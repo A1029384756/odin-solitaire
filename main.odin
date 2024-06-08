@@ -83,9 +83,7 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 		if card == nil {continue}
 		if card_collides(card, coord) {return true}
 	}
-	card: Card
-	card.pos = pile.pos
-	if card_collides(card, coord) {return true}
+	if card_collides(pile.pos, coord) {return true}
 	return false
 }
 
