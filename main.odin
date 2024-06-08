@@ -76,6 +76,7 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 }
 
 draw_pile :: proc(pile: ^Pile) {
+	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos.xy + pile.spacing.xy * idx
