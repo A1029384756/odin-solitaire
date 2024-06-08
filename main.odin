@@ -30,6 +30,7 @@ Stack :: struct {
 Held_Pile :: struct {
 	using pile:  Pile,
 	source_pile: ^Pile,
+	hold_offset: Vector2,
 }
 
 CARD_WIDTH :: 100
@@ -188,7 +189,7 @@ main :: proc() {
 	init_state(&state)
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE})
-	rl.InitWindow(1920, 1080, "Solitaire")
+	rl.InitWindow(1080, 1080, "Solitaire")
 
 	for !rl.WindowShouldClose() {
 		// general update
@@ -199,95 +200,118 @@ main :: proc() {
 
 		// input handlers
 		{
+			// reset game
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
-				if pile_collides(&state.hand, getmousepos()) {
-					top, idx := pile_get_top(&state.hand)
-					_, discard_size := pile_get_top(&state.discard)
-					switch idx {
-					case -1:
-						copy(state.hand.cards[:], state.discard.cards[:])
-						slice.zero(state.discard.cards[:])
-						for card in state.hand.cards {
-							if card == nil {break}
-							card.flipped = false
-						}
-					case 0 ..< 3:
-						copy(state.discard.cards[discard_size + 1:], state.hand.cards[:idx + 1])
-						slice.zero(state.hand.cards[:idx + 1])
-						for card in state.discard.cards[discard_size + 1:] {
-							if card == nil {break}
-							card.flipped = true
-							card.pos = state.discard.pos
-						}
-					case:
-						copy(
-							state.discard.cards[discard_size + 1:],
-							state.hand.cards[idx - 2:idx + 1],
-						)
-						slice.zero(state.hand.cards[idx - 2:idx + 1])
-						for card in state.discard.cards[discard_size + 1:] {
-							if card == nil {break}
-							card.flipped = true
-							card.pos = state.discard.pos
+				// Handle discard
+				{
+					if pile_collides(&state.hand, getmousepos()) {
+						top, idx := pile_get_top(&state.hand)
+						_, discard_size := pile_get_top(&state.discard)
+						switch idx {
+						case -1:
+							copy(state.hand.cards[:], state.discard.cards[:])
+							slice.zero(state.discard.cards[:])
+							for card in state.hand.cards {
+								if card == nil {break}
+								card.flipped = false
+							}
+						case 0 ..< 3:
+							copy(
+								state.discard.cards[discard_size + 1:],
+								state.hand.cards[:idx + 1],
+							)
+							slice.zero(state.hand.cards[:idx + 1])
+							for card in state.discard.cards[discard_size + 1:] {
+								if card == nil {break}
+								card.flipped = true
+								card.pos = state.discard.pos
+							}
+						case:
+							copy(
+								state.discard.cards[discard_size + 1:],
+								state.hand.cards[idx - 2:idx + 1],
+							)
+							slice.zero(state.hand.cards[idx - 2:idx + 1])
+							for card in state.discard.cards[discard_size + 1:] {
+								if card == nil {break}
+								card.flipped = true
+								card.pos = state.discard.pos
+							}
 						}
 					}
 				}
 
-				top, idx := pile_get_top(&state.discard)
-				if idx != -1 && card_collides(top, getmousepos()) {
-					state.held_pile.cards[0] = top
-					state.held_pile.source_pile = &state.discard
-					state.discard.cards[idx] = nil
+				// pick up from discard 
+				{
+					top, idx := pile_get_top(&state.discard)
+					if idx != -1 && card_collides(top, getmousepos()) {
+						state.held_pile.cards[0] = top
+						state.held_pile.source_pile = &state.discard
+						state.discard.cards[idx] = nil
+					}
 				}
 
-				for &pile in state.piles {
-					#reverse for card, idx in pile.cards {
-						if card == nil {continue}
-						if card.flipped && card_collides(card, getmousepos()) {
-							copy(state.held_pile.cards[:], pile.cards[idx:])
-							state.held_pile.source_pile = &pile
-							slice.zero(pile.cards[idx:])
-							break
+				// pick up from pile 
+				{
+					for &pile in state.piles {
+						#reverse for card, idx in pile.cards {
+							if card == nil {continue}
+							if card.flipped && card_collides(card, getmousepos()) {
+								copy(state.held_pile.cards[:], pile.cards[idx:])
+								state.held_pile.source_pile = &pile
+								slice.zero(pile.cards[idx:])
+								break
+							}
 						}
 					}
 				}
 			}
 
 			if rl.IsMouseButtonReleased(.LEFT) {
-				for &pile in state.piles {
-					if state.held_pile.source_pile == nil {continue}
-					if pile_collides(&pile, getmousepos()) &&
-					   pile_can_place(&pile, &state.held_pile) {
-						top, idx := pile_get_top(state.held_pile.source_pile)
-						if top != nil {top.flipped = true}
-						held_pile_send_to_pile(&state.held_pile, &pile)
-						break
+				// add hand pile to pile
+				{
+					for &pile in state.piles {
+						if state.held_pile.source_pile == nil {continue}
+						if pile_collides(&pile, getmousepos()) &&
+						   pile_can_place(&pile, &state.held_pile) {
+							top, idx := pile_get_top(state.held_pile.source_pile)
+							if top != nil {top.flipped = true}
+							held_pile_send_to_pile(&state.held_pile, &pile)
+							break
+						}
 					}
 				}
 
-				for &stack in state.stacks {
-					if pile_collides(&stack, getmousepos()) &&
-					   stack_can_place(&stack, &state.held_pile) {
-						top, idx := pile_get_top(state.held_pile.source_pile)
-						if top != nil {top.flipped = true}
-						held_pile_send_to_pile(&state.held_pile, &stack)
+				// add card to stack
+				{
+					for &stack in state.stacks {
+						if pile_collides(&stack, getmousepos()) &&
+						   stack_can_place(&stack, &state.held_pile) {
+							top, idx := pile_get_top(state.held_pile.source_pile)
+							if top != nil {top.flipped = true}
+							held_pile_send_to_pile(&state.held_pile, &stack)
+						}
 					}
 				}
 
+				// return unassigned hand pile to source
 				if state.held_pile.cards[0] != nil {
 					held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
 				}
 
-				for &stack, idx in state.stacks {
-					top, top_idx := pile_get_top(&stack)
-					if top_idx != 12 {
-						break
-					}
-					if idx == 3 {
-						fmt.println("you win")
-						init_state(&state)
+				// win condition
+				{
+					for &stack, idx in state.stacks {
+						top, top_idx := pile_get_top(&stack)
+						if top_idx != 12 {
+							break
+						}
+						if idx == 3 {
+							fmt.println("you win")
+							init_state(&state)
+						}
 					}
 				}
 			}
