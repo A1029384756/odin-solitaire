@@ -102,34 +102,12 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 			return card, idx
 		}
 	}
-	return nil, 0
-}
-
-draw_stack :: proc(stack: ^Stack) {
-	rl.DrawRectangle(i32(stack.x), i32(stack.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
-
-	label: cstring
-	switch stack.suit {
-	case 0:
-		label = "h"
-	case 1:
-		label = "c"
-	case 2:
-		label = "d"
-	case 3:
-		label = "s"
-	case:
-		fmt.eprintln("bad suit")
-	}
-	rl.DrawText(label, i32(stack.x), i32(stack.y), 20, rl.BLACK)
-}
-
-vector2_to_int :: proc(v: rl.Vector2) -> Vector2 {
-	return {int(v.x), int(v.y)}
+	return nil, -1
 }
 
 getmousepos :: proc() -> Vector2 {
-	return vector2_to_int(rl.GetMousePosition())
+	v := rl.GetMousePosition()
+	return {int(v.x), int(v.y)}
 }
 
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
@@ -149,6 +127,13 @@ pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 		return held.cards[0].rank == 12
 	}
 	return held.cards[0].rank == top.rank - 1 && held.cards[0].suit % 2 != top.suit % 2
+}
+
+stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
+	top, idx := pile_get_top(stack)
+	if idx == -1 {return held.cards[0].rank == 0}
+	if idx != 0 {return false}
+	return held.cards[0].rank == top.rank + 1 && held.cards[0].suit == top.suit
 }
 
 init_state :: proc(state: ^State) {
@@ -228,7 +213,7 @@ main :: proc() {
 
 		draw_pile(&state.hand)
 		for &stack in state.stacks {
-			draw_stack(&stack)
+			draw_pile(&stack)
 		}
 
 		if state.held_pile.cards[0] != nil {
@@ -249,6 +234,17 @@ main :: proc() {
 						}
 						held_pile_send_to_pile(&state.held_pile, &pile)
 						break
+					}
+				}
+
+				for &stack in state.stacks {
+					if pile_collides(&stack, getmousepos()) &&
+					   stack_can_place(&stack, &state.held_pile) {
+						top, idx := pile_get_top(state.held_pile.source_pile)
+						if top != nil {
+							top.flipped = true
+						}
+						held_pile_send_to_pile(&state.held_pile, &stack)
 					}
 				}
 
