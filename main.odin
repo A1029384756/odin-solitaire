@@ -145,16 +145,14 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 
 pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 	top, _ := pile_get_top(pile)
-	fmt.println(top)
 	if top == nil {
-		fmt.println(held.cards[0].rank)
 		return held.cards[0].rank == 12
 	}
 	return held.cards[0].rank == top.rank - 1 && held.cards[0].suit % 2 != top.suit % 2
 }
 
-reset_state :: proc(allocator := context.allocator) -> ^State {
-	state := new(State, allocator)
+init_state :: proc(state: ^State) {
+	state^ = State{}
 	for &card, idx in state.cards {
 		card.rank = idx % 13
 		card.suit = idx % 4
@@ -188,8 +186,6 @@ reset_state :: proc(allocator := context.allocator) -> ^State {
 	}
 
 	state.held_pile.spacing.y = PILE_SPACING
-
-	return state
 }
 
 State :: struct {
@@ -202,16 +198,15 @@ State :: struct {
 }
 
 main :: proc() {
-	state := reset_state()
-	defer free(state)
+	state: State
+	init_state(&state)
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE})
 	rl.InitWindow(1920, 1080, "Solitaire")
 
 	for !rl.WindowShouldClose() {
 		if rl.IsKeyPressed(.R) {
-			free(state)
-			state = reset_state()
+			init_state(&state)
 		}
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.RAYWHITE)
