@@ -161,9 +161,10 @@ init_state :: proc(state: ^State) {
 
 	for &card, idx in state.cards[total_pile_dealt:] {
 		state.hand.cards[idx] = &card
-		state.hand.spacing.x = 4
-		state.hand.pos.xy = {50, 50}
 	}
+	state.hand.spacing.x = 4
+	state.hand.pos.xy = {50, 50}
+	state.discard.pos.xy = {300, 50}
 
 	for &stack, idx in state.stacks {
 		stack.pos = {500 + (CARD_WIDTH + 10) * idx, 50}
@@ -201,6 +202,25 @@ main :: proc() {
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
+				if pile_collides(&state.hand, getmousepos()) {
+					top, idx := pile_get_top(&state.hand)
+					_, discard_size := pile_get_top(&state.discard)
+					switch idx {
+					case -1:
+						copy(state.hand.cards[:], state.discard.cards[:])
+						slice.zero(state.discard.cards[:])
+					case 0 ..< 3:
+						copy(state.discard.cards[discard_size + 1:], state.hand.cards[:idx + 1])
+						slice.zero(state.hand.cards[:idx + 1])
+					case:
+						copy(
+							state.discard.cards[discard_size + 1:],
+							state.hand.cards[idx - 2:idx + 1],
+						)
+						slice.zero(state.hand.cards[idx - 2:idx + 1])
+					}
+				}
+
 				for &pile in state.piles {
 					#reverse for card, idx in pile.cards {
 						if card == nil {continue}
@@ -251,6 +271,7 @@ main :: proc() {
 			}
 
 			draw_pile(&state.hand)
+			draw_pile(&state.discard)
 			for &stack in state.stacks {
 				draw_pile(&stack)
 			}
