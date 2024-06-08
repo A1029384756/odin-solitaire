@@ -209,16 +209,37 @@ main :: proc() {
 					case -1:
 						copy(state.hand.cards[:], state.discard.cards[:])
 						slice.zero(state.discard.cards[:])
+						for card in state.hand.cards {
+							if card == nil {break}
+							card.flipped = false
+						}
 					case 0 ..< 3:
 						copy(state.discard.cards[discard_size + 1:], state.hand.cards[:idx + 1])
 						slice.zero(state.hand.cards[:idx + 1])
+						for card in state.discard.cards[discard_size + 1:] {
+							if card == nil {break}
+							card.flipped = true
+							card.pos = state.discard.pos
+						}
 					case:
 						copy(
 							state.discard.cards[discard_size + 1:],
 							state.hand.cards[idx - 2:idx + 1],
 						)
 						slice.zero(state.hand.cards[idx - 2:idx + 1])
+						for card in state.discard.cards[discard_size + 1:] {
+							if card == nil {break}
+							card.flipped = true
+							card.pos = state.discard.pos
+						}
 					}
+				}
+
+				top, idx := pile_get_top(&state.discard)
+				if idx != -1 && card_collides(top, getmousepos()) {
+					state.held_pile.cards[0] = top
+					state.held_pile.source_pile = &state.discard
+					state.discard.cards[idx] = nil
 				}
 
 				for &pile in state.piles {
@@ -257,6 +278,17 @@ main :: proc() {
 
 				if state.held_pile.cards[0] != nil {
 					held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
+				}
+
+				for &stack, idx in state.stacks {
+					top, top_idx := pile_get_top(&stack)
+					if top_idx != 12 {
+						break
+					}
+					if idx == 3 {
+						fmt.println("you win")
+						init_state(&state)
+					}
 				}
 			}
 		}
