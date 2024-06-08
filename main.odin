@@ -2,40 +2,47 @@ package main
 
 import "core:fmt"
 import "core:math/rand"
+import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
 
 Vector2 :: distinct [2]int
 
 Card :: struct {
+	using pos: Vector2,
 	flipped:   bool,
 	rank:      int,
 	suit:      int,
-	using pos: Vector2,
 }
 
 Pile :: struct {
-	cards:     [13]^Card,
 	using pos: Vector2,
+	cards:     [24]^Card,
+	spacing:   Vector2,
+	size:      int,
 }
 
 Stack :: struct {
-	cards:     [13]^Card,
-	suit:      int,
-	using pos: Vector2,
+	using pile: Pile,
+	suit:       int,
 }
 
-HeldCard :: struct {
-	card:        ^Card,
+Held_Pile :: struct {
+	using pile:  Pile,
 	source_pile: ^Pile,
 }
 
 CARD_WIDTH :: 100
 CARD_HEIGHT :: 160
+PILE_SPACING :: 20
 
 draw_card :: proc(card: ^Card) {
 	rl.DrawRectangle(i32(card.x), i32(card.y), CARD_WIDTH, CARD_HEIGHT, rl.LIGHTGRAY)
 	rl.DrawRectangleLines(i32(card.x), i32(card.y), CARD_WIDTH, CARD_HEIGHT, rl.BLUE)
+	if !card.flipped {
+		return
+	}
+
 	rl.DrawText(
 		strings.clone_to_cstring(
 			fmt.tprintf("R: %d\nS: %d", card.rank, card.suit),
@@ -71,7 +78,7 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 draw_pile :: proc(pile: ^Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = {pile.x, pile.y + 10 * idx}
+		card.pos = pile.pos.xy + pile.spacing.xy * idx
 		draw_card(card)
 	}
 }
@@ -112,23 +119,23 @@ getmousepos :: proc() -> Vector2 {
 	return vector2_to_int(rl.GetMousePosition())
 }
 
-held_card_return_to_pile :: proc(held_card: ^HeldCard, pile: ^Pile) {
+held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	top, idx := pile_get_top(pile)
 	if top == nil {
-		pile.cards[0] = held_card.card
+		copy(pile.cards[:], held_pile.cards[:])
 	} else {
-		pile.cards[idx + 1] = held_card.card
+		copy(pile.cards[idx + 1:], held_pile.cards[:])
 	}
-	held_card.card = nil
-	held_card.source_pile = nil
+	slice.zero(held_pile.cards[:])
+	held_pile.source_pile = nil
 }
 
-pile_can_place :: proc(pile: ^Pile, card: ^HeldCard) -> bool {
+pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 	top, idx := pile_get_top(pile)
 	if top == nil {
-		return card.card.rank == 12
+		return held.cards[0].rank == 12
 	}
-	return card.card.rank == top.rank - 1 && card.card.suit % 2 != top.suit % 2
+	return held.cards[0].rank == top.rank - 1 && held.cards[0].suit % 2 != top.suit % 2
 }
 
 reset_state :: proc(allocator := context.allocator) -> ^State {
@@ -142,17 +149,22 @@ reset_state :: proc(allocator := context.allocator) -> ^State {
 	total_pile_dealt := 0
 	pile_card_count := 1
 	for &pile, idx in state.piles {
+		pile.spacing.y = PILE_SPACING
 		pile.pos = {idx * (CARD_WIDTH + 10) + 200, 300}
 		for i in 0 ..< pile_card_count {
 			pile.cards[i] = &state.cards[total_pile_dealt]
 			total_pile_dealt += 1
+			if i + 1 == pile_card_count {
+				pile.cards[i].flipped = true
+			}
 		}
 		pile_card_count += 1
 	}
 
 	for &card, idx in state.cards[total_pile_dealt:] {
-		state.hand[idx] = &card
-		card.pos = {20 + idx * 4, 50}
+		state.hand.cards[idx] = &card
+		state.hand.spacing.x = 4
+		state.hand.pos.xy = {50, 50}
 	}
 
 	for &stack, idx in state.stacks {
@@ -160,16 +172,18 @@ reset_state :: proc(allocator := context.allocator) -> ^State {
 		stack.suit = idx
 	}
 
+	state.held_pile.spacing.y = PILE_SPACING
+
 	return state
 }
 
 State :: struct {
 	cards:     [52]Card,
 	piles:     [7]Pile,
-	hand:      [24]^Card,
-	discard:   [24]^Card,
+	hand:      Pile,
+	discard:   Pile,
 	stacks:    [4]Stack,
-	held_card: HeldCard,
+	held_pile: Held_Pile,
 }
 
 main :: proc() {
@@ -188,44 +202,48 @@ main :: proc() {
 		rl.ClearBackground(rl.RAYWHITE)
 
 		for &pile in state.piles {
-			top, idx := pile_get_top(&pile)
-			if top == nil {
-				continue
-			}
-			if rl.IsMouseButtonPressed(.LEFT) && card_collides(top, getmousepos()) {
-				state.held_card.card = top
-				state.held_card.source_pile = &pile
-				pile.cards[idx] = nil
+			if rl.IsMouseButtonPressed(.LEFT) {
+				#reverse for card, idx in pile.cards {
+					if card == nil {continue}
+					if card.flipped && card_collides(card, getmousepos()) {
+						copy(state.held_pile.cards[:], pile.cards[idx:])
+						state.held_pile.source_pile = &pile
+						slice.zero(pile.cards[idx:])
+						break
+					}
+				}
 			}
 			draw_pile(&pile)
 		}
 
-		for &card in state.hand {
-			draw_card(card)
-		}
+		draw_pile(&state.hand)
 		for &stack in state.stacks {
 			draw_stack(&stack)
 		}
 
-		if state.held_card.card != nil {
-			state.held_card.card.pos = getmousepos()
-			draw_card(state.held_card.card)
+		if state.held_pile.cards[0] != nil {
+			state.held_pile.pos = getmousepos()
+			draw_pile(&state.held_pile)
 
 			if rl.IsMouseButtonReleased(.LEFT) {
 				for &pile in state.piles {
-					if &pile == state.held_card.source_pile {
+					if &pile == state.held_pile.source_pile {
 						continue
 					}
 
 					if pile_collides(&pile, getmousepos()) &&
-					   pile_can_place(&pile, &state.held_card) {
-						held_card_return_to_pile(&state.held_card, &pile)
+					   pile_can_place(&pile, &state.held_pile) {
+						top, idx := pile_get_top(state.held_pile.source_pile)
+						if top != nil {
+							top.flipped = true
+						}
+						held_pile_send_to_pile(&state.held_pile, &pile)
 						break
 					}
 				}
 
-				if state.held_card.card != nil {
-					held_card_return_to_pile(&state.held_card, state.held_card.source_pile)
+				if state.held_pile.cards[0] != nil {
+					held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
 				}
 			}
 		}
