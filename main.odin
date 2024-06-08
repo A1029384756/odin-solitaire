@@ -190,48 +190,37 @@ main :: proc() {
 	rl.InitWindow(1920, 1080, "Solitaire")
 
 	for !rl.WindowShouldClose() {
-		if rl.IsKeyPressed(.R) {
-			init_state(&state)
+		// general update
+		{
+			state.held_pile.pos = getmousepos()
 		}
-		rl.BeginDrawing()
-		rl.ClearBackground(rl.RAYWHITE)
 
-		for &pile in state.piles {
+
+		// input handlers
+		{
+			if rl.IsKeyPressed(.R) {init_state(&state)}
+
 			if rl.IsMouseButtonPressed(.LEFT) {
-				#reverse for card, idx in pile.cards {
-					if card == nil {continue}
-					if card.flipped && card_collides(card, getmousepos()) {
-						copy(state.held_pile.cards[:], pile.cards[idx:])
-						state.held_pile.source_pile = &pile
-						slice.zero(pile.cards[idx:])
-						break
+				for &pile in state.piles {
+					#reverse for card, idx in pile.cards {
+						if card == nil {continue}
+						if card.flipped && card_collides(card, getmousepos()) {
+							copy(state.held_pile.cards[:], pile.cards[idx:])
+							state.held_pile.source_pile = &pile
+							slice.zero(pile.cards[idx:])
+							break
+						}
 					}
 				}
 			}
-			draw_pile(&pile)
-		}
-
-		draw_pile(&state.hand)
-		for &stack in state.stacks {
-			draw_pile(&stack)
-		}
-
-		if state.held_pile.cards[0] != nil {
-			state.held_pile.pos = getmousepos()
-			draw_pile(&state.held_pile)
 
 			if rl.IsMouseButtonReleased(.LEFT) {
 				for &pile in state.piles {
-					if &pile == state.held_pile.source_pile {
-						continue
-					}
-
+					if state.held_pile.source_pile == nil {continue}
 					if pile_collides(&pile, getmousepos()) &&
 					   pile_can_place(&pile, &state.held_pile) {
 						top, idx := pile_get_top(state.held_pile.source_pile)
-						if top != nil {
-							top.flipped = true
-						}
+						if top != nil {top.flipped = true}
 						held_pile_send_to_pile(&state.held_pile, &pile)
 						break
 					}
@@ -241,9 +230,7 @@ main :: proc() {
 					if pile_collides(&stack, getmousepos()) &&
 					   stack_can_place(&stack, &state.held_pile) {
 						top, idx := pile_get_top(state.held_pile.source_pile)
-						if top != nil {
-							top.flipped = true
-						}
+						if top != nil {top.flipped = true}
 						held_pile_send_to_pile(&state.held_pile, &stack)
 					}
 				}
@@ -254,9 +241,29 @@ main :: proc() {
 			}
 		}
 
+		// rendering 
+		{
+			rl.BeginDrawing()
+			rl.ClearBackground(rl.RAYWHITE)
 
-		rl.DrawFPS(0, 0)
-		rl.EndDrawing()
+			for &pile in state.piles {
+				draw_pile(&pile)
+			}
+
+			draw_pile(&state.hand)
+			for &stack in state.stacks {
+				draw_pile(&stack)
+			}
+
+			if state.held_pile.cards[0] != nil {
+				draw_pile(&state.held_pile)
+			}
+
+
+			rl.DrawFPS(0, 0)
+			rl.EndDrawing()
+		}
+
 		free_all(context.temp_allocator)
 	}
 
