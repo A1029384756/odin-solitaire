@@ -43,9 +43,23 @@ draw_card :: proc(card: ^Card) {
 		return
 	}
 
+	label: string
+	switch card.suit {
+	case 0:
+		label = "h"
+	case 1:
+		label = "c"
+	case 2:
+		label = "d"
+	case 3:
+		label = "s"
+	case:
+		fmt.eprintln("bad suit")
+	}
+
 	rl.DrawText(
 		strings.clone_to_cstring(
-			fmt.tprintf("R: %d\nS: %d", card.rank, card.suit),
+			fmt.tprintf("R: %d\nS: %s", card.rank, label),
 			context.temp_allocator,
 		),
 		i32(card.x + CARD_WIDTH / 2),
@@ -55,7 +69,7 @@ draw_card :: proc(card: ^Card) {
 	)
 }
 
-card_collides :: proc(card: ^Card, coord: Vector2) -> bool {
+card_collides :: proc(card: Vector2, coord: Vector2) -> bool {
 	return(
 		card.x < coord.x &&
 		card.y < coord.y &&
@@ -65,14 +79,14 @@ card_collides :: proc(card: ^Card, coord: Vector2) -> bool {
 }
 
 pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
-	top, idx := pile_get_top(pile)
-	if top == nil {
-		card := Card {
-			pos = pile.pos,
-		}
-		return card_collides(&card, coord)
+	for card in pile.cards {
+		if card == nil {continue}
+		if card_collides(card, coord) {return true}
 	}
-	return card_collides(top, coord)
+	card: Card
+	card.pos = pile.pos
+	if card_collides(card, coord) {return true}
+	return false
 }
 
 draw_pile :: proc(pile: ^Pile) {
@@ -132,8 +146,10 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 }
 
 pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
-	top, idx := pile_get_top(pile)
+	top, _ := pile_get_top(pile)
+	fmt.println(top)
 	if top == nil {
+		fmt.println(held.cards[0].rank)
 		return held.cards[0].rank == 12
 	}
 	return held.cards[0].rank == top.rank - 1 && held.cards[0].suit % 2 != top.suit % 2
