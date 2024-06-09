@@ -92,7 +92,7 @@ draw_pile :: proc(pile: ^Pile) {
 	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = pile.pos.xy + pile.spacing.xy * idx
+		card.pos = pile.pos + pile.spacing * idx
 		draw_card(card)
 	}
 }
@@ -100,7 +100,7 @@ draw_pile :: proc(pile: ^Pile) {
 draw_held_pile :: proc(pile: ^Held_Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = pile.pos - pile.hold_offset + pile.spacing.xy * idx
+		card.pos = pile.pos - pile.hold_offset + pile.spacing * idx
 		draw_card(card)
 	}
 }
@@ -127,7 +127,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 		copy(pile.cards[idx + 1:], held_pile.cards[:])
 	}
 	slice.zero(held_pile.cards[:])
-	held_pile.hold_offset.xy = 0
+	held_pile.hold_offset = 0
 	held_pile.source_pile = nil
 }
 
@@ -173,8 +173,8 @@ init_state :: proc(state: ^State) {
 		state.hand.cards[idx] = &card
 	}
 	state.hand.spacing.x = 4
-	state.hand.pos.xy = {50, 50}
-	state.discard.pos.xy = {300, 50}
+	state.hand.pos = {50, 50}
+	state.discard.pos = {300, 50}
 
 	for &stack, idx in state.stacks {
 		stack.pos = {500 + (CARD_WIDTH + 10) * idx, 50}
