@@ -189,7 +189,6 @@ pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 	top, idx := pile_get_top(stack)
 	if idx == -1 {return held.cards[0].rank == 0}
-	if idx != 0 {return false}
 	return held.cards[0].rank == top.rank + 1 && held.cards[0].suit == top.suit
 }
 
@@ -285,7 +284,9 @@ main :: proc() {
 								state.hand.cards[:idx + 1],
 							)
 							slice.zero(state.hand.cards[:idx + 1])
-							slice.reverse(state.discard.cards[discard_size + 1:discard_size + 1 + idx  +1])
+							slice.reverse(
+								state.discard.cards[discard_size + 1:discard_size + 1 + idx + 1],
+							)
 							for card in state.discard.cards[discard_size + 1:] {
 								if card == nil {break}
 								card.flipped = true
