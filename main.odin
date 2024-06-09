@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:math"
+import "core:math/linalg"
 import "core:math/rand"
 import "core:slice"
 import "core:strings"
@@ -111,6 +112,34 @@ draw_pile :: proc(pile: ^Pile) {
 	}
 }
 
+draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
+	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
+
+	top, top_idx := pile_get_top(pile)
+	_, held_idx := pile_get_top(held)
+	num_disc := top_idx + 1
+	num_held := held_idx + 1
+	v := 3 - min(num_disc, 3)
+
+	for card, idx in pile.cards {
+		if card == nil {break}
+		if num_held > 0 && held.source_pile == pile {
+			if top_idx - idx < 3 - num_held {
+				card.pos = pile.pos + pile.spacing * f32(2 - num_held - (top_idx - idx))
+			} else {
+				card.pos = pile.pos
+			}
+		} else {
+			if top_idx - idx < 3 {
+				card.pos = pile.pos + pile.spacing * f32(2 - v - (top_idx - idx))
+			} else {
+				card.pos = pile.pos
+			}
+		}
+		draw_card(card)
+	}
+}
+
 draw_held_pile :: proc(pile: ^Held_Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
@@ -136,18 +165,13 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	top, idx := pile_get_top(pile)
 	if top == nil {
 		copy(pile.cards[:], held_pile.cards[:])
-		for card in held_pile.cards[:] {
-			if card == nil {break}
-			card.offset =
-				(held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
-		}
 	} else {
 		copy(pile.cards[idx + 1:], held_pile.cards[:])
-		for card in held_pile.cards[:] {
-			if card == nil {break}
-			card.offset =
-				(held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
-		}
+	}
+
+	for card in held_pile.cards[:] {
+		if card == nil {break}
+		card.offset = (held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
 	}
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
@@ -197,7 +221,9 @@ init_state :: proc(state: ^State) {
 	}
 	state.hand.spacing.x = 4
 	state.hand.pos = {50, 50}
-	state.discard.pos = {300, 50}
+
+	state.discard.spacing.x = -20
+	state.discard.pos = {350, 50}
 
 	for &stack, idx in state.stacks {
 		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 50}
@@ -229,7 +255,7 @@ main :: proc() {
 			state.held_pile.pos = getmousepos()
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 25)
-				if card.offset.x < 0.1 && card.offset.y < 0.1 {card.offset = 0}
+				if linalg.distance(card.offset, 0) < 5 {card.offset = 0}
 			}
 		}
 
@@ -248,6 +274,7 @@ main :: proc() {
 						case -1:
 							copy(state.hand.cards[:], state.discard.cards[:])
 							slice.zero(state.discard.cards[:])
+							slice.reverse(state.hand.cards[:])
 							for card in state.hand.cards {
 								if card == nil {break}
 								card.flipped = false
@@ -258,6 +285,7 @@ main :: proc() {
 								state.hand.cards[:idx + 1],
 							)
 							slice.zero(state.hand.cards[:idx + 1])
+							slice.reverse(state.discard.cards[discard_size + 1:])
 							for card in state.discard.cards[discard_size + 1:] {
 								if card == nil {break}
 								card.flipped = true
@@ -266,9 +294,10 @@ main :: proc() {
 						case:
 							copy(
 								state.discard.cards[discard_size + 1:],
-								state.hand.cards[idx - 2:idx + 1],
+								state.hand.cards[idx - 2:],
 							)
-							slice.zero(state.hand.cards[idx - 2:idx + 1])
+							slice.zero(state.hand.cards[idx - 2:])
+							slice.reverse(state.discard.cards[discard_size + 1:discard_size + 4])
 							for card in state.discard.cards[discard_size + 1:] {
 								if card == nil {break}
 								card.flipped = true
@@ -316,7 +345,6 @@ main :: proc() {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
 							held_pile_send_to_pile(&state.held_pile, &pile)
-							break
 						}
 					}
 				}
@@ -365,7 +393,7 @@ main :: proc() {
 			}
 
 			draw_pile(&state.hand)
-			draw_pile(&state.discard)
+			draw_discard(&state.discard, &state.held_pile)
 			for &stack in state.stacks {
 				draw_pile(&stack)
 			}
