@@ -229,6 +229,7 @@ main :: proc() {
 			state.held_pile.pos = getmousepos()
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 25)
+				if card.offset.x < 0.1 && card.offset.y < 0.1 {card.offset = 0}
 			}
 		}
 
@@ -370,9 +371,7 @@ main :: proc() {
 				draw_pile(&stack)
 			}
 
-			if state.held_pile.cards[0] != nil {
-				draw_held_pile(&state.held_pile)
-			}
+			draw_held_pile(&state.held_pile)
 
 
 			rl.DrawFPS(0, 0)
