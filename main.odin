@@ -1,15 +1,17 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
 import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
 
-Vector2 :: distinct [2]int
+Vector2 :: distinct [2]f32
 
 Card :: struct {
 	using pos: Vector2,
+	offset:    Vector2,
 	flipped:   bool,
 	rank:      int,
 	suit:      int,
@@ -38,8 +40,20 @@ CARD_HEIGHT :: 160
 PILE_SPACING :: 20
 
 draw_card :: proc(card: ^Card) {
-	rl.DrawRectangle(i32(card.x), i32(card.y), CARD_WIDTH, CARD_HEIGHT, rl.LIGHTGRAY)
-	rl.DrawRectangleLines(i32(card.x), i32(card.y), CARD_WIDTH, CARD_HEIGHT, rl.BLUE)
+	rl.DrawRectangle(
+		i32(card.x + card.offset.x),
+		i32(card.y + card.offset.y),
+		CARD_WIDTH,
+		CARD_HEIGHT,
+		rl.LIGHTGRAY,
+	)
+	rl.DrawRectangleLines(
+		i32(card.x + card.offset.x),
+		i32(card.y + card.offset.y),
+		CARD_WIDTH,
+		CARD_HEIGHT,
+		rl.BLUE,
+	)
 	if !card.flipped {
 		return
 	}
@@ -63,8 +77,8 @@ draw_card :: proc(card: ^Card) {
 			fmt.tprintf("R: %d\nS: %s", card.rank, label),
 			context.temp_allocator,
 		),
-		i32(card.x + CARD_WIDTH / 2),
-		i32(card.y + CARD_HEIGHT / 2),
+		i32(card.x + card.offset.x + CARD_WIDTH / 2),
+		i32(card.y + card.offset.y + CARD_HEIGHT / 2),
 		20,
 		rl.BLACK,
 	)
@@ -92,7 +106,7 @@ draw_pile :: proc(pile: ^Pile) {
 	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = pile.pos + pile.spacing * idx
+		card.pos = pile.pos + pile.spacing * f32(idx)
 		draw_card(card)
 	}
 }
@@ -100,7 +114,7 @@ draw_pile :: proc(pile: ^Pile) {
 draw_held_pile :: proc(pile: ^Held_Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = pile.pos - pile.hold_offset + pile.spacing * idx
+		card.pos = pile.pos - pile.hold_offset + pile.spacing * f32(idx)
 		draw_card(card)
 	}
 }
@@ -115,16 +129,25 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 }
 
 getmousepos :: proc() -> Vector2 {
-	v := rl.GetMousePosition()
-	return {int(v.x), int(v.y)}
+	return Vector2(rl.GetMousePosition())
 }
 
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	top, idx := pile_get_top(pile)
 	if top == nil {
 		copy(pile.cards[:], held_pile.cards[:])
+		for card in held_pile.cards[:] {
+			if card == nil {break}
+			card.offset =
+				(held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
+		}
 	} else {
 		copy(pile.cards[idx + 1:], held_pile.cards[:])
+		for card in held_pile.cards[:] {
+			if card == nil {break}
+			card.offset =
+				(held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
+		}
 	}
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
@@ -158,7 +181,7 @@ init_state :: proc(state: ^State) {
 	pile_card_count := 1
 	for &pile, idx in state.piles {
 		pile.spacing.y = PILE_SPACING
-		pile.pos = {idx * (CARD_WIDTH + 10) + 200, 300}
+		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 300}
 		for i in 0 ..< pile_card_count {
 			pile.cards[i] = &state.cards[total_pile_dealt]
 			total_pile_dealt += 1
@@ -177,7 +200,7 @@ init_state :: proc(state: ^State) {
 	state.discard.pos = {300, 50}
 
 	for &stack, idx in state.stacks {
-		stack.pos = {500 + (CARD_WIDTH + 10) * idx, 50}
+		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 50}
 		stack.suit = idx
 	}
 
@@ -204,6 +227,9 @@ main :: proc() {
 		// general update
 		{
 			state.held_pile.pos = getmousepos()
+			for &card in state.cards {
+				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 25)
+			}
 		}
 
 
@@ -299,6 +325,7 @@ main :: proc() {
 				{
 					for &stack in state.stacks {
 						if pile_collides(&stack, getmousepos()) &&
+						   state.held_pile.cards[0] != nil &&
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
