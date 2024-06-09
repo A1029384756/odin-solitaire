@@ -233,7 +233,6 @@ main :: proc() {
 			}
 		}
 
-
 		// input handlers
 		{
 			// reset game
@@ -372,7 +371,6 @@ main :: proc() {
 			}
 
 			draw_held_pile(&state.held_pile)
-
 
 			rl.DrawFPS(0, 0)
 			rl.EndDrawing()
