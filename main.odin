@@ -19,10 +19,11 @@ Card :: struct {
 }
 
 Pile :: struct {
-	using pos: Vector2,
-	cards:     [24]^Card,
-	spacing:   Vector2,
-	size:      int,
+	using pos:   Vector2,
+	cards:       [24]^Card,
+	spacing:     Vector2,
+	size:        int,
+	max_visible: int,
 }
 
 Stack :: struct {
@@ -171,7 +172,10 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 
 	for card in held_pile.cards[:] {
 		if card == nil {break}
-		card.offset = (held_pile.pos - held_pile.hold_offset) - pile.pos - f32(idx) * pile.spacing
+		card.offset =
+			(held_pile.pos - held_pile.hold_offset) -
+			pile.pos -
+			f32(min(pile.max_visible, idx)) * pile.spacing
 	}
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
@@ -213,6 +217,7 @@ init_state :: proc(state: ^State) {
 			}
 		}
 		pile_card_count += 1
+		pile.max_visible = 52
 	}
 
 	for &card, idx in state.cards[total_pile_dealt:] {
@@ -220,16 +225,20 @@ init_state :: proc(state: ^State) {
 	}
 	state.hand.spacing.x = 4
 	state.hand.pos = {50, 50}
+	state.hand.max_visible = 52
 
 	state.discard.spacing.x = -20
 	state.discard.pos = {350, 50}
+	state.discard.max_visible = 3
 
 	for &stack, idx in state.stacks {
 		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 50}
 		stack.suit = idx
+		stack.max_visible = 1
 	}
 
 	state.held_pile.spacing.y = PILE_SPACING
+	state.held_pile.max_visible = 52
 }
 
 State :: struct {
