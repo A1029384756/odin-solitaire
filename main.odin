@@ -97,6 +97,14 @@ draw_pile :: proc(pile: ^Pile) {
 	}
 }
 
+draw_held_pile :: proc(pile: ^Held_Pile) {
+	for card, idx in pile.cards {
+		if card == nil {break}
+		card.pos = pile.pos - pile.hold_offset + pile.spacing.xy * idx
+		draw_card(card)
+	}
+}
+
 pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 	#reverse for card, idx in pile.cards {
 		if card != nil {
@@ -119,6 +127,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 		copy(pile.cards[idx + 1:], held_pile.cards[:])
 	}
 	slice.zero(held_pile.cards[:])
+	held_pile.hold_offset.xy = 0
 	held_pile.source_pile = nil
 }
 
@@ -204,7 +213,7 @@ main :: proc() {
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
-				// Handle discard
+				// handle discard
 				{
 					if pile_collides(&state.hand, getmousepos()) {
 						top, idx := pile_get_top(&state.hand)
@@ -248,6 +257,7 @@ main :: proc() {
 					top, idx := pile_get_top(&state.discard)
 					if idx != -1 && card_collides(top, getmousepos()) {
 						state.held_pile.cards[0] = top
+						state.held_pile.hold_offset = getmousepos() - top.pos
 						state.held_pile.source_pile = &state.discard
 						state.discard.cards[idx] = nil
 					}
@@ -260,6 +270,7 @@ main :: proc() {
 							if card == nil {continue}
 							if card.flipped && card_collides(card, getmousepos()) {
 								copy(state.held_pile.cards[:], pile.cards[idx:])
+								state.held_pile.hold_offset = getmousepos() - card.pos
 								state.held_pile.source_pile = &pile
 								slice.zero(pile.cards[idx:])
 								break
@@ -333,7 +344,7 @@ main :: proc() {
 			}
 
 			if state.held_pile.cards[0] != nil {
-				draw_pile(&state.held_pile)
+				draw_held_pile(&state.held_pile)
 			}
 
 
