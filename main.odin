@@ -274,7 +274,7 @@ main :: proc() {
 						case -1:
 							copy(state.hand.cards[:], state.discard.cards[:])
 							slice.zero(state.discard.cards[:])
-							slice.reverse(state.hand.cards[:])
+							slice.reverse(state.hand.cards[:discard_size + 1])
 							for card in state.hand.cards {
 								if card == nil {break}
 								card.flipped = false
@@ -285,7 +285,7 @@ main :: proc() {
 								state.hand.cards[:idx + 1],
 							)
 							slice.zero(state.hand.cards[:idx + 1])
-							slice.reverse(state.discard.cards[discard_size + 1:])
+							slice.reverse(state.discard.cards[discard_size + 1:discard_size + 1 + idx  +1])
 							for card in state.discard.cards[discard_size + 1:] {
 								if card == nil {break}
 								card.flipped = true
