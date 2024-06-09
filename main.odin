@@ -124,7 +124,7 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
 		if num_held > 0 && held.source_pile == pile {
-			if top_idx - idx < 3 - num_held {
+			if top_idx - idx < min(num_disc - num_held, 2) {
 				card.pos = pile.pos + pile.spacing * f32(2 - num_held - (top_idx - idx))
 			} else {
 				card.pos = pile.pos
