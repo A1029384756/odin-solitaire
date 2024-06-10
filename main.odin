@@ -41,21 +41,24 @@ CARD_WIDTH :: 100
 CARD_HEIGHT :: 160
 PILE_SPACING :: 20
 
+WIDTH_UNITS :: 1000
+
+units_to_px :: proc(coord: Vector2) -> [2]i32 {
+	win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+	aspect := f32(win_size.x) / f32(win_size.y)
+
+	unit_size: Vector2 = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	scaling := win_size / unit_size
+	scaled_coords := coord * scaling
+	return {i32(scaled_coords.x), i32(scaled_coords.y)}
+}
+
 draw_card :: proc(card: ^Card) {
-	rl.DrawRectangle(
-		i32(card.x + card.offset.x),
-		i32(card.y + card.offset.y),
-		CARD_WIDTH,
-		CARD_HEIGHT,
-		rl.LIGHTGRAY,
-	)
-	rl.DrawRectangleLines(
-		i32(card.x + card.offset.x),
-		i32(card.y + card.offset.y),
-		CARD_WIDTH,
-		CARD_HEIGHT,
-		rl.BLUE,
-	)
+	px_pos := units_to_px(card.pos + card.offset)
+	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+
+	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.LIGHTGRAY)
+	rl.DrawRectangleLines(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.BLUE)
 	if !card.flipped {
 		return
 	}
@@ -79,8 +82,8 @@ draw_card :: proc(card: ^Card) {
 			fmt.tprintf("R: %d\nS: %s", card.rank, label),
 			context.temp_allocator,
 		),
-		i32(card.x + card.offset.x + CARD_WIDTH / 2),
-		i32(card.y + card.offset.y + CARD_HEIGHT / 2),
+		px_pos.x,
+		px_pos.y,
 		20,
 		rl.BLACK,
 	)
@@ -105,7 +108,9 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 }
 
 draw_pile :: proc(pile: ^Pile) {
-	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
+	px_pos := units_to_px(pile.pos)
+	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.YELLOW)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos + pile.spacing * f32(idx)
@@ -114,7 +119,9 @@ draw_pile :: proc(pile: ^Pile) {
 }
 
 draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
-	rl.DrawRectangle(i32(pile.x), i32(pile.y), CARD_WIDTH, CARD_HEIGHT, rl.YELLOW)
+	px_pos := units_to_px(pile.pos)
+	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.YELLOW)
 
 	top, top_idx := pile_get_top(pile)
 	_, held_idx := pile_get_top(held)
@@ -159,7 +166,13 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 }
 
 getmousepos :: proc() -> Vector2 {
-	return Vector2(rl.GetMousePosition())
+	win_size: rl.Vector2 = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+	aspect := f32(win_size.x) / f32(win_size.y)
+
+	unit_size: rl.Vector2 = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	scaling := unit_size / win_size
+	scaled_coords := rl.GetMousePosition() * scaling
+	return Vector2(scaled_coords)
 }
 
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
