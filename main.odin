@@ -8,7 +8,7 @@ import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
 
-Vector2 :: distinct [2]f32
+Vector2 :: [2]f32
 
 Card :: struct {
 	using pos: Vector2,
@@ -47,22 +47,22 @@ PILE_SPACING :: 20
 
 WIDTH_UNITS :: 1000
 
-units_to_px :: proc(coord: Vector2) -> [2]i32 {
+units_to_px :: proc(coord: Vector2) -> [2]f32 {
 	win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
 	aspect := f32(win_size.x) / f32(win_size.y)
 
 	unit_size: Vector2 = {WIDTH_UNITS, WIDTH_UNITS / aspect}
 	scaling := win_size / unit_size
-	scaled_coords := coord * scaling
-	return {i32(scaled_coords.x), i32(scaled_coords.y)}
+	return coord * scaling
 }
 
 draw_card :: proc(card: ^Card) {
 	px_pos := units_to_px(card.pos + card.offset)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 
-	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.LIGHTGRAY)
-	rl.DrawRectangleLines(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.BLUE)
+	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.LIGHTGRAY)
+	rl.DrawRectangleRoundedLines(card_rect, 0.1, 1, 1, rl.BLUE)
 	if !card.flipped {
 		return
 	}
@@ -86,8 +86,8 @@ draw_card :: proc(card: ^Card) {
 			fmt.tprintf("R: %d\nS: %s", card.rank, label),
 			context.temp_allocator,
 		),
-		px_pos.x,
-		px_pos.y,
+		i32(px_pos.x + 10),
+		i32(px_pos.y + 10),
 		20,
 		rl.BLACK,
 	)
@@ -114,7 +114,8 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 draw_pile :: proc(pile: ^Pile) {
 	px_pos := units_to_px(pile.pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
-	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, STACK_COLOR)
+	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos + pile.spacing * f32(idx)
@@ -125,7 +126,8 @@ draw_pile :: proc(pile: ^Pile) {
 draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 	px_pos := units_to_px(pile.pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
-	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, STACK_COLOR)
+	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
 
 	top, top_idx := pile_get_top(pile)
 	_, held_idx := pile_get_top(held)
@@ -265,13 +267,14 @@ State :: struct {
 	discard:   Pile,
 	stacks:    [4]Stack,
 	held_pile: Held_Pile,
+	show_perf: bool,
 }
 
 main :: proc() {
 	state: State
 	init_state(&state)
 
-	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE})
+	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
 	rl.InitWindow(1080, 1080, "Solitaire")
 
 	for !rl.WindowShouldClose() {
@@ -288,6 +291,8 @@ main :: proc() {
 		{
 			// reset game
 			if rl.IsKeyPressed(.R) {init_state(&state)}
+
+			if rl.IsKeyPressed(.P) {state.show_perf = !state.show_perf}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
@@ -436,7 +441,15 @@ main :: proc() {
 				}
 			}
 
-			rl.DrawFPS(0, 0)
+			if state.show_perf {
+				rl.DrawRectangleRounded(
+					{10, 10, 90, 20},
+					0.5,
+					10,
+					rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
+				)
+				rl.DrawFPS(15, 11)
+			}
 			rl.EndDrawing()
 		}
 
