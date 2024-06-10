@@ -37,6 +37,10 @@ Held_Pile :: struct {
 	hold_offset: Vector2,
 }
 
+
+BG_COLOR :: rl.Color{0x34, 0xA2, 0x49, 0xFF}
+STACK_COLOR :: rl.Color{0x2B, 0x7B, 0x3B, 0xFF}
+
 CARD_WIDTH :: 100
 CARD_HEIGHT :: 160
 PILE_SPACING :: 20
@@ -110,7 +114,7 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 draw_pile :: proc(pile: ^Pile) {
 	px_pos := units_to_px(pile.pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
-	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.YELLOW)
+	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, STACK_COLOR)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos + pile.spacing * f32(idx)
@@ -121,7 +125,7 @@ draw_pile :: proc(pile: ^Pile) {
 draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 	px_pos := units_to_px(pile.pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
-	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, rl.YELLOW)
+	rl.DrawRectangle(px_pos.x, px_pos.y, px_size.x, px_size.y, STACK_COLOR)
 
 	top, top_idx := pile_get_top(pile)
 	_, held_idx := pile_get_top(held)
@@ -409,7 +413,7 @@ main :: proc() {
 		// rendering 
 		{
 			rl.BeginDrawing()
-			rl.ClearBackground(rl.RAYWHITE)
+			rl.ClearBackground(BG_COLOR)
 
 			for &pile in state.piles {
 				draw_pile(&pile)
@@ -423,9 +427,12 @@ main :: proc() {
 
 			draw_held_pile(&state.held_pile)
 
-			for &card in state.cards {
-				if linalg.distance(card.offset, 0) > 0 {
-					draw_card(&card)
+			for &pile in state.piles {
+				for card in pile.cards {
+					if card == nil {continue}
+					if linalg.distance(card.offset, 0) > 0 {
+						draw_card(card)
+					}
 				}
 			}
 
