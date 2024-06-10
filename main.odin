@@ -423,6 +423,12 @@ main :: proc() {
 
 			draw_held_pile(&state.held_pile)
 
+			for &card in state.cards {
+				if linalg.distance(card.offset, 0) > 0 {
+					draw_card(&card)
+				}
+			}
+
 			rl.DrawFPS(0, 0)
 			rl.EndDrawing()
 		}
