@@ -183,7 +183,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 		card.offset =
 			(held_pile.pos - held_pile.hold_offset) -
 			pile.pos -
-			f32(min(pile.max_visible, idx)) * pile.spacing
+			f32(min(idx + 1, pile.max_visible - 1)) * pile.spacing
 	}
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
@@ -280,8 +280,8 @@ main :: proc() {
 		{
 			state.held_pile.pos = getmousepos()
 			for &card in state.cards {
-				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 25)
-				if linalg.distance(card.offset, 0) < 5 {card.offset = 0}
+				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 15)
+				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
 			}
 		}
 
@@ -330,6 +330,9 @@ main :: proc() {
 									f32(min(state.discard.max_visible, idx)) *
 										state.discard.spacing
 							}
+							for card in state.discard.cards[:discard_size + 1] {
+								card.offset = card.pos - state.discard.pos
+							}
 						case:
 							copy(
 								state.discard.cards[discard_size + 1:],
@@ -346,6 +349,9 @@ main :: proc() {
 									state.discard.pos -
 									f32(min(state.discard.max_visible, idx)) *
 										state.discard.spacing
+							}
+							for card in state.discard.cards[:discard_size + 1] {
+								card.offset = card.pos - state.discard.pos
 							}
 						}
 					}
@@ -388,6 +394,20 @@ main :: proc() {
 						   pile_can_place(&pile, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
+							if state.held_pile.source_pile == &state.discard {
+								switch idx {
+								case -1:
+								case 0 ..< 3:
+								case:
+									for card, idx in state.discard.cards[idx - 1:idx + 1] {
+										card.offset =
+											card.pos -
+											state.discard.pos -
+											f32(min(state.discard.max_visible - 1, idx + 1)) *
+												state.discard.spacing
+									}
+								}
+							}
 							held_pile_send_to_pile(&state.held_pile, &pile)
 						}
 					}
@@ -401,6 +421,20 @@ main :: proc() {
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
+							if state.held_pile.source_pile == &state.discard {
+								switch idx {
+								case -1:
+								case 0 ..< 3:
+								case:
+									for card, idx in state.discard.cards[idx - 1:idx + 1] {
+										card.offset =
+											card.pos -
+											state.discard.pos -
+											f32(min(state.discard.max_visible - 1, idx + 1)) *
+												state.discard.spacing
+									}
+								}
+							}
 							held_pile_send_to_pile(&state.held_pile, &stack)
 						}
 					}
@@ -436,13 +470,12 @@ main :: proc() {
 				draw_pile(&pile)
 			}
 
-			draw_pile(&state.hand)
-			draw_discard(&state.discard, &state.held_pile)
 			for &stack in state.stacks {
 				draw_pile(&stack)
 			}
 
-			draw_held_pile(&state.held_pile)
+			draw_pile(&state.hand)
+			draw_discard(&state.discard, &state.held_pile)
 
 			for &pile in state.piles {
 				for card in pile.cards {
@@ -452,6 +485,8 @@ main :: proc() {
 					}
 				}
 			}
+
+			draw_held_pile(&state.held_pile)
 
 			if state.show_perf {
 				rl.DrawRectangleRounded(
@@ -464,8 +499,6 @@ main :: proc() {
 			}
 			rl.EndDrawing()
 		}
-
-		free_all(context.temp_allocator)
 	}
 
 	rl.CloseWindow()
