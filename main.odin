@@ -42,7 +42,7 @@ BG_COLOR :: rl.Color{0x34, 0xA2, 0x49, 0xFF}
 STACK_COLOR :: rl.Color{0x2B, 0x7B, 0x3B, 0xFF}
 
 CARD_WIDTH :: 100
-CARD_HEIGHT :: 160
+CARD_HEIGHT :: 134
 PILE_SPACING :: 40
 
 WIDTH_UNITS :: 1000
@@ -71,7 +71,14 @@ draw_card :: proc(card: ^Card) {
 		rl.DrawTexturePro(CARDS, tex_rect, output_pos, 0, 0, rl.WHITE)
 	} else {
 		output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-		rl.DrawTexturePro(BACKS, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, output_pos, 0, 0, rl.WHITE)
+		rl.DrawTexturePro(
+			BACKS,
+			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
+			output_pos,
+			0,
+			0,
+			rl.WHITE,
+		)
 	}
 }
 
@@ -211,7 +218,7 @@ init_state :: proc(state: ^State) {
 	pile_card_count := 1
 	for &pile, idx in state.piles {
 		pile.spacing.y = PILE_SPACING
-		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 300}
+		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 250}
 		for i in 0 ..< pile_card_count {
 			pile.cards[i] = &state.cards[total_pile_dealt]
 			total_pile_dealt += 1
@@ -255,9 +262,8 @@ State :: struct {
 }
 
 CARDS: rl.Texture
-CARD_TEX_SIZE: [2]f32 : {71, 95}
-
 BACKS: rl.Texture
+CARD_TEX_SIZE: [2]f32 : {71, 95}
 
 main :: proc() {
 	state: State
