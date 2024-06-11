@@ -43,7 +43,7 @@ STACK_COLOR :: rl.Color{0x2B, 0x7B, 0x3B, 0xFF}
 
 CARD_WIDTH :: 100
 CARD_HEIGHT :: 160
-PILE_SPACING :: 20
+PILE_SPACING :: 40
 
 WIDTH_UNITS :: 1000
 
@@ -61,36 +61,18 @@ draw_card :: proc(card: ^Card) {
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 
 	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.LIGHTGRAY)
-	rl.DrawRectangleRoundedLines(card_rect, 0.1, 1, 1, rl.BLUE)
-	if !card.flipped {
-		return
-	}
+	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.WHITE)
+	rl.DrawRectangleRoundedLines(card_rect, 0.1, 1, 1, rl.LIGHTGRAY)
+	if card.flipped {
+		tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
+		tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
 
-	label: string
-	switch card.suit {
-	case 0:
-		label = "h"
-	case 1:
-		label = "c"
-	case 2:
-		label = "d"
-	case 3:
-		label = "s"
-	case:
-		fmt.eprintln("bad suit")
+		output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+		rl.DrawTexturePro(CARDS, tex_rect, output_pos, 0, 0, rl.WHITE)
+	} else {
+		output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+		rl.DrawTexturePro(BACKS, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, output_pos, 0, 0, rl.WHITE)
 	}
-
-	rl.DrawText(
-		strings.clone_to_cstring(
-			fmt.tprintf("R: %d\nS: %s", card.rank, label),
-			context.temp_allocator,
-		),
-		i32(px_pos.x + 10),
-		i32(px_pos.y + 10),
-		20,
-		rl.BLACK,
-	)
 }
 
 card_collides :: proc(card: Vector2, coord: Vector2) -> bool {
@@ -216,7 +198,9 @@ stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 }
 
 init_state :: proc(state: ^State) {
-	state^ = State{show_perf=state.show_perf}
+	state^ = State {
+		show_perf = state.show_perf,
+	}
 	for &card, idx in state.cards {
 		card.rank = idx % 13
 		card.suit = idx % 4
@@ -270,12 +254,20 @@ State :: struct {
 	show_perf: bool,
 }
 
+CARDS: rl.Texture
+CARD_TEX_SIZE: [2]f32 : {71, 95}
+
+BACKS: rl.Texture
+
 main :: proc() {
 	state: State
 	init_state(&state)
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
 	rl.InitWindow(1080, 1080, "Solitaire")
+
+	CARDS = rl.LoadTexture("assets/playing_cards.png")
+	BACKS = rl.LoadTexture("assets/card_backs.png")
 
 	for !rl.WindowShouldClose() {
 		// general update
