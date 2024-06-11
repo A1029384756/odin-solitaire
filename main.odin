@@ -305,9 +305,13 @@ main :: proc() {
 							copy(state.hand.cards[:], state.discard.cards[:])
 							slice.zero(state.discard.cards[:])
 							slice.reverse(state.hand.cards[:discard_size + 1])
-							for card in state.hand.cards {
+							for card, idx in state.hand.cards {
 								if card == nil {break}
 								card.flipped = false
+								card.offset =
+									state.discard.pos -
+									state.hand.pos -
+									f32(min(state.hand.max_visible, idx)) * state.hand.spacing
 							}
 						case 0 ..< 3:
 							copy(
@@ -322,6 +326,11 @@ main :: proc() {
 								if card == nil {break}
 								card.flipped = true
 								card.pos = state.discard.pos
+								card.offset =
+									state.hand.pos -
+									state.discard.pos -
+									f32(min(state.discard.max_visible, idx)) *
+										state.discard.spacing
 							}
 						case:
 							copy(
@@ -334,6 +343,11 @@ main :: proc() {
 								if card == nil {break}
 								card.flipped = true
 								card.pos = state.discard.pos
+								card.offset =
+									state.hand.pos -
+									state.discard.pos -
+									f32(min(state.discard.max_visible, idx)) *
+										state.discard.spacing
 							}
 						}
 					}
