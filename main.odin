@@ -216,7 +216,7 @@ stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 }
 
 init_state :: proc(state: ^State) {
-	state^ = State{}
+	state^ = State{show_perf=state.show_perf}
 	for &card, idx in state.cards {
 		card.rank = idx % 13
 		card.suit = idx % 4
