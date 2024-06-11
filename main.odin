@@ -280,7 +280,8 @@ main :: proc() {
 		{
 			state.held_pile.pos = getmousepos()
 			for &card in state.cards {
-				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 15)
+				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
+
 				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
 			}
 		}
