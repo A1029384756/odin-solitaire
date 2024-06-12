@@ -46,18 +46,26 @@ CARD_HEIGHT :: 134
 PILE_SPACING :: 40
 
 WIDTH_UNITS :: 1000
+HEIGHT_UNITS :: 1000
+UNIT_ASPECT :: WIDTH_UNITS / HEIGHT_UNITS
 
 units_to_px :: proc(coord: Vector2) -> [2]f32 {
 	win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-	aspect := f32(win_size.x) / f32(win_size.y)
+	aspect := win_size.x / win_size.y
 
-	unit_size: Vector2 = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	unit_size: Vector2
+	if aspect > UNIT_ASPECT {
+		unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+	} else {
+		unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	}
+
 	scaling := win_size / unit_size
 	return coord * scaling
 }
 
 draw_card :: proc(card: ^Card) {
-	px_pos := units_to_px(card.pos + card.offset)
+	px_pos := units_to_px(card.pos + card.offset + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 
 	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
@@ -84,10 +92,10 @@ draw_card :: proc(card: ^Card) {
 
 card_collides :: proc(card: Vector2, coord: Vector2) -> bool {
 	return(
-		card.x < coord.x &&
-		card.y < coord.y &&
-		card.x + CARD_WIDTH > coord.x &&
-		card.y + CARD_HEIGHT > coord.y \
+		card.x < coord.x - state.camera_pos.x &&
+		card.y < coord.y - state.camera_pos.y &&
+		card.x + CARD_WIDTH > coord.x - state.camera_pos.x &&
+		card.y + CARD_HEIGHT > coord.y - state.camera_pos.y \
 	)
 }
 
@@ -101,7 +109,7 @@ pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
 }
 
 draw_pile :: proc(pile: ^Pile) {
-	px_pos := units_to_px(pile.pos)
+	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
@@ -113,7 +121,7 @@ draw_pile :: proc(pile: ^Pile) {
 }
 
 draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
-	px_pos := units_to_px(pile.pos)
+	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
@@ -159,14 +167,19 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 	return nil, -1
 }
 
-getmousepos :: proc() -> Vector2 {
-	win_size: rl.Vector2 = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-	aspect := f32(win_size.x) / f32(win_size.y)
+get_mouse_pos :: proc() -> Vector2 {
+	win_size: Vector2 = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+	aspect := win_size.x / win_size.y
 
-	unit_size: rl.Vector2 = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	unit_size: Vector2
+	if aspect > UNIT_ASPECT {
+		unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+	} else {
+		unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+	}
+
 	scaling := unit_size / win_size
-	scaled_coords := rl.GetMousePosition() * scaling
-	return Vector2(scaled_coords)
+	return rl.GetMousePosition() * scaling
 }
 
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
@@ -209,7 +222,8 @@ stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 
 init_state :: proc(state: ^State) {
 	state^ = State {
-		show_perf = state.show_perf,
+		show_perf  = state.show_perf,
+		camera_pos = state.camera_pos,
 	}
 	for &card, idx in state.cards {
 		card.rank = idx % 13
@@ -255,21 +269,23 @@ init_state :: proc(state: ^State) {
 }
 
 State :: struct {
-	cards:     [52]Card,
-	piles:     [7]Pile,
-	hand:      Pile,
-	discard:   Pile,
-	stacks:    [4]Stack,
-	held_pile: Held_Pile,
-	show_perf: bool,
+	cards:      [52]Card,
+	piles:      [7]Pile,
+	hand:       Pile,
+	discard:    Pile,
+	stacks:     [4]Stack,
+	held_pile:  Held_Pile,
+	show_perf:  bool,
+	camera_pos: Vector2,
 }
 
 CARDS: rl.Texture
 BACKS: rl.Texture
 CARD_TEX_SIZE: [2]f32 : {71, 95}
 
+state: State
+
 main :: proc() {
-	state: State
 	init_state(&state)
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
@@ -286,10 +302,32 @@ main :: proc() {
 	for !rl.WindowShouldClose() {
 		// general update
 		{
-			state.held_pile.pos = getmousepos()
+			// Camera update
+			{
+				win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+				aspect := win_size.x / win_size.y
+
+				unit_size: Vector2
+				if aspect > UNIT_ASPECT {
+					unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+				} else {
+					unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+				}
+
+				scaling := unit_size / win_size
+				win_size_units := win_size * scaling
+
+				horz_overflow := win_size_units.x - WIDTH_UNITS
+				if horz_overflow > 0 {
+					state.camera_pos.x = horz_overflow / 2
+				} else {
+					state.camera_pos.x = 0
+				}
+			}
+
+			state.held_pile.pos = get_mouse_pos()
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
-
 				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
 			}
 		}
@@ -304,7 +342,7 @@ main :: proc() {
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
 				{
-					if pile_collides(&state.hand, getmousepos()) {
+					if pile_collides(&state.hand, get_mouse_pos()) {
 						top, idx := pile_get_top(&state.hand)
 						_, discard_size := pile_get_top(&state.discard)
 						switch idx {
@@ -369,9 +407,9 @@ main :: proc() {
 				// pick up from discard 
 				{
 					top, idx := pile_get_top(&state.discard)
-					if idx != -1 && card_collides(top, getmousepos()) {
+					if idx != -1 && card_collides(top, get_mouse_pos()) {
 						state.held_pile.cards[0] = top
-						state.held_pile.hold_offset = getmousepos() - top.pos
+						state.held_pile.hold_offset = get_mouse_pos() - top.pos
 						state.held_pile.source_pile = &state.discard
 						state.discard.cards[idx] = nil
 					}
@@ -382,9 +420,9 @@ main :: proc() {
 					for &pile in state.piles {
 						#reverse for card, idx in pile.cards {
 							if card == nil {continue}
-							if card.flipped && card_collides(card, getmousepos()) {
+							if card.flipped && card_collides(card, get_mouse_pos()) {
 								copy(state.held_pile.cards[:], pile.cards[idx:])
-								state.held_pile.hold_offset = getmousepos() - card.pos
+								state.held_pile.hold_offset = get_mouse_pos() - card.pos
 								state.held_pile.source_pile = &pile
 								slice.zero(pile.cards[idx:])
 								break
@@ -399,7 +437,7 @@ main :: proc() {
 				{
 					for &pile in state.piles {
 						if state.held_pile.source_pile == nil {continue}
-						if pile_collides(&pile, getmousepos()) &&
+						if pile_collides(&pile, get_mouse_pos()) &&
 						   pile_can_place(&pile, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
@@ -425,7 +463,7 @@ main :: proc() {
 				// add card to stack
 				{
 					for &stack in state.stacks {
-						if pile_collides(&stack, getmousepos()) &&
+						if pile_collides(&stack, get_mouse_pos()) &&
 						   state.held_pile.cards[0] != nil &&
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
@@ -486,9 +524,18 @@ main :: proc() {
 			draw_pile(&state.hand)
 			draw_discard(&state.discard, &state.held_pile)
 
+			for &stack in state.stacks {
+				for card in stack.cards {
+					if card == nil {break}
+					if linalg.distance(card.offset, 0) > 0 {
+						draw_card(card)
+					}
+				}
+			}
+
 			for &pile in state.piles {
 				for card in pile.cards {
-					if card == nil {continue}
+					if card == nil {break}
 					if linalg.distance(card.offset, 0) > 0 {
 						draw_card(card)
 					}
