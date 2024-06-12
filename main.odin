@@ -13,9 +13,11 @@ Vector2 :: [2]f32
 Card :: struct {
 	using pos: Vector2,
 	offset:    Vector2,
-	flipped:   bool,
 	rank:      int,
 	suit:      int,
+	scale:     f32,
+	flipped:   bool,
+	held:      bool,
 }
 
 Pile :: struct {
@@ -98,6 +100,9 @@ px_to_units :: #force_inline proc(px: Vector2) -> Vector2 {
 draw_card :: proc(card: ^Card) {
 	px_pos := units_to_px(card.pos + card.offset + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	scaled_size := px_size * card.scale
+	px_pos -= (scaled_size - px_size) / 2
+  px_size = scaled_size
 
 	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.WHITE)
@@ -208,6 +213,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 
 	for card in held_pile.cards[:] {
 		if card == nil {break}
+		card.held = false
 		card.offset =
 			(held_pile.pos - held_pile.hold_offset) -
 			pile.pos -
@@ -244,6 +250,7 @@ init_state :: proc(state: ^State) {
 	for &card, idx in state.cards {
 		card.rank = idx % 13
 		card.suit = idx % 4
+		card.scale = 1
 	}
 	rand.shuffle(state.cards[:])
 
@@ -356,6 +363,7 @@ main :: proc() {
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
 				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
+				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
 			}
 		}
 
@@ -436,6 +444,7 @@ main :: proc() {
 					top, idx := pile_get_top(&state.discard)
 					if idx != -1 && card_collides(top, state.mouse_pos) {
 						state.held_pile.cards[0] = top
+						state.held_pile.cards[0].held = true
 						state.held_pile.hold_offset = state.mouse_pos - top.pos
 						state.held_pile.source_pile = &state.discard
 						state.discard.cards[idx] = nil
@@ -449,6 +458,10 @@ main :: proc() {
 							if card == nil {continue}
 							if card.flipped && card_collides(card, state.mouse_pos) {
 								copy(state.held_pile.cards[:], pile.cards[idx:])
+								for card in state.held_pile.cards {
+									if card == nil {break}
+									card.held = true
+								}
 								state.held_pile.hold_offset = state.mouse_pos - card.pos
 								state.held_pile.source_pile = &pile
 								slice.zero(pile.cards[idx:])
