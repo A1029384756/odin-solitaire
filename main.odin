@@ -195,7 +195,11 @@ pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 	if top == nil {
 		return held.cards[0].rank == 12
 	}
-	return held.cards[0].rank == top.rank - 1 && held.cards[0].suit % 2 != top.suit % 2
+	return(
+		held.cards[0].rank == top.rank - 1 &&
+		held.cards[0].suit % 2 != top.suit % 2 &&
+		top.flipped \
+	)
 }
 
 stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
