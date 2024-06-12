@@ -41,6 +41,8 @@ Held_Pile :: struct {
 BG_COLOR :: rl.Color{0x34, 0xA2, 0x49, 0xFF}
 STACK_COLOR :: rl.Color{0x2B, 0x7B, 0x3B, 0xFF}
 
+ICON_SIZE :: 18
+
 CARD_WIDTH :: 100
 CARD_HEIGHT :: 134
 PILE_SPACING :: 40
@@ -49,19 +51,48 @@ WIDTH_UNITS :: 1000
 HEIGHT_UNITS :: 1000
 UNIT_ASPECT :: WIDTH_UNITS / HEIGHT_UNITS
 
-units_to_px :: proc(coord: Vector2) -> [2]f32 {
-	win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-	aspect := win_size.x / win_size.y
+Icon :: enum {
+	RESET,
+	SHOW_PERF,
+}
 
-	unit_size: Vector2
-	if aspect > UNIT_ASPECT {
-		unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+icon_rect := [Icon]rl.Rectangle {
+	.RESET     = rl.Rectangle{3 * ICON_SIZE, 13 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.SHOW_PERF = rl.Rectangle{14 * ICON_SIZE, 12 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+}
+
+icon_button :: proc(
+	rect: rl.Rectangle,
+	icon: Icon,
+	icon_color: rl.Color,
+	icon_scale: f32 = 2,
+) -> bool {
+	clicked: bool
+
+	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
+		if rl.IsMouseButtonReleased(
+			.LEFT,
+		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
 	} else {
-		unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
 	}
+	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
 
-	scaling := win_size / unit_size
-	return coord * scaling
+	overflow := Vector2{rect.width, rect.height}
+	overflow -= ICON_SIZE * f32(icon_scale)
+
+	rl.BeginBlendMode(.ALPHA)
+	rl.DrawTexturePro(ICONS, icon_rect[icon], rect, 0, 0, rl.DARKGRAY)
+	rl.EndBlendMode()
+	return clicked
+}
+
+units_to_px :: #force_inline proc(coord: Vector2) -> Vector2 {
+	return coord * state.unit_to_px_scaling
+}
+
+px_to_units :: #force_inline proc(px: Vector2) -> Vector2 {
+	return px / state.unit_to_px_scaling
 }
 
 draw_card :: proc(card: ^Card) {
@@ -167,21 +198,6 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 	return nil, -1
 }
 
-get_mouse_pos :: proc() -> Vector2 {
-	win_size: Vector2 = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-	aspect := win_size.x / win_size.y
-
-	unit_size: Vector2
-	if aspect > UNIT_ASPECT {
-		unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
-	} else {
-		unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
-	}
-
-	scaling := unit_size / win_size
-	return rl.GetMousePosition() * scaling
-}
-
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	top, idx := pile_get_top(pile)
 	if top == nil {
@@ -251,15 +267,15 @@ init_state :: proc(state: ^State) {
 		state.hand.cards[idx] = &card
 	}
 	state.hand.spacing.x = 4
-	state.hand.pos = {50, 50}
+	state.hand.pos = {50, 70}
 	state.hand.max_visible = 52
 
 	state.discard.spacing.x = -20
-	state.discard.pos = {350, 50}
+	state.discard.pos = {350, 70}
 	state.discard.max_visible = 3
 
 	for &stack, idx in state.stacks {
-		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 50}
+		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 70}
 		stack.suit = idx
 		stack.max_visible = 1
 	}
@@ -269,19 +285,22 @@ init_state :: proc(state: ^State) {
 }
 
 State :: struct {
-	cards:      [52]Card,
-	piles:      [7]Pile,
-	hand:       Pile,
-	discard:    Pile,
-	stacks:     [4]Stack,
-	held_pile:  Held_Pile,
-	show_perf:  bool,
-	camera_pos: Vector2,
+	cards:              [52]Card,
+	piles:              [7]Pile,
+	hand:               Pile,
+	discard:            Pile,
+	stacks:             [4]Stack,
+	held_pile:          Held_Pile,
+	show_perf:          bool,
+	camera_pos:         Vector2,
+	mouse_pos:          Vector2,
+	unit_to_px_scaling: Vector2,
 }
 
 CARDS: rl.Texture
 BACKS: rl.Texture
-CARD_TEX_SIZE: [2]f32 : {71, 95}
+CARD_TEX_SIZE: Vector2 : {71, 95}
+ICONS: rl.Texture
 
 state: State
 
@@ -297,25 +316,33 @@ main :: proc() {
 	rl.InitWindow(1080, 1080, "Solitaire")
 
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
+	defer rl.UnloadTexture(CARDS)
+
 	BACKS = rl.LoadTexture("assets/card_backs.png")
+	defer rl.UnloadTexture(BACKS)
+
+	ICONS = rl.LoadTexture("assets/icons.png")
+	defer rl.UnloadTexture(ICONS)
 
 	for !rl.WindowShouldClose() {
 		// general update
 		{
-			// Camera update
-			{
-				win_size: Vector2 = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-				aspect := win_size.x / win_size.y
+			state.mouse_pos = rl.GetMousePosition() * (1 / state.unit_to_px_scaling)
 
-				unit_size: Vector2
+			// Camera horizontal centering
+			{
+				win_size_px := Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+				aspect := win_size_px.x / win_size_px.y
+
+				win_size_unit: Vector2
 				if aspect > UNIT_ASPECT {
-					unit_size = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+					win_size_unit = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
 				} else {
-					unit_size = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+					win_size_unit = {WIDTH_UNITS, WIDTH_UNITS / aspect}
 				}
 
-				scaling := unit_size / win_size
-				win_size_units := win_size * scaling
+				state.unit_to_px_scaling = win_size_px / win_size_unit
+				win_size_units := px_to_units(win_size_px)
 
 				horz_overflow := win_size_units.x - WIDTH_UNITS
 				if horz_overflow > 0 {
@@ -325,7 +352,7 @@ main :: proc() {
 				}
 			}
 
-			state.held_pile.pos = get_mouse_pos()
+			state.held_pile.pos = state.mouse_pos
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
 				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
@@ -342,7 +369,7 @@ main :: proc() {
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
 				{
-					if pile_collides(&state.hand, get_mouse_pos()) {
+					if pile_collides(&state.hand, state.mouse_pos) {
 						top, idx := pile_get_top(&state.hand)
 						_, discard_size := pile_get_top(&state.discard)
 						switch idx {
@@ -407,9 +434,9 @@ main :: proc() {
 				// pick up from discard 
 				{
 					top, idx := pile_get_top(&state.discard)
-					if idx != -1 && card_collides(top, get_mouse_pos()) {
+					if idx != -1 && card_collides(top, state.mouse_pos) {
 						state.held_pile.cards[0] = top
-						state.held_pile.hold_offset = get_mouse_pos() - top.pos
+						state.held_pile.hold_offset = state.mouse_pos - top.pos
 						state.held_pile.source_pile = &state.discard
 						state.discard.cards[idx] = nil
 					}
@@ -420,9 +447,9 @@ main :: proc() {
 					for &pile in state.piles {
 						#reverse for card, idx in pile.cards {
 							if card == nil {continue}
-							if card.flipped && card_collides(card, get_mouse_pos()) {
+							if card.flipped && card_collides(card, state.mouse_pos) {
 								copy(state.held_pile.cards[:], pile.cards[idx:])
-								state.held_pile.hold_offset = get_mouse_pos() - card.pos
+								state.held_pile.hold_offset = state.mouse_pos - card.pos
 								state.held_pile.source_pile = &pile
 								slice.zero(pile.cards[idx:])
 								break
@@ -437,7 +464,7 @@ main :: proc() {
 				{
 					for &pile in state.piles {
 						if state.held_pile.source_pile == nil {continue}
-						if pile_collides(&pile, get_mouse_pos()) &&
+						if pile_collides(&pile, state.mouse_pos) &&
 						   pile_can_place(&pile, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
@@ -463,7 +490,7 @@ main :: proc() {
 				// add card to stack
 				{
 					for &stack in state.stacks {
-						if pile_collides(&stack, get_mouse_pos()) &&
+						if pile_collides(&stack, state.mouse_pos) &&
 						   state.held_pile.cards[0] != nil &&
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
@@ -511,51 +538,76 @@ main :: proc() {
 		// rendering 
 		{
 			rl.BeginDrawing()
-			rl.ClearBackground(BG_COLOR)
 
-			for &pile in state.piles {
-				draw_pile(&pile)
-			}
+			// card rendering
+			{
+				rl.ClearBackground(BG_COLOR)
 
-			for &stack in state.stacks {
-				draw_pile(&stack)
-			}
+				for &pile in state.piles {
+					draw_pile(&pile)
+				}
 
-			draw_pile(&state.hand)
-			draw_discard(&state.discard, &state.held_pile)
+				for &stack in state.stacks {
+					draw_pile(&stack)
+				}
 
-			for &stack in state.stacks {
-				for card in stack.cards {
-					if card == nil {break}
-					if linalg.distance(card.offset, 0) > 0 {
-						draw_card(card)
+				draw_pile(&state.hand)
+				draw_discard(&state.discard, &state.held_pile)
+
+				for &stack in state.stacks {
+					for card in stack.cards {
+						if card == nil {break}
+						if linalg.distance(card.offset, 0) > 0 {
+							draw_card(card)
+						}
 					}
 				}
-			}
 
-			for &pile in state.piles {
-				for card in pile.cards {
-					if card == nil {break}
-					if linalg.distance(card.offset, 0) > 0 {
-						draw_card(card)
+				for &pile in state.piles {
+					for card in pile.cards {
+						if card == nil {break}
+						if linalg.distance(card.offset, 0) > 0 {
+							draw_card(card)
+						}
 					}
 				}
-			}
 
-			draw_held_pile(&state.held_pile)
+				draw_held_pile(&state.held_pile)
 
-			if state.show_perf {
-				rl.DrawRectangleRounded(
-					{10, 10, 90, 20},
-					0.5,
-					10,
-					rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
-				)
-				rl.DrawFPS(15, 11)
+				if state.show_perf {
+					perf_px := Vector2 {
+						f32(rl.GetScreenWidth()) - 100,
+						f32(rl.GetScreenHeight()) - 30,
+					}
+					rl.DrawRectangleRounded(
+						{perf_px.x, perf_px.y, 90, 20},
+						0.5,
+						10,
+						rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
+					)
+					rl.DrawFPS(i32(perf_px.x) + 5, i32(perf_px.y))
+				}
 			}
-			rl.EndDrawing()
 		}
+
+		// ui rendering
+		{
+			// toolbar
+			{
+				out_loc := units_to_px({50, 50})
+				rl.DrawRectangle(0, 0, rl.GetScreenWidth(), i32(out_loc.y), rl.LIGHTGRAY)
+				if icon_button({0, 0, out_loc.x, out_loc.y}, .RESET, rl.DARKGRAY) {
+					init_state(&state)
+				}
+				if icon_button({out_loc.x + 2, 0, out_loc.x, out_loc.y}, .SHOW_PERF, rl.DARKGRAY) {
+					state.show_perf = !state.show_perf
+				}
+			}
+		}
+
+		rl.EndDrawing()
 	}
+
 
 	rl.CloseWindow()
 }
