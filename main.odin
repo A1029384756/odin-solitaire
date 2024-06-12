@@ -273,6 +273,11 @@ main :: proc() {
 	init_state(&state)
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
+
+	when !ODIN_DEBUG {
+		rl.SetTraceLogLevel(.ERROR)
+	}
+
 	rl.InitWindow(1080, 1080, "Solitaire")
 
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
