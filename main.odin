@@ -83,7 +83,7 @@ icon_button :: proc(
 	return clicked
 }
 
-text_button :: proc(rect: rl.Rectangle, text: string, color: rl.Color, font_size: i32) -> bool {
+text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_size: f32) -> bool {
 	clicked: bool
 
 	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
@@ -94,24 +94,18 @@ text_button :: proc(rect: rl.Rectangle, text: string, color: rl.Color, font_size
 		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
 	}
 	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
-
-	text_size := rl.MeasureTextEx(
-		rl.GetFontDefault(),
-		strings.unsafe_string_to_cstring(text),
-		f32(font_size),
-		0,
-	)
-
-	text_offset := Vector2{rect.width, rect.height} - text_size
-
-	rl.DrawText(
-		strings.unsafe_string_to_cstring(text),
-		i32(rect.x + text_offset.x / 2),
-		i32(rect.y + text_offset.y / 2),
-		font_size,
-		color,
-	)
+	draw_text_centered(text, font_size, {rect.x, rect.y} + {rect.width, rect.height} / 2, color)
 	return clicked
+}
+
+draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
+	width := rl.MeasureTextEx(rl.GetFontDefault(), message, size, 5)
+	rl.DrawText(message, i32(pos.x - width.x / 2), i32(pos.y - width.y / 2), i32(size), color)
+}
+
+ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
+	C4: f32 = 2 * math.PI / 3
+	return math.pow(2, -10 * state.fade_in) * math.sin((state.fade_in * 10 - 0.75) * C4) + 1
 }
 
 units_to_px :: #force_inline proc(coord: Vector2) -> Vector2 {
@@ -142,7 +136,13 @@ draw_card :: proc(card: ^Card) {
 
 	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.WHITE)
-	rl.DrawRectangleRoundedLines(card_rect, 0.1, 1, 1, rl.LIGHTGRAY)
+	rl.DrawRectangleRoundedLines(
+		{card_rect.x + 1, card_rect.y + 1, card_rect.width - 1, card_rect.height - 1},
+		0.1,
+		1,
+		2.5,
+		rl.LIGHTGRAY,
+	)
 	if card.flipped {
 		tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
 		tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
@@ -587,6 +587,7 @@ main :: proc() {
 								}
 							}
 
+							state.has_won = true
 							held_pile_send_to_pile(&state.held_pile, &pile)
 						}
 					}
@@ -747,17 +748,11 @@ main :: proc() {
 
 					// victory screen
 					if state.has_won {
-						C4: f32 = 2 * math.PI / 3
-						if state.fade_in < 1 {
-							state.fade_in += rl.GetFrameTime()
-						} else {
-							state.fade_in = 1
-						}
+						state.fade_in =
+							state.fade_in + rl.GetFrameTime() if state.fade_in < 1 else 1
 
-						anim :=
-							math.pow(2, -10 * state.fade_in) *
-								math.sin((state.fade_in * 10 - 0.75) * C4) +
-							1
+						anim := ease_out_elastic(state.fade_in)
+
 						rl.DrawRectangle(
 							0,
 							0,
@@ -766,25 +761,15 @@ main :: proc() {
 							{0x1F, 0x1F, 0x1, u8(0x5F * state.fade_in)},
 						)
 
-						WIN_FONT_SIZE :: 60
-						WIN_MSG :: "YOU WIN!"
-						text_width := rl.MeasureText(WIN_MSG, WIN_FONT_SIZE)
-						rl.DrawText(
-							WIN_MSG,
-							i32(state.resolution.x / 2) - text_width / 2,
-							i32(anim * state.resolution.y / 2) - 60,
-							WIN_FONT_SIZE,
-							rl.WHITE,
-						)
+						draw_text_centered("YOU WIN!", 60, state.resolution / 2, rl.WHITE)
 
-						BUTTON_SIZE :: Vector2{500, 150}
-						button_px := units_to_px(BUTTON_SIZE)
+						button_px := units_to_px({500, 150})
 						if text_button(
 							{
 								state.resolution.x / 2 - button_px.x / 2,
 								anim * state.resolution.y / 2 -
 								button_px.y / 2 +
-								100 * state.unit_to_px_scaling.y,
+								200 * state.unit_to_px_scaling.y,
 								button_px.x,
 								button_px.y,
 							},
