@@ -6,6 +6,12 @@ uniform vec2 u_resolution;
 uniform float u_time;
 uniform float u_hue;
 
+float effectDensity = 4.0;
+float effectScale = 0.3;
+float timeScale = 0.000125;
+float desaturationPercent = 0.7;
+float brightnessPercent = 0.5;
+
 vec3 hueShift( vec3 color, float hueAdjust ) {
     const vec3  kRGBToYPrime = vec3 (0.299, 0.587, 0.114);
     const vec3  kRGBToI      = vec3 (0.596, -0.275, -0.321);
@@ -32,11 +38,6 @@ vec3 hueShift( vec3 color, float hueAdjust ) {
 }
 
 void main() {
-    float effectDensity = 4.0;
-    float effectScale = 0.3;
-    float timeScale = 0.000125;
-    float desaturationPercent = 0.7;
-    float brightnessPercent = 0.5;
     float scaledTime = u_time * timeScale;
     
     // Normalized pixel coordinates (from 0 to 1)
