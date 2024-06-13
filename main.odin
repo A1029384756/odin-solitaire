@@ -98,11 +98,22 @@ px_to_units :: #force_inline proc(px: Vector2) -> Vector2 {
 }
 
 draw_card :: proc(card: ^Card) {
+	win_midpoint := f32(rl.GetScreenWidth()) * state.unit_to_px_scaling.x / 2
 	px_pos := units_to_px(card.pos + card.offset + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	scaled_size := px_size * card.scale
-	px_pos -= (scaled_size - px_size) / 2
-  px_size = scaled_size
+	px_pos.x -= (scaled_size.x - px_size.x) / 2
+
+	shadow_pos := px_pos
+	shadow_pos.x -= 0.1 * (card.scale - 1) * (win_midpoint - shadow_pos.x)
+
+	px_pos.y -= 2 * (scaled_size.y - px_size.y)
+	px_size = scaled_size
+
+	if card.scale > 1 {
+		shadow_rect := rl.Rectangle{shadow_pos.x, shadow_pos.y, px_size.x, px_size.y}
+		rl.DrawRectangleRounded(shadow_rect, 0.1, 1, rl.Color{0x2F, 0x2F, 0x2F, 0x2F})
+	}
 
 	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.WHITE)
