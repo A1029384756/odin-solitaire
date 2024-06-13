@@ -8,6 +8,8 @@ import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
 
+EASYWIN :: #config(EASYWIN, false)
+
 Vector2 :: [2]f32
 
 Card :: struct {
@@ -587,7 +589,10 @@ main :: proc() {
 								}
 							}
 
-							state.has_won = true
+							when EASYWIN {
+								state.has_won = true
+							}
+
 							held_pile_send_to_pile(&state.held_pile, &pile)
 						}
 					}
