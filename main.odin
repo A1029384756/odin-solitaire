@@ -41,7 +41,7 @@ Held_Pile :: struct {
 
 
 BG_COLOR :: rl.Color{0x34, 0xA2, 0x49, 0xFF}
-STACK_COLOR :: rl.Color{0x2B, 0x7B, 0x3B, 0xFF}
+STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
 
 ICON_SIZE :: 18
 
@@ -257,7 +257,10 @@ init_state :: proc(state: ^State) {
 	state^ = State {
 		show_perf  = state.show_perf,
 		camera_pos = state.camera_pos,
+		game_time  = state.game_time,
+		hue_shift  = state.hue_shift,
 	}
+
 	for &card, idx in state.cards {
 		card.rank = idx % 13
 		card.suit = idx % 4
@@ -309,10 +312,12 @@ State :: struct {
 	discard:            Pile,
 	stacks:             [4]Stack,
 	held_pile:          Held_Pile,
-	show_perf:          bool,
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	unit_to_px_scaling: Vector2,
+	game_time:          f32,
+	hue_shift:          f32,
+	show_perf:          bool,
 }
 
 CARDS: rl.Texture
@@ -324,6 +329,7 @@ state: State
 
 main :: proc() {
 	init_state(&state)
+	state.hue_shift = 9.2
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
 
@@ -342,9 +348,23 @@ main :: proc() {
 	ICONS = rl.LoadTexture("assets/icons.png")
 	defer rl.UnloadTexture(ICONS)
 
+	background_shader := rl.LoadShader(nil, "shaders/fbm.fs")
+	defer rl.UnloadShader(background_shader)
+
+	time_loc := rl.GetShaderLocation(background_shader, "u_time")
+	rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
+
+	hue_loc := rl.GetShaderLocation(background_shader, "u_hue")
+	rl.SetShaderValue(background_shader, hue_loc, &state.hue_shift, .FLOAT)
+
+	res_loc := rl.GetShaderLocation(background_shader, "u_resolution")
+	resolution := Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+	rl.SetShaderValue(background_shader, res_loc, &resolution, .VEC2)
+
 	for !rl.WindowShouldClose() {
 		// general update
 		{
+			state.game_time += rl.GetFrameTime()
 			state.mouse_pos = rl.GetMousePosition() * (1 / state.unit_to_px_scaling)
 
 			// Camera horizontal centering
@@ -562,10 +582,19 @@ main :: proc() {
 		// rendering 
 		{
 			rl.BeginDrawing()
+			defer rl.EndDrawing()
 
 			// card rendering
 			{
-				rl.ClearBackground(BG_COLOR)
+				{
+					rl.BeginShaderMode(background_shader)
+					rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
+					rl.SetShaderValue(background_shader, hue_loc, &state.hue_shift, .FLOAT)
+					resolution = {f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+					rl.SetShaderValue(background_shader, res_loc, &resolution, .VEC2)
+					rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), rl.BLANK)
+					defer rl.EndShaderMode()
+				}
 
 				for &pile in state.piles {
 					draw_pile(&pile)
@@ -612,24 +641,33 @@ main :: proc() {
 					rl.DrawFPS(i32(perf_px.x) + 5, i32(perf_px.y))
 				}
 			}
-		}
-
-		// ui rendering
-		{
-			// toolbar
+			// ui rendering
 			{
-				out_loc := units_to_px({50, 50})
-				rl.DrawRectangle(0, 0, rl.GetScreenWidth(), i32(out_loc.y), rl.LIGHTGRAY)
-				if icon_button({0, 0, out_loc.x, out_loc.y}, .RESET, rl.DARKGRAY) {
-					init_state(&state)
-				}
-				if icon_button({out_loc.x + 2, 0, out_loc.x, out_loc.y}, .SHOW_PERF, rl.DARKGRAY) {
-					state.show_perf = !state.show_perf
+				// toolbar
+				{
+					out_loc := units_to_px({50, 50})
+					rl.DrawRectangle(0, 0, rl.GetScreenWidth(), i32(out_loc.y), rl.LIGHTGRAY)
+					if icon_button({0, 0, out_loc.x, out_loc.y}, .RESET, rl.DARKGRAY) {
+						init_state(&state)
+					}
+					if icon_button(
+						{out_loc.x + 2, 0, out_loc.x, out_loc.y},
+						.SHOW_PERF,
+						rl.DARKGRAY,
+					) {
+						state.show_perf = !state.show_perf
+					}
+					rl.GuiSlider(
+						{(out_loc.x + 2) * 2, 20, out_loc.x * 3, 20},
+						"",
+						"",
+						&state.hue_shift,
+						0,
+						10,
+					)
 				}
 			}
 		}
-
-		rl.EndDrawing()
 	}
 
 

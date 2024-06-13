@@ -21,6 +21,7 @@
           odin
           ols
           gdb
+          glslls
           #put your runtime and build dependencies here
         ];
       in
