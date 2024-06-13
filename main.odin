@@ -40,10 +40,7 @@ Held_Pile :: struct {
 }
 
 
-BG_COLOR :: rl.Color{0x34, 0xA2, 0x49, 0xFF}
 STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
-
-ICON_SIZE :: 18
 
 CARD_WIDTH :: 100
 CARD_HEIGHT :: 134
@@ -323,13 +320,15 @@ State :: struct {
 CARDS: rl.Texture
 BACKS: rl.Texture
 CARD_TEX_SIZE: Vector2 : {71, 95}
+
 ICONS: rl.Texture
+ICON_SIZE :: 18
 
 state: State
 
 main :: proc() {
 	init_state(&state)
-	state.hue_shift = 9.2
+	state.hue_shift = 2.91
 
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
 
@@ -337,7 +336,7 @@ main :: proc() {
 		rl.SetTraceLogLevel(.ERROR)
 	}
 
-	rl.InitWindow(1080, 1080, "Solitaire")
+	rl.InitWindow(800, 800, "Solitaire")
 
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
 	defer rl.UnloadTexture(CARDS)
@@ -658,12 +657,17 @@ main :: proc() {
 						state.show_perf = !state.show_perf
 					}
 					rl.GuiSlider(
-						{(out_loc.x + 2) * 2, 20, out_loc.x * 3, 20},
+						{
+							(out_loc.x + 2) * 2,
+							15 * state.unit_to_px_scaling.y,
+							out_loc.x * 3,
+							20 * state.unit_to_px_scaling.y,
+						},
 						"",
 						"",
 						&state.hue_shift,
 						0,
-						10,
+						2 * math.PI,
 					)
 				}
 			}
