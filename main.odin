@@ -77,12 +77,40 @@ icon_button :: proc(
 	}
 	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
 
-	overflow := Vector2{rect.width, rect.height}
-	overflow -= ICON_SIZE * f32(icon_scale)
-
 	rl.BeginBlendMode(.ALPHA)
 	rl.DrawTexturePro(ICONS, icon_rect[icon], rect, 0, 0, rl.DARKGRAY)
 	rl.EndBlendMode()
+	return clicked
+}
+
+text_button :: proc(rect: rl.Rectangle, text: string, color: rl.Color, font_size: i32) -> bool {
+	clicked: bool
+
+	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
+		if rl.IsMouseButtonReleased(
+			.LEFT,
+		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
+	} else {
+		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
+	}
+	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
+
+	text_size := rl.MeasureTextEx(
+		rl.GetFontDefault(),
+		strings.unsafe_string_to_cstring(text),
+		f32(font_size),
+		0,
+	)
+
+	text_offset := Vector2{rect.width, rect.height} - text_size
+
+	rl.DrawText(
+		strings.unsafe_string_to_cstring(text),
+		i32(rect.x + text_offset.x / 2),
+		i32(rect.y + text_offset.y / 2),
+		font_size,
+		color,
+	)
 	return clicked
 }
 
@@ -305,20 +333,28 @@ init_state :: proc(state: ^State) {
 }
 
 State :: struct {
+	// rendering
 	render_tex:         rl.RenderTexture2D,
+	camera_pos:         Vector2,
+	mouse_pos:          Vector2,
+	resolution:         Vector2,
+	unit_to_px_scaling: Vector2,
+	// board
 	cards:              [52]Card,
 	piles:              [7]Pile,
 	hand:               Pile,
 	discard:            Pile,
 	stacks:             [4]Stack,
+	// player items
 	held_pile:          Held_Pile,
-	camera_pos:         Vector2,
-	mouse_pos:          Vector2,
-	resolution:         Vector2,
-	unit_to_px_scaling: Vector2,
-	game_time:          f32,
+	// settings
 	hue_shift:          f32,
 	show_perf:          bool,
+	// game stats
+	game_time:          f32,
+	has_won:            bool,
+	// win screen
+	fade_in:            f32,
 }
 
 CARDS: rl.Texture
@@ -340,6 +376,7 @@ main :: proc() {
 	}
 
 	rl.InitWindow(800, 800, "Solitaire")
+	defer rl.CloseWindow()
 
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
 	defer rl.UnloadTexture(CARDS)
@@ -381,7 +418,10 @@ main :: proc() {
 				if new_resolution != state.resolution {
 					state.resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
-					state.render_tex = rl.LoadRenderTexture(i32(state.resolution.x), i32(state.resolution.y))
+					state.render_tex = rl.LoadRenderTexture(
+						i32(state.resolution.x),
+						i32(state.resolution.y),
+					)
 				}
 			}
 
@@ -419,7 +459,7 @@ main :: proc() {
 		}
 
 		// input handlers
-		{
+		if !state.has_won {
 			// reset game
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
@@ -546,6 +586,7 @@ main :: proc() {
 									}
 								}
 							}
+
 							held_pile_send_to_pile(&state.held_pile, &pile)
 						}
 					}
@@ -591,8 +632,7 @@ main :: proc() {
 							break
 						}
 						if idx == 3 {
-							fmt.println("you win")
-							init_state(&state)
+							state.has_won = true
 						}
 					}
 				}
@@ -652,20 +692,6 @@ main :: proc() {
 					}
 
 					draw_held_pile(&state.held_pile)
-
-					if state.show_perf {
-						perf_px := Vector2 {
-							f32(state.resolution.x) - 100,
-							f32(state.resolution.y) - 30,
-						}
-						rl.DrawRectangleRounded(
-							{perf_px.x, perf_px.y, 90, 20},
-							0.5,
-							10,
-							rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
-						)
-						rl.DrawFPS(i32(perf_px.x) + 5, i32(perf_px.y))
-					}
 				}
 				// ui rendering
 				{
@@ -703,6 +729,72 @@ main :: proc() {
 							2 * math.PI,
 						)
 					}
+
+					// performance overlay
+					if state.show_perf {
+						perf_px := Vector2 {
+							f32(state.resolution.x) - 100,
+							f32(state.resolution.y) - 30,
+						}
+						rl.DrawRectangleRounded(
+							{perf_px.x, perf_px.y, 90, 20},
+							0.5,
+							10,
+							rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
+						)
+						rl.DrawFPS(i32(perf_px.x) + 5, i32(perf_px.y))
+					}
+
+					// victory screen
+					if state.has_won {
+						C4: f32 = 2 * math.PI / 3
+						if state.fade_in < 1 {
+							state.fade_in += rl.GetFrameTime()
+						} else {
+							state.fade_in = 1
+						}
+
+						anim :=
+							math.pow(2, -10 * state.fade_in) *
+								math.sin((state.fade_in * 10 - 0.75) * C4) +
+							1
+						rl.DrawRectangle(
+							0,
+							0,
+							i32(state.resolution.x),
+							i32(state.resolution.y),
+							{0x1F, 0x1F, 0x1, u8(0x5F * state.fade_in)},
+						)
+
+						WIN_FONT_SIZE :: 60
+						WIN_MSG :: "YOU WIN!"
+						text_width := rl.MeasureText(WIN_MSG, WIN_FONT_SIZE)
+						rl.DrawText(
+							WIN_MSG,
+							i32(state.resolution.x / 2) - text_width / 2,
+							i32(anim * state.resolution.y / 2) - 60,
+							WIN_FONT_SIZE,
+							rl.WHITE,
+						)
+
+						BUTTON_SIZE :: Vector2{500, 150}
+						button_px := units_to_px(BUTTON_SIZE)
+						if text_button(
+							{
+								state.resolution.x / 2 - button_px.x / 2,
+								anim * state.resolution.y / 2 -
+								button_px.y / 2 +
+								100 * state.unit_to_px_scaling.y,
+								button_px.x,
+								button_px.y,
+							},
+							"RESTART",
+							rl.WHITE,
+							60,
+						) {
+							init_state(&state)
+						}
+					}
 				}
 			}
 
@@ -730,6 +822,4 @@ main :: proc() {
 			}
 		}
 	}
-
-	rl.CloseWindow()
 }
