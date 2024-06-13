@@ -1,10 +1,83 @@
 #version 330
 
-out vec4 fragColor;
-
 uniform vec2 u_resolution;
 uniform float u_time;
 uniform float u_hue;
+
+float colormap_red(float x) {
+    if (x < 0.0) {
+        return 54.0 / 255.0;
+    } else if (x < 20049.0 / 82979.0) {
+        return (829.79 * x + 54.51) / 255.0;
+    } else {
+        return 1.0;
+    }
+}
+
+float colormap_green(float x) {
+    if (x < 20049.0 / 82979.0) {
+        return 0.0;
+    } else if (x < 327013.0 / 810990.0) {
+        return (8546482679670.0 / 10875673217.0 * x - 2064961390770.0 / 10875673217.0) / 255.0;
+    } else if (x <= 1.0) {
+        return (103806720.0 / 483977.0 * x + 19607415.0 / 483977.0) / 255.0;
+    } else {
+        return 1.0;
+    }
+}
+
+float colormap_blue(float x) {
+    if (x < 0.0) {
+        return 54.0 / 255.0;
+    } else if (x < 7249.0 / 82979.0) {
+        return (829.79 * x + 54.51) / 255.0;
+    } else if (x < 20049.0 / 82979.0) {
+        return 127.0 / 255.0;
+    } else if (x < 327013.0 / 810990.0) {
+        return (792.02249341361393720147485376583 * x - 64.364790735602331034989206222672) / 255.0;
+    } else {
+        return 1.0;
+    }
+}
+
+vec4 colormap(float x) {
+    return vec4(colormap_red(x), colormap_green(x), colormap_blue(x), 1.0);
+}
+
+
+float rand(vec2 n) { 
+    return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453);
+}
+
+float noise(vec2 p) {
+    vec2 ip = floor(p);
+    vec2 u = fract(p);
+    u = u*u*(3.0-2.0*u);
+
+    float res = mix(
+        mix(rand(ip),rand(ip+vec2(1.0,0.0)),u.x),
+        mix(rand(ip+vec2(0.0,1.0)),rand(ip+vec2(1.0,1.0)),u.x),u.y);
+    return res*res;
+}
+
+const mat2 mtx = mat2( 0.80,  0.60, -0.60,  0.80 );
+
+float fbm( vec2 p ) {
+    float f = 0.0;
+
+    f += 0.500000*noise( p + u_time / 500. ); p = mtx*p*2.02;
+    f += 0.031250*noise( p ); p = mtx*p*2.01;
+    f += 0.250000*noise( p ); p = mtx*p*2.03;
+    f += 0.125000*noise( p ); p = mtx*p*2.01;
+    f += 0.062500*noise( p ); p = mtx*p*2.04;
+    f += 0.015625*noise( p + sin(u_time) );
+
+    return f/0.96875;
+}
+
+float pattern( in vec2 p ) {
+	return fbm( p + fbm( p + fbm( p ) ) );
+}
 
 vec3 hueShift( vec3 color, float hueAdjust ) {
     const vec3  kRGBToYPrime = vec3 (0.299, 0.587, 0.114);
@@ -31,37 +104,9 @@ vec3 hueShift( vec3 color, float hueAdjust ) {
     return vec3( dot (yIQ, kYIQToR), dot (yIQ, kYIQToG), dot (yIQ, kYIQToB) );
 }
 
-void main() {
-    float effectDensity = 4.0;
-    float effectScale = 0.3;
-    float timeScale = 0.000125;
-    float desaturationPercent = 0.7;
-    float brightnessPercent = 0.5;
-    float scaledTime = u_time * timeScale;
-    
-    // Normalized pixel coordinates (from 0 to 1)
-    vec2 uv = gl_FragCoord.xy/u_resolution.xy;
-    
-    // scale y to the aspect ratio
-    uv.y *= u_resolution.y / u_resolution.x;
-    
-    // effect density/repeat
-    uv = uv * effectDensity;
-   
-    for(float i = 1.0; i < 8.0; i += 1.0){
-        uv.x += effectScale * sin(uv.y * i + scaledTime) - scaledTime * i * 10.0;
-        uv.y += effectScale * cos(uv.x * i + scaledTime) - sin(scaledTime * i);
-    }
-    
-    // Time varying pixel color
-    vec3 col = hueShift(0.5 + 0.5*sin(uv.xyx * 0.3+vec3(0,2,4)), u_hue) * brightnessPercent;
-
-    float L = 0.3*col.x + 0.6*col.y + 0.1*col.z;
-    vec3 desaturated;
-    desaturated.x = col.x + desaturationPercent * (L - col.x);
-    desaturated.y = col.y + desaturationPercent * (L - col.y);
-    desaturated.z = col.z + desaturationPercent * (L - col.z);
-
-    // Output to screen
-    fragColor = vec4(desaturated,1.0);
+void main()
+{
+    vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+	  float shade = pattern(uv);
+    gl_FragColor = vec4(hueShift(colormap(shade).rgb, u_hue) * 0.4, shade);
 }
