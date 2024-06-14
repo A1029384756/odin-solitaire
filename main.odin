@@ -13,13 +13,15 @@ EASYWIN :: #config(EASYWIN, false)
 Vector2 :: [2]f32
 
 Card :: struct {
-	using pos: Vector2,
-	offset:    Vector2,
-	rank:      int,
-	suit:      int,
-	scale:     f32,
-	flipped:   bool,
-	held:      bool,
+	using pos:    Vector2,
+	offset:       Vector2,
+	rank:         int,
+	suit:         int,
+	scale:        f32,
+	target_angle: f32,
+	angle:        f32,
+	flipped:      bool,
+	held:         bool,
 }
 
 Pile :: struct {
@@ -131,34 +133,41 @@ draw_card :: proc(card: ^Card) {
 	px_pos.y -= 2 * (scaled_size.y - px_size.y)
 	px_size = scaled_size
 
+	output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+
 	if card.scale > 1 {
 		shadow_rect := rl.Rectangle{shadow_pos.x, shadow_pos.y, px_size.x, px_size.y}
-		rl.DrawRectangleRounded(shadow_rect, 0.1, 1, rl.Color{0x2F, 0x2F, 0x2F, 0x2F})
+		rl.DrawTexturePro(
+			BLANK,
+			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
+			shadow_rect,
+			0,
+			card.angle,
+			rl.Color{0x2F, 0x2F, 0x2F, 0x2F},
+		)
 	}
 
-	card_rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawRectangleRounded(card_rect, 0.1, 1, rl.WHITE)
-	rl.DrawRectangleRoundedLines(
-		{card_rect.x + 1, card_rect.y + 1, card_rect.width - 1, card_rect.height - 1},
-		0.1,
-		1,
-		2.5,
-		rl.LIGHTGRAY,
+	rl.DrawTexturePro(
+		BLANK,
+		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
+		output_pos,
+		0,
+		card.angle,
+		rl.WHITE,
 	)
+
 	if card.flipped {
 		tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
 		tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
 
-		output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-		rl.DrawTexturePro(CARDS, tex_rect, output_pos, 0, 0, rl.WHITE)
+		rl.DrawTexturePro(CARDS, tex_rect, output_pos, 0, card.angle, rl.WHITE)
 	} else {
-		output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 		rl.DrawTexturePro(
 			BACKS,
 			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 			output_pos,
 			0,
-			0,
+			card.angle,
 			rl.WHITE,
 		)
 	}
@@ -186,7 +195,7 @@ draw_pile :: proc(pile: ^Pile) {
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
+	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos + pile.spacing * f32(idx)
@@ -198,7 +207,7 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawRectangleRounded(rect, 0.1, 1, STACK_COLOR)
+	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 
 	top, top_idx := pile_get_top(pile)
 	_, held_idx := pile_get_top(held)
@@ -360,6 +369,7 @@ State :: struct {
 }
 
 CARDS: rl.Texture
+BLANK: rl.Texture
 BACKS: rl.Texture
 CARD_TEX_SIZE: Vector2 : {71, 95}
 
@@ -382,6 +392,9 @@ main :: proc() {
 
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
 	defer rl.UnloadTexture(CARDS)
+
+	BLANK = rl.LoadTexture("assets/blank_card.png")
+	defer rl.UnloadTexture(BLANK)
 
 	BACKS = rl.LoadTexture("assets/card_backs.png")
 	defer rl.UnloadTexture(BACKS)
@@ -457,6 +470,11 @@ main :: proc() {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
 				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
 				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
+
+				if abs(card.angle - card.target_angle) < 0.01 {
+					card.target_angle = rand.float32_range(-2, 2)
+				}
+				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
 			}
 		}
 
