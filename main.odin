@@ -43,6 +43,13 @@ Held_Pile :: struct {
 	hold_offset: Vector2,
 }
 
+Board :: struct {
+	cards:   [52]Card,
+	piles:   [7]Pile,
+	hand:    Pile,
+	discard: Pile,
+	stacks:  [4]Stack,
+}
 
 STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
 
@@ -173,7 +180,7 @@ draw_card :: proc(card: ^Card) {
 	}
 }
 
-card_collides :: proc(card: Vector2, coord: Vector2) -> bool {
+card_collides_point :: proc(card: Vector2, coord: Vector2) -> bool {
 	return(
 		card.x < coord.x - state.camera_pos.x &&
 		card.y < coord.y - state.camera_pos.y &&
@@ -182,13 +189,32 @@ card_collides :: proc(card: Vector2, coord: Vector2) -> bool {
 	)
 }
 
-pile_collides :: proc(pile: ^Pile, coord: Vector2) -> bool {
+cards_collide :: proc(a: Vector2, b: Vector2) -> bool {
+	return abs(a.x - b.x) < CARD_WIDTH && abs(a.y - b.y) < CARD_HEIGHT
+}
+
+pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
 	for card in pile.cards {
 		if card == nil {continue}
-		if card_collides(card, coord) {return true}
+		if card_collides_point(card, coord) {return true}
 	}
-	if card_collides(pile.pos, coord) {return true}
-	return false
+	return card_collides_point(pile.pos, coord)
+}
+
+piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
+	assert(a.cards[0] != nil, "pile 'a' should contain a card")
+
+	last_idx := 0
+	for card_a, idx in a.cards {
+		if card_a == nil {break}
+		last_idx = idx
+		for card_b in b.cards {
+			if card_b == nil || !card_b.flipped {continue}
+			if cards_collide(card_a.pos, card_b.pos) {return true}
+		}
+	}
+
+	return b.cards[0] == nil && cards_collide(a.cards[last_idx].pos, b.pos)
 }
 
 draw_pile :: proc(pile: ^Pile) {
@@ -289,6 +315,10 @@ stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 	return held.cards[0].rank == top.rank + 1 && held.cards[0].suit == top.suit
 }
 
+create_solveable_board :: proc() -> Board {
+	unimplemented("TODO")
+}
+
 init_state :: proc(state: ^State) {
 	state^ = State {
 		show_perf  = state.show_perf,
@@ -351,16 +381,16 @@ State :: struct {
 	resolution:         Vector2,
 	unit_to_px_scaling: Vector2,
 	// board
-	cards:              [52]Card,
-	piles:              [7]Pile,
-	hand:               Pile,
-	discard:            Pile,
-	stacks:             [4]Stack,
+	using board:        Board,
 	// player items
 	held_pile:          Held_Pile,
 	// settings
 	hue_shift:          f32,
 	show_perf:          bool,
+	difficulty:         enum {
+		EASY,
+		RANDOM,
+	},
 	// game stats
 	game_time:          f32,
 	has_won:            bool,
@@ -488,7 +518,7 @@ main :: proc() {
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
 				{
-					if pile_collides(&state.hand, state.mouse_pos) {
+					if pile_collides_point(&state.hand, state.mouse_pos) {
 						top, idx := pile_get_top(&state.hand)
 						_, discard_size := pile_get_top(&state.discard)
 						switch idx {
@@ -553,7 +583,7 @@ main :: proc() {
 				// pick up from discard 
 				{
 					top, idx := pile_get_top(&state.discard)
-					if idx != -1 && card_collides(top, state.mouse_pos) {
+					if idx != -1 && card_collides_point(top, state.mouse_pos) {
 						state.held_pile.cards[0] = top
 						state.held_pile.cards[0].held = true
 						state.held_pile.hold_offset = state.mouse_pos - top.pos
@@ -567,7 +597,7 @@ main :: proc() {
 					for &pile in state.piles {
 						#reverse for card, idx in pile.cards {
 							if card == nil {continue}
-							if card.flipped && card_collides(card, state.mouse_pos) {
+							if card.flipped && card_collides_point(card, state.mouse_pos) {
 								copy(state.held_pile.cards[:], pile.cards[idx:])
 								for card in state.held_pile.cards {
 									if card == nil {break}
@@ -586,41 +616,75 @@ main :: proc() {
 			if rl.IsMouseButtonReleased(.LEFT) {
 				// add hand pile to pile
 				{
+					candidate_piles: [7]^Pile
+					num_candidates := 0
+
 					for &pile in state.piles {
 						if state.held_pile.source_pile == nil {continue}
-						if pile_collides(&pile, state.mouse_pos) &&
+						if piles_collide(&state.held_pile, &pile) &&
 						   pile_can_place(&pile, &state.held_pile) {
-							top, idx := pile_get_top(state.held_pile.source_pile)
-							if top != nil {top.flipped = true}
-							if state.held_pile.source_pile == &state.discard {
-								switch idx {
-								case -1:
-								case 0 ..< 3:
-								case:
-									for card, idx in state.discard.cards[idx - 1:idx + 1] {
-										card.offset =
-											card.pos -
-											state.discard.pos -
-											f32(min(state.discard.max_visible - 1, idx + 1)) *
-												state.discard.spacing
-									}
+							candidate_piles[num_candidates] = &pile
+							num_candidates += 1
+						}
+					}
+
+					if num_candidates > 0 {
+						closest_pile: ^Pile
+						max_overlap := f32(0)
+						for i in 0 ..< num_candidates {
+							candidate_top, top_idx := pile_get_top(candidate_piles[i])
+							top_pos :=
+								candidate_top == nil ? candidate_piles[i].pos : candidate_top.pos
+							held_pos := state.held_pile.cards[0].pos
+
+							overlap :=
+								max(
+									0,
+									min(held_pos.x + CARD_WIDTH, top_pos.x + CARD_WIDTH) -
+									max(held_pos.x, top_pos.x),
+								) *
+								max(
+									0,
+									min(held_pos.y + CARD_HEIGHT, top_pos.y + CARD_HEIGHT) -
+									max(held_pos.y, top_pos.y),
+								)
+
+							if overlap > max_overlap {
+								closest_pile = candidate_piles[i]
+								max_overlap = overlap
+							}
+						}
+
+						top, idx := pile_get_top(state.held_pile.source_pile)
+						if top != nil {top.flipped = true}
+						if state.held_pile.source_pile == &state.discard {
+							switch idx {
+							case -1:
+							case 0 ..< 3:
+							case:
+								for card, idx in state.discard.cards[idx - 1:idx + 1] {
+									card.offset =
+										card.pos -
+										state.discard.pos -
+										f32(min(state.discard.max_visible - 1, idx + 1)) *
+											state.discard.spacing
 								}
 							}
-
-							when EASYWIN {
-								state.has_won = true
-							}
-
-							held_pile_send_to_pile(&state.held_pile, &pile)
 						}
+
+						when EASYWIN {
+							state.has_won = true
+						}
+
+						held_pile_send_to_pile(&state.held_pile, closest_pile)
 					}
 				}
 
 				// add card to stack
 				{
 					for &stack in state.stacks {
-						if pile_collides(&stack, state.mouse_pos) &&
-						   state.held_pile.cards[0] != nil &&
+						if state.held_pile.cards[0] == nil {continue}
+						if piles_collide(&state.held_pile, &stack) &&
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
