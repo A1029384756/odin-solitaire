@@ -205,10 +205,7 @@ pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
 }
 
 piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
-	// assert(a.cards[0] != nil, "pile 'a' should contain a card")
-	if a.cards[0] == nil {
-		fmt.println("ERROR")
-	}
+	assert(a.cards[0] != nil, "pile 'a' should contain a card")
 
 	for card_a in a.cards {
 		if card_a == nil {break}
