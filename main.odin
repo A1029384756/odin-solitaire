@@ -680,7 +680,7 @@ main :: proc() {
 						if state.held_pile.source_pile == &state.discard {
 							switch idx {
 							case -1:
-							case 0 ..< 3:
+							case 0 ..< 2:
 							case:
 								for card, idx in state.discard.cards[idx - 1:idx + 1] {
 									card.offset =
