@@ -128,6 +128,8 @@ px_to_units :: #force_inline proc(px: Vector2) -> Vector2 {
 }
 
 draw_card :: proc(card: ^Card) {
+	assert(card != nil, "card should exist")
+
 	win_midpoint := state.resolution.x * state.unit_to_px_scaling.x / 2
 	px_pos := units_to_px(card.pos + card.offset + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
@@ -194,8 +196,10 @@ cards_collide :: proc(a: Vector2, b: Vector2) -> bool {
 }
 
 pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
+	assert(pile != nil, "pile should exist")
+
 	for card in pile.cards {
-		if card == nil {continue}
+		if card == nil {break}
 		if card_collides_point(card, coord) {return true}
 	}
 	return card_collides_point(pile.pos, coord)
@@ -207,7 +211,8 @@ piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
 	for card_a in a.cards {
 		if card_a == nil {break}
 		for card_b in b.cards {
-			if card_b == nil || !card_b.flipped {continue}
+			if card_b == nil {break}
+			if !card_b.flipped {continue}
 			if cards_collide(card_a.pos, card_b.pos) {return true}
 		}
 	}
@@ -216,6 +221,8 @@ piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
 }
 
 draw_pile :: proc(pile: ^Pile) {
+	assert(pile != nil, "pile should exist")
+
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
@@ -228,6 +235,9 @@ draw_pile :: proc(pile: ^Pile) {
 }
 
 draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
+	assert(held != nil, "held pile should exist")
+	assert(pile != nil, "pile should exist")
+
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
@@ -258,6 +268,8 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 }
 
 draw_held_pile :: proc(pile: ^Held_Pile) {
+	assert(pile != nil, "pile should exist")
+
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos - pile.hold_offset + pile.spacing * f32(idx)
@@ -266,6 +278,8 @@ draw_held_pile :: proc(pile: ^Held_Pile) {
 }
 
 pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
+	assert(pile != nil, "pile should exist")
+
 	#reverse for card, idx in pile.cards {
 		if card != nil {
 			return card, idx
@@ -275,6 +289,9 @@ pile_get_top :: proc(pile: ^Pile) -> (^Card, int) {
 }
 
 held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
+	assert(held_pile != nil, "held pile should exist")
+	assert(pile != nil, "pile should exist")
+
 	top, idx := pile_get_top(pile)
 	if top == nil {
 		copy(pile.cards[:], held_pile.cards[:])
@@ -296,6 +313,9 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 }
 
 pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
+	assert(held != nil, "held pile should exist")
+	assert(pile != nil, "pile should exist")
+
 	top, _ := pile_get_top(pile)
 	if top == nil {
 		return held.cards[0].rank == 12
@@ -308,6 +328,9 @@ pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 }
 
 stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
+	assert(stack != nil, "stack should exist")
+	assert(held != nil, "held pile should exist")
+
 	top, idx := pile_get_top(stack)
 	if idx == -1 {return held.cards[0].rank == 0}
 	return held.cards[0].rank == top.rank + 1 && held.cards[0].suit == top.suit
@@ -689,7 +712,7 @@ main :: proc() {
 							if state.held_pile.source_pile == &state.discard {
 								switch idx {
 								case -1:
-								case 0 ..< 3:
+								case 0 ..< 2:
 								case:
 									for card, idx in state.discard.cards[idx - 1:idx + 1] {
 										card.offset =
