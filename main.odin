@@ -28,7 +28,6 @@ Pile :: struct {
 	using pos:   Vector2,
 	cards:       [24]^Card,
 	spacing:     Vector2,
-	size:        int,
 	max_visible: int,
 }
 
@@ -206,7 +205,10 @@ pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
 }
 
 piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
-	assert(a.cards[0] != nil, "pile 'a' should contain a card")
+	// assert(a.cards[0] != nil, "pile 'a' should contain a card")
+	if a.cards[0] == nil {
+		fmt.println("ERROR")
+	}
 
 	for card_a in a.cards {
 		if card_a == nil {break}
@@ -636,12 +638,12 @@ main :: proc() {
 
 			if rl.IsMouseButtonReleased(.LEFT) {
 				// add hand pile to pile
-				{
+				if state.held_pile.source_pile != nil {
 					candidate_piles: [7]^Pile
 					num_candidates := 0
 
 					for &pile in state.piles {
-						if state.held_pile.source_pile == nil {continue}
+						if state.held_pile.source_pile == &pile {continue}
 						if piles_collide(&state.held_pile, &pile) &&
 						   pile_can_place(&pile, &state.held_pile) {
 							candidate_piles[num_candidates] = &pile
@@ -651,7 +653,7 @@ main :: proc() {
 
 					if num_candidates > 0 {
 						closest_pile: ^Pile
-						max_overlap := f32(0)
+						max_overlap := f32(math.F32_MIN)
 						for i in 0 ..< num_candidates {
 							candidate_top, top_idx := pile_get_top(candidate_piles[i])
 							top_pos :=
@@ -670,7 +672,7 @@ main :: proc() {
 									max(held_pos.y, top_pos.y),
 								)
 
-							if overlap > max_overlap {
+							if overlap >= max_overlap {
 								closest_pile = candidate_piles[i]
 								max_overlap = overlap
 							}
@@ -702,9 +704,8 @@ main :: proc() {
 				}
 
 				// add card to stack
-				{
+				if state.held_pile.source_pile != nil {
 					for &stack in state.stacks {
-						if state.held_pile.cards[0] == nil {continue}
 						if piles_collide(&state.held_pile, &stack) &&
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
@@ -724,12 +725,13 @@ main :: proc() {
 								}
 							}
 							held_pile_send_to_pile(&state.held_pile, &stack)
+							break
 						}
 					}
 				}
 
 				// return unassigned hand pile to source
-				if state.held_pile.cards[0] != nil {
+				if state.held_pile.source_pile != nil {
 					held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
 				}
 
