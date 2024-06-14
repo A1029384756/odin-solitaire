@@ -204,17 +204,15 @@ pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
 piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
 	assert(a.cards[0] != nil, "pile 'a' should contain a card")
 
-	last_idx := 0
-	for card_a, idx in a.cards {
+	for card_a in a.cards {
 		if card_a == nil {break}
-		last_idx = idx
 		for card_b in b.cards {
 			if card_b == nil || !card_b.flipped {continue}
 			if cards_collide(card_a.pos, card_b.pos) {return true}
 		}
 	}
 
-	return b.cards[0] == nil && cards_collide(a.cards[last_idx].pos, b.pos)
+	return b.cards[0] == nil && cards_collide(a.cards[0].pos, b.pos)
 }
 
 draw_pile :: proc(pile: ^Pile) {
