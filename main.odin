@@ -518,13 +518,12 @@ main :: proc() {
 			state.held_pile.pos = state.mouse_pos
 			for &card in state.cards {
 				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
-				if linalg.distance(card.offset, 0) < 2 {card.offset = 0}
 				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
+				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
 
 				if abs(card.angle - card.target_angle) < 0.01 {
 					card.target_angle = rand.float32_range(-2, 2)
 				}
-				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
 			}
 		}
 
@@ -799,7 +798,7 @@ main :: proc() {
 					for &stack in state.stacks {
 						for card in stack.cards {
 							if card == nil {break}
-							if linalg.distance(card.offset, 0) > 0 {
+							if card.offset.x > 0 && card.offset.y > 0 {
 								draw_card(card)
 							}
 						}
@@ -808,7 +807,7 @@ main :: proc() {
 					for &pile in state.piles {
 						for card in pile.cards {
 							if card == nil {break}
-							if linalg.distance(card.offset, 0) > 0 {
+							if card.offset.x > 0 && card.offset.y > 0 {
 								draw_card(card)
 							}
 						}
