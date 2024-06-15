@@ -612,6 +612,21 @@ main :: proc() {
 					}
 				}
 
+				// pick up from stack 
+				{
+					for &stack in state.stacks {
+						top, idx := pile_get_top(&stack)
+						if idx != -1 && card_collides_point(top, state.mouse_pos) {
+							state.held_pile.cards[0] = top
+							state.held_pile.cards[0].held = true
+							state.held_pile.hold_offset = state.mouse_pos - top.pos
+							state.held_pile.source_pile = &stack
+							stack.cards[idx] = nil
+							break
+						}
+					}
+				}
+
 				// pick up from pile 
 				{
 					for &pile in state.piles {
@@ -650,7 +665,7 @@ main :: proc() {
 
 					if num_candidates > 0 {
 						closest_pile: ^Pile
-						max_overlap := f32(math.F32_MIN)
+						max_overlap := min(f32)
 						for i in 0 ..< num_candidates {
 							candidate_top, top_idx := pile_get_top(candidate_piles[i])
 							top_pos :=
