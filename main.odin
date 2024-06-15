@@ -1,14 +1,22 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
+import "core:prof/spall"
 import "core:slice"
 import "core:strings"
 import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
+PROFILING :: #config(PROFILING, false)
+
+when PROFILING {
+	spall_ctx: spall.Context
+	spall_buffer: spall.Buffer
+}
 
 Vector2 :: [2]f32
 
@@ -429,6 +437,18 @@ ICON_SIZE :: 18
 state: State
 
 main :: proc() {
+	when PROFILING {
+		spall_ctx = spall.context_create("solitaire.spall")
+		defer spall.context_destroy(&spall_ctx)
+
+		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
+
+		spall_buffer = spall.buffer_create(buffer_backing)
+		defer spall.buffer_destroy(&spall_ctx, &spall_buffer)
+
+		spall.SCOPED_EVENT(&spall_ctx, &spall_buffer, #procedure)
+	}
+
 	init_state(&state)
 	state.hue_shift = 2.91
 	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
@@ -927,5 +947,23 @@ main :: proc() {
 				}
 			}
 		}
+	}
+}
+
+when PROFILING {
+	@(instrumentation_enter)
+	spall_enter :: proc "contextless" (
+		proc_address, call_site_return_address: rawptr,
+		loc: runtime.Source_Code_Location,
+	) {
+		spall._buffer_begin(&spall_ctx, &spall_buffer, "", "", loc)
+	}
+
+	@(instrumentation_exit)
+	spall_exit :: proc "contextless" (
+		proc_address, call_site_return_address: rawptr,
+		loc: runtime.Source_Code_Location,
+	) {
+		spall._buffer_end(&spall_ctx, &spall_buffer)
 	}
 }
