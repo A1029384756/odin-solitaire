@@ -818,7 +818,7 @@ main :: proc() {
 					for &stack in state.stacks {
 						for card in stack.cards {
 							if card == nil {break}
-							if card.offset.x > 0 && card.offset.y > 0 {
+							if abs(card.offset.x) > 0 && abs(card.offset.y) > 0 {
 								draw_card(card)
 							}
 						}
@@ -827,7 +827,7 @@ main :: proc() {
 					for &pile in state.piles {
 						for card in pile.cards {
 							if card == nil {break}
-							if card.offset.x > 0 && card.offset.y > 0 {
+							if abs(card.offset.x) > 0 && abs(card.offset.y) > 0 {
 								draw_card(card)
 							}
 						}
