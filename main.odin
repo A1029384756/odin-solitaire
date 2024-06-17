@@ -39,11 +39,6 @@ Pile :: struct {
 	max_visible: int,
 }
 
-Stack :: struct {
-	using pile: Pile,
-	suit:       int,
-}
-
 Held_Pile :: struct {
 	using pile:  Pile,
 	source_pile: ^Pile,
@@ -55,7 +50,7 @@ Board :: struct {
 	piles:   [7]Pile,
 	hand:    Pile,
 	discard: Pile,
-	stacks:  [4]Stack,
+	stacks:  [4]Pile,
 }
 
 STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
@@ -102,8 +97,7 @@ icon_button :: proc(
 }
 
 text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_size: f32) -> bool {
-	clicked: bool
-
+	clicked := false
 	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
 		if rl.IsMouseButtonReleased(
 			.LEFT,
@@ -334,7 +328,7 @@ pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
 	)
 }
 
-stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
+stack_can_place :: proc(stack: ^Pile, held: ^Held_Pile) -> bool {
 	assert(stack != nil, "stack should exist")
 	assert(held != nil, "held pile should exist")
 
@@ -343,8 +337,83 @@ stack_can_place :: proc(stack: ^Stack, held: ^Held_Pile) -> bool {
 	return held.cards[0].rank == top.rank + 1 && held.cards[0].suit == top.suit
 }
 
-create_solveable_board :: proc() -> Board {
-	unimplemented("TODO")
+create_solvable_board :: proc(board: ^Board) {
+	for &stack, suit in board.stacks {
+		for idx in 0 ..< 13 {
+			board.cards[idx * 4 + suit] = Card {
+				rank  = idx,
+				suit  = suit,
+				scale = 1,
+			}
+			stack.cards[idx] = &board.cards[idx * 4 + suit]
+		}
+	}
+
+	for &stack, suit in board.stacks {
+		top, idx := pile_get_top(&stack)
+		assert(top != nil)
+		assert(top.rank == 12)
+		assert(top.suit == suit)
+	}
+
+	placed := 0
+	for placed < 52 {
+		suit := rand.int_max(4)
+		top, top_idx := pile_get_top(&board.stacks[suit])
+		if top == nil {continue}
+
+		output_loc := rand.int_max(8)
+		switch output_loc {
+		case 0 ..< 7:
+			_, output_top_idx := pile_get_top(&board.piles[output_loc])
+			if output_top_idx >= output_loc {continue}
+
+			board.piles[output_loc].cards[output_top_idx + 1] = top
+			board.stacks[suit].cards[top_idx] = nil
+		case 7:
+			_, output_top_idx := pile_get_top(&board.hand)
+			if output_top_idx >= len(board.hand.cards) - 1 {continue}
+
+			board.hand.cards[output_top_idx + 1] = top
+			board.stacks[suit].cards[top_idx] = nil
+		case:
+			unimplemented(fmt.tprintf("Invalid value %d", output_loc))
+		}
+
+		placed += 1
+	}
+
+	for &pile, idx in board.piles {
+		top, _ := pile_get_top(&pile)
+		top.flipped = true
+	}
+	slice.reverse(board.hand.cards[:])
+}
+
+create_random_board :: proc(board: ^Board) {
+	for &card, idx in board.cards {
+		card.rank = idx % 13
+		card.suit = idx % 4
+		card.scale = 1
+	}
+	rand.shuffle(board.cards[:])
+
+	total_pile_dealt := 0
+	pile_card_count := 1
+	for &pile, idx in board.piles {
+		for i in 0 ..< pile_card_count {
+			pile.cards[i] = &board.cards[total_pile_dealt]
+			total_pile_dealt += 1
+			if i + 1 == pile_card_count {
+				pile.cards[i].flipped = true
+			}
+		}
+		pile_card_count += 1
+	}
+
+	for &card, idx in board.cards[total_pile_dealt:] {
+		board.hand.cards[idx] = &card
+	}
 }
 
 init_state :: proc(state: ^State) {
@@ -355,34 +424,22 @@ init_state :: proc(state: ^State) {
 		hue_shift  = state.hue_shift,
 		render_tex = state.render_tex,
 		resolution = state.resolution,
+		difficulty = state.difficulty,
 	}
 
-	for &card, idx in state.cards {
-		card.rank = idx % 13
-		card.suit = idx % 4
-		card.scale = 1
+	switch state.difficulty {
+	case .EASY:
+		create_solvable_board(&state.board)
+	case .RANDOM:
+		create_random_board(&state.board)
 	}
-	rand.shuffle(state.cards[:])
 
-	total_pile_dealt := 0
-	pile_card_count := 1
 	for &pile, idx in state.piles {
 		pile.spacing.y = PILE_SPACING
 		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 250}
-		for i in 0 ..< pile_card_count {
-			pile.cards[i] = &state.cards[total_pile_dealt]
-			total_pile_dealt += 1
-			if i + 1 == pile_card_count {
-				pile.cards[i].flipped = true
-			}
-		}
-		pile_card_count += 1
 		pile.max_visible = 52
 	}
 
-	for &card, idx in state.cards[total_pile_dealt:] {
-		state.hand.cards[idx] = &card
-	}
 	state.hand.spacing.x = 4
 	state.hand.pos = {50, 70}
 	state.hand.max_visible = 52
@@ -393,7 +450,6 @@ init_state :: proc(state: ^State) {
 
 	for &stack, idx in state.stacks {
 		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 70}
-		stack.suit = idx
 		stack.max_visible = 1
 	}
 
@@ -416,9 +472,11 @@ State :: struct {
 	hue_shift:          f32,
 	show_perf:          bool,
 	difficulty:         enum {
-		EASY,
-		RANDOM,
+		EASY   = 0,
+		RANDOM = 1,
 	},
+	diff_menu_edit:     bool,
+	gui_locked:         bool,
 	// game stats
 	game_time:          f32,
 	has_won:            bool,
@@ -496,10 +554,10 @@ main :: proc() {
 
 	for !rl.WindowShouldClose() {
 		// general update
-		{
+		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution := Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
+				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
 				if new_resolution != state.resolution {
 					state.resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
@@ -548,7 +606,7 @@ main :: proc() {
 		}
 
 		// input handlers
-		if !state.has_won {
+		if !state.has_won && rl.IsWindowFocused() {
 			// reset game
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
@@ -770,12 +828,8 @@ main :: proc() {
 				{
 					for &stack, idx in state.stacks {
 						top, top_idx := pile_get_top(&stack)
-						if top_idx != 12 {
-							break
-						}
-						if idx == 3 {
-							state.has_won = true
-						}
+						if top_idx != 12 {break}
+						if idx == 3 {state.has_won = true}
 					}
 				}
 			}
@@ -818,7 +872,7 @@ main :: proc() {
 					for &stack in state.stacks {
 						for card in stack.cards {
 							if card == nil {break}
-							if abs(card.offset.x) > 0 && abs(card.offset.y) > 0 {
+							if abs(card.offset.x) > 0.1 && abs(card.offset.y) > 0.1 {
 								draw_card(card)
 							}
 						}
@@ -827,7 +881,7 @@ main :: proc() {
 					for &pile in state.piles {
 						for card in pile.cards {
 							if card == nil {break}
-							if abs(card.offset.x) > 0 && abs(card.offset.y) > 0 {
+							if abs(card.offset.x) > 0.1 && abs(card.offset.y) > 0.1 {
 								draw_card(card)
 							}
 						}
@@ -870,6 +924,13 @@ main :: proc() {
 							0,
 							2 * math.PI,
 						)
+
+						if rl.GuiDropdownBox(
+							{(out_loc.x + 2) * 5, 0, out_loc.x * 2, out_loc.y},
+							"Easy;Random",
+							cast(^i32)&state.difficulty,
+							state.diff_menu_edit,
+						) {state.diff_menu_edit = !state.diff_menu_edit}
 					}
 
 					// performance overlay
