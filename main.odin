@@ -967,18 +967,19 @@ main :: proc() {
 
 						button_px := units_to_px({500, 150})
 						if text_button(
-							{
-								state.resolution.x / 2 - button_px.x / 2,
-								anim * state.resolution.y / 2 -
-								button_px.y / 2 +
-								200 * state.unit_to_px_scaling.y,
-								button_px.x,
-								button_px.y,
-							},
-							"RESTART",
-							rl.WHITE,
-							60,
-						) {
+							   {
+								   state.resolution.x / 2 - button_px.x / 2,
+								   anim * state.resolution.y / 2 -
+								   button_px.y / 2 +
+								   200 * state.unit_to_px_scaling.y,
+								   button_px.x,
+								   button_px.y,
+							   },
+							   "RESTART",
+							   rl.WHITE,
+							   60,
+						   ) &&
+						   state.fade_in == 1 {
 							init_state(&state)
 						}
 					}
