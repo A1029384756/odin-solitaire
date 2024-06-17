@@ -81,7 +81,7 @@ icon_button :: proc(
 ) -> bool {
 	clicked: bool
 
-	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
+	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
 		if rl.IsMouseButtonReleased(
 			.LEFT,
 		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
@@ -98,7 +98,7 @@ icon_button :: proc(
 
 text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_size: f32) -> bool {
 	clicked := false
-	if rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
+	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
 		if rl.IsMouseButtonReleased(
 			.LEFT,
 		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
@@ -893,6 +893,7 @@ main :: proc() {
 				{
 					// toolbar
 					{
+						if state.has_won {rl.GuiLock()}
 						out_loc := units_to_px({50, 50})
 						rl.DrawRectangle(
 							0,
@@ -950,6 +951,7 @@ main :: proc() {
 
 					// victory screen
 					if state.has_won {
+						rl.GuiUnlock()
 						state.fade_in =
 							state.fade_in + rl.GetFrameTime() if state.fade_in < 1 else 1
 
