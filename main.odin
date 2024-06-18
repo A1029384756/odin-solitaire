@@ -516,6 +516,7 @@ main :: proc() {
 	rl.InitWindow(800, 800, "Solitaire")
 	defer rl.CloseWindow()
 
+	rl.ChangeDirectory(rl.GetApplicationDirectory())
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
 	defer rl.UnloadTexture(CARDS)
 
