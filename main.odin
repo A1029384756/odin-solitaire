@@ -359,7 +359,7 @@ create_solvable_board :: proc(board: ^Board) {
 		top, top_idx := pile_get_top(&board.stacks[suit])
 		if top == nil {continue}
 
-		output_loc := rand.int_max(8)
+		output_loc := rand.int_max(20)
 		switch output_loc {
 		case 0 ..< 7:
 			_, output_top_idx := pile_get_top(&board.piles[output_loc])
@@ -367,14 +367,12 @@ create_solvable_board :: proc(board: ^Board) {
 
 			board.piles[output_loc].cards[output_top_idx + 1] = top
 			board.stacks[suit].cards[top_idx] = nil
-		case 7:
+		case:
 			_, output_top_idx := pile_get_top(&board.hand)
 			if output_top_idx >= len(board.hand.cards) - 1 {continue}
 
 			board.hand.cards[output_top_idx + 1] = top
 			board.stacks[suit].cards[top_idx] = nil
-		case:
-			unimplemented(fmt.tprintf("Invalid value %d", output_loc))
 		}
 
 		placed += 1
@@ -384,7 +382,10 @@ create_solvable_board :: proc(board: ^Board) {
 		top, _ := pile_get_top(&pile)
 		top.flipped = true
 	}
-	slice.reverse(board.hand.cards[:])
+
+	for i := 0; i < len(board.hand.cards); i += 3 {
+		slice.reverse(board.hand.cards[i:i + 3])
+	}
 }
 
 create_random_board :: proc(board: ^Board) {
