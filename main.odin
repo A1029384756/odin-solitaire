@@ -146,7 +146,7 @@ draw_card :: proc(card: ^Card) {
 
 	output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 
-	parabolic_show: f32 = math.pow((card.flip_prog - 0.5) * 2, 2)
+	parabolic_show: f32 = max(0.3, math.pow((card.flip_prog - 0.5) * 2, 2))
 	output_pos.x += (1 - parabolic_show) * output_pos.width / 2
 	output_pos.width *= parabolic_show
 
