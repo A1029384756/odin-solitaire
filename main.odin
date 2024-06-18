@@ -28,6 +28,7 @@ Card :: struct {
 	scale:        f32,
 	target_angle: f32,
 	angle:        f32,
+	flip_prog:    f32,
 	flipped:      bool,
 	held:         bool,
 }
@@ -145,6 +146,10 @@ draw_card :: proc(card: ^Card) {
 
 	output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 
+	parabolic_show: f32 = math.pow((card.flip_prog - 0.5) * 2, 2)
+	output_pos.x += (1 - parabolic_show) * output_pos.width / 2
+	output_pos.width *= parabolic_show
+
 	if card.scale > 1 {
 		shadow_rect := rl.Rectangle{shadow_pos.x, shadow_pos.y, px_size.x, px_size.y}
 		rl.DrawTexturePro(
@@ -166,7 +171,7 @@ draw_card :: proc(card: ^Card) {
 		rl.WHITE,
 	)
 
-	if card.flipped {
+	if card.flip_prog >= 0.5 {
 		tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
 		tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
 
@@ -597,6 +602,11 @@ main :: proc() {
 				card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
 				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
 				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
+				card.flip_prog = math.lerp(
+					card.flip_prog,
+					1 if card.flipped else 0,
+					rl.GetFrameTime() * 20,
+				)
 
 				if abs(card.angle - card.target_angle) < 0.01 {
 					card.target_angle = rand.float32_range(-2, 2)
