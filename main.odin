@@ -22,7 +22,7 @@ Vector2 :: [2]f32
 
 Card :: struct {
 	using pos:    Vector2,
-	offset:       Vector2,
+	drawn_pos:    Vector2,
 	rank:         int,
 	suit:         int,
 	scale:        f32,
@@ -132,7 +132,7 @@ draw_card :: proc(card: ^Card) {
 	assert(card != nil, "card should exist")
 
 	win_midpoint := state.resolution.x * state.unit_to_px_scaling.x / 2
-	px_pos := units_to_px(card.pos + card.offset + state.camera_pos)
+	px_pos := units_to_px(card.drawn_pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	scaled_size := px_size * card.scale
 	px_pos.x -= (scaled_size.x - px_size.x) / 2
@@ -274,6 +274,7 @@ draw_held_pile :: proc(pile: ^Held_Pile) {
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos - pile.hold_offset + pile.spacing * f32(idx)
+		card.drawn_pos = card.pos
 		draw_card(card)
 	}
 }
@@ -303,10 +304,6 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	for card in held_pile.cards[:] {
 		if card == nil {break}
 		card.held = false
-		card.offset =
-			(held_pile.pos - held_pile.hold_offset) -
-			pile.pos -
-			f32(min(idx + 1, pile.max_visible - 1)) * pile.spacing
 	}
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
@@ -595,7 +592,7 @@ main :: proc() {
 
 			state.held_pile.pos = state.mouse_pos
 			for &card in state.cards {
-				card.offset = math.lerp(card.offset, 0, rl.GetFrameTime() * 10)
+				card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
 				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
 				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
 
@@ -626,10 +623,6 @@ main :: proc() {
 							for card, idx in state.hand.cards {
 								if card == nil {break}
 								card.flipped = false
-								card.offset =
-									state.discard.pos -
-									state.hand.pos -
-									f32(min(state.hand.max_visible, idx)) * state.hand.spacing
 							}
 						case 0 ..< 3:
 							copy(
@@ -644,14 +637,6 @@ main :: proc() {
 								if card == nil {break}
 								card.flipped = true
 								card.pos = state.discard.pos
-								card.offset =
-									state.hand.pos -
-									state.discard.pos -
-									f32(min(state.discard.max_visible, idx)) *
-										state.discard.spacing
-							}
-							for card in state.discard.cards[:discard_size + 1] {
-								card.offset = card.pos - state.discard.pos
 							}
 						case:
 							copy(
@@ -664,14 +649,6 @@ main :: proc() {
 								if card == nil {break}
 								card.flipped = true
 								card.pos = state.discard.pos
-								card.offset =
-									state.hand.pos -
-									state.discard.pos -
-									f32(min(state.discard.max_visible, idx)) *
-										state.discard.spacing
-							}
-							for card in state.discard.cards[:discard_size + 1] {
-								card.offset = card.pos - state.discard.pos
 							}
 						}
 					}
@@ -769,20 +746,6 @@ main :: proc() {
 
 						top, idx := pile_get_top(state.held_pile.source_pile)
 						if top != nil {top.flipped = true}
-						if state.held_pile.source_pile == &state.discard {
-							switch idx {
-							case -1:
-							case 0 ..< 2:
-							case:
-								for card, idx in state.discard.cards[idx - 1:idx + 1] {
-									card.offset =
-										card.pos -
-										state.discard.pos -
-										f32(min(state.discard.max_visible - 1, idx + 1)) *
-											state.discard.spacing
-								}
-							}
-						}
 
 						when EASYWIN {
 							state.has_won = true
@@ -799,20 +762,6 @@ main :: proc() {
 						   stack_can_place(&stack, &state.held_pile) {
 							top, idx := pile_get_top(state.held_pile.source_pile)
 							if top != nil {top.flipped = true}
-							if state.held_pile.source_pile == &state.discard {
-								switch idx {
-								case -1:
-								case 0 ..< 2:
-								case:
-									for card, idx in state.discard.cards[idx - 1:idx + 1] {
-										card.offset =
-											card.pos -
-											state.discard.pos -
-											f32(min(state.discard.max_visible - 1, idx + 1)) *
-												state.discard.spacing
-									}
-								}
-							}
 							held_pile_send_to_pile(&state.held_pile, &stack)
 							break
 						}
@@ -872,7 +821,7 @@ main :: proc() {
 					for &stack in state.stacks {
 						for card in stack.cards {
 							if card == nil {break}
-							if abs(card.offset.x) > 0.1 && abs(card.offset.y) > 0.1 {
+							if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
 								draw_card(card)
 							}
 						}
@@ -881,7 +830,7 @@ main :: proc() {
 					for &pile in state.piles {
 						for card in pile.cards {
 							if card == nil {break}
-							if abs(card.offset.x) > 0.1 && abs(card.offset.y) > 0.1 {
+							if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
 								draw_card(card)
 							}
 						}
