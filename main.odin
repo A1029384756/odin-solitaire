@@ -171,21 +171,25 @@ draw_card :: proc(card: ^Card) {
 		rl.WHITE,
 	)
 
-	if card.flip_prog >= 0.5 {
-		tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
-		tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
+	tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
+	tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
 
-		rl.DrawTexturePro(CARDS, tex_rect, output_pos, 0, card.angle, rl.WHITE)
-	} else {
-		rl.DrawTexturePro(
-			BACKS,
-			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
-			output_pos,
-			0,
-			card.angle,
-			rl.WHITE,
-		)
-	}
+	rl.DrawTexturePro(
+		CARDS,
+		tex_rect,
+		output_pos,
+		0,
+		card.angle,
+		{0xFF, 0xFF, 0xFF, u8(255 * card.flip_prog)},
+	)
+	rl.DrawTexturePro(
+		BACKS,
+		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
+		output_pos,
+		0,
+		card.angle,
+		{0xFF, 0xFF, 0xFF, u8(255 * (1 - card.flip_prog))},
+	)
 }
 
 card_collides_point :: proc(card: Vector2, coord: Vector2) -> bool {
