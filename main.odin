@@ -281,14 +281,14 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 draw_held_pile :: proc(pile: ^Held_Pile) {
 	assert(pile != nil, "pile should exist")
 
-	mouse_vel := rl.GetMouseDelta()
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos =
-			pile.pos -
-			pile.hold_offset +
-			pile.spacing * f32(idx) -
-			{mouse_vel.x * math.pow(f32(idx), 1.1), 0}
+		card.pos = pile.pos - pile.hold_offset + pile.spacing * f32(idx)
+		card.drawn_pos = math.lerp(
+			card.drawn_pos,
+			card.pos,
+			rl.GetFrameTime() * 40 / math.pow(f32(idx + 1), 0.6),
+		)
 		draw_card(card)
 	}
 }
@@ -521,7 +521,7 @@ main :: proc() {
 
 	init_state(&state)
 	state.hue_shift = 2.91
-	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE, .MSAA_4X_HINT})
+	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE})
 
 	when !ODIN_DEBUG {
 		rl.SetTraceLogLevel(.ERROR)
@@ -636,9 +636,7 @@ main :: proc() {
 
 				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
 
-				if card.held {
-					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 40)
-				} else {
+				if !card.held {
 					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
 				}
 			}
