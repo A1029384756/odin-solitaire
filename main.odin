@@ -135,6 +135,7 @@ draw_card :: proc(card: ^Card) {
 	win_midpoint := state.resolution.x * state.unit_to_px_scaling.x / 2
 	px_pos := units_to_px(card.drawn_pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	px_pos += px_size / 2
 	scaled_size := px_size * card.scale
 	px_pos.x -= (scaled_size.x - px_size.x) / 2
 
@@ -156,8 +157,8 @@ draw_card :: proc(card: ^Card) {
 			BLANK,
 			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 			shadow_rect,
-			0,
-			card.angle,
+			px_size / 2,
+			math.to_degrees(card.angle),
 			rl.Color{0x2F, 0x2F, 0x2F, 0x2F},
 		)
 	}
@@ -166,8 +167,8 @@ draw_card :: proc(card: ^Card) {
 		BLANK,
 		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 		output_pos,
-		0,
-		card.angle,
+		px_size / 2,
+		math.to_degrees(card.angle),
 		rl.WHITE,
 	)
 
@@ -178,16 +179,16 @@ draw_card :: proc(card: ^Card) {
 		CARDS,
 		tex_rect,
 		output_pos,
-		0,
-		card.angle,
+		px_size / 2,
+		math.to_degrees(card.angle),
 		{0xFF, 0xFF, 0xFF, u8(255 * card.flip_prog)},
 	)
 	rl.DrawTexturePro(
 		BACKS,
 		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 		output_pos,
-		0,
-		card.angle,
+		px_size / 2,
+		math.to_degrees(card.angle),
 		{0xFF, 0xFF, 0xFF, u8(255 * (1 - card.flip_prog))},
 	)
 }
@@ -280,10 +281,15 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 draw_held_pile :: proc(pile: ^Held_Pile) {
 	assert(pile != nil, "pile should exist")
 
+	mouse_vel := rl.GetMouseDelta()
 	for card, idx in pile.cards {
 		if card == nil {break}
-		card.pos = pile.pos - pile.hold_offset + pile.spacing * f32(idx)
-		card.drawn_pos = card.pos
+		card.pos =
+			pile.pos -
+			pile.hold_offset +
+			pile.spacing * f32(idx) -
+			{mouse_vel.x * math.pow(f32(idx), 1.1), 0}
+		// card.drawn_pos = card.pos
 		draw_card(card)
 	}
 }
@@ -603,17 +609,38 @@ main :: proc() {
 
 			state.held_pile.pos = state.mouse_pos
 			for &card in state.cards {
-				card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
-				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
-				card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
+				if card.held {
+					mouse_delta := rl.GetMouseDelta()
+					if linalg.length(mouse_delta) > 0 {
+						angle :=
+							math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
+							(min(abs(mouse_delta.x), 100) / 40)
+						card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 8)
+					} else {
+						card.angle = math.angle_lerp(card.angle, 0, rl.GetFrameTime() * 6)
+					}
+				} else {
+					if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
+						card.angle = math.lerp(card.angle, 0, rl.GetFrameTime() * 20)
+					} else {
+						card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
+						if abs(card.angle - card.target_angle) < 0.001 {
+							card.target_angle = rand.float32_range(-0.07, 0.07)
+						}
+					}
+				}
 				card.flip_prog = math.lerp(
 					card.flip_prog,
 					1 if card.flipped else 0,
 					rl.GetFrameTime() * 20,
 				)
 
-				if abs(card.angle - card.target_angle) < 0.01 {
-					card.target_angle = rand.float32_range(-2, 2)
+				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
+
+				if card.held {
+					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 40)
+				} else {
+					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
 				}
 			}
 		}
