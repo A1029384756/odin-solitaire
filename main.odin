@@ -114,8 +114,19 @@ text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_siz
 }
 
 draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
-	width := rl.MeasureTextEx(rl.GetFontDefault(), message, size, 5 * state.render_scale)
-	rl.DrawText(message, i32(pos.x - width.x / 2), i32(pos.y - width.y / 2), i32(size), color)
+	width := rl.MeasureTextEx(
+		rl.GetFontDefault(),
+		message,
+		size * state.render_scale,
+		5 * state.render_scale,
+	)
+	rl.DrawText(
+		message,
+		i32(pos.x - width.x / 2),
+		i32(pos.y - width.y / 2),
+		i32(size * state.render_scale),
+		color,
+	)
 }
 
 ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
@@ -134,7 +145,7 @@ px_to_units :: #force_inline proc(px: Vector2) -> Vector2 {
 draw_card :: proc(card: ^Card) {
 	assert(card != nil, "card should exist")
 
-	win_midpoint := state.resolution.x * state.unit_to_px_scaling.x / 2
+	win_midpoint := state.resolution.x / 2
 	px_pos := units_to_px(card.drawn_pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	px_pos += px_size / 2
@@ -142,7 +153,7 @@ draw_card :: proc(card: ^Card) {
 	px_pos.x -= (scaled_size.x - px_size.x) / 2
 
 	shadow_pos := px_pos
-	shadow_pos.x -= 0.1 * (card.scale - 1) * (win_midpoint - shadow_pos.x)
+	shadow_pos.x -= 0.2 * (card.scale - 1) * (win_midpoint - shadow_pos.x)
 
 	px_pos.y -= 2 * (scaled_size.y - px_size.y)
 	px_size = scaled_size
@@ -487,6 +498,8 @@ init_state :: proc(state: ^State) {
 }
 
 Settings :: struct {
+	menu_visible:  bool,
+	menu_fade_in:  f32,
 	vsync:         bool,
 	render_scale:  f32,
 	scale_changed: bool,
@@ -926,6 +939,8 @@ main :: proc() {
 				}
 				// ui rendering
 				{
+					if state.menu_visible{
+					}
 					// toolbar
 					{
 						if state.has_won {rl.GuiLock()}
@@ -967,28 +982,23 @@ main :: proc() {
 							cast(^i32)&state.difficulty,
 							state.diff_menu_edit,
 						) {state.diff_menu_edit = !state.diff_menu_edit}
-					}
 
-					// performance overlay
-					if state.show_perf {
-						perf_px := units_to_px({880, 0})
-						perf_size := units_to_px({120, 50})
-						rl.DrawRectangleRec(
-							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
-							rl.LIGHTGRAY,
-						)
-						rl.DrawRectangleLinesEx(
-							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
-							3,
-							rl.DARKGRAY,
-						)
-						fps := fmt.ctprintf("%d FPS", rl.GetFPS())
-						draw_text_centered(
-							fps,
-							20 * state.render_scale,
-							perf_px + perf_size / 2,
-							rl.DARKGRAY,
-						)
+						// performance overlay
+						if state.show_perf {
+							perf_px := units_to_px({880, 0})
+							perf_size := units_to_px({120, 50})
+							rl.DrawRectangleRec(
+								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+								rl.LIGHTGRAY,
+							)
+							rl.DrawRectangleLinesEx(
+								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+								3,
+								rl.DARKGRAY,
+							)
+							fps := fmt.ctprintf("%d FPS", rl.GetFPS())
+							draw_text_centered(fps, 20, perf_px + perf_size / 2, rl.DARKGRAY)
+						}
 					}
 
 					// victory screen
