@@ -43,14 +43,14 @@ draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.
 	width := rl.MeasureTextEx(
 		rl.GetFontDefault(),
 		message,
-		size * state.render_scale,
-		5 * state.render_scale,
+		size * settings.render_scale,
+		5 * settings.render_scale,
 	)
 	rl.DrawText(
 		message,
 		i32(pos.x - width.x / 2),
 		i32(pos.y - width.y / 2),
-		i32(size * state.render_scale),
+		i32(size * settings.render_scale),
 		color,
 	)
 }

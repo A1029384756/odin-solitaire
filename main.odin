@@ -402,7 +402,7 @@ init_state :: proc(state: ^State) {
 		settings          = state.settings,
 	}
 
-	switch state.difficulty {
+	switch settings.difficulty {
 	case .EASY:
 		create_solvable_board(&state.board)
 	case .RANDOM:
@@ -457,7 +457,7 @@ State :: struct {
 	// render info
 	mru_piles:          [13]^Pile,
 	// settings
-	using settings:     Settings,
+	settings:           Settings,
 	diff_menu_edit:     bool,
 	gui_locked:         bool,
 	// game stats
@@ -476,6 +476,7 @@ ICONS: rl.Texture
 ICON_SIZE :: 18
 
 state: State
+settings: Settings
 
 main :: proc() {
 	when PROFILING {
@@ -491,8 +492,8 @@ main :: proc() {
 	}
 
 	init_state(&state)
-	state.hue_shift = 2.91
-	state.render_scale = 0.75
+	settings.hue_shift = 2.91
+	settings.render_scale = 0.75
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
@@ -526,7 +527,7 @@ main :: proc() {
 	rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
 
 	hue_loc := rl.GetShaderLocation(background_shader, "u_hue")
-	rl.SetShaderValue(background_shader, hue_loc, &state.hue_shift, .FLOAT)
+	rl.SetShaderValue(background_shader, hue_loc, &settings.hue_shift, .FLOAT)
 
 	res_loc := rl.GetShaderLocation(background_shader, "u_resolution")
 	state.resolution = Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
@@ -544,8 +545,8 @@ main :: proc() {
 			// window resizing
 			{
 				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-				if state.scale_changed || state.screen_resolution != new_resolution {
-					state.resolution = new_resolution * state.render_scale
+				if settings.scale_changed || state.screen_resolution != new_resolution {
+					state.resolution = new_resolution * settings.render_scale
 					state.screen_resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
 					state.render_tex = rl.LoadRenderTexture(
@@ -554,12 +555,13 @@ main :: proc() {
 					)
 					rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
 					rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
-					state.scale_changed = false
+					settings.scale_changed = false
 				}
 			}
 
 			state.game_time += rl.GetFrameTime()
-			state.mouse_pos = state.render_scale * rl.GetMousePosition() / state.unit_to_px_scaling
+			state.mouse_pos =
+				settings.render_scale * rl.GetMousePosition() / state.unit_to_px_scaling
 
 			// camera horizontal centering
 			{
@@ -589,7 +591,7 @@ main :: proc() {
 				for &card in state.cards {
 					if card.held {
 						mouse_delta := px_to_units(
-							state.render_scale * rl.GetMouseDelta() / (50 * rl.GetFrameTime()),
+							settings.render_scale * rl.GetMouseDelta() / (50 * rl.GetFrameTime()),
 						)
 						if linalg.length(mouse_delta) > 0 {
 							angle := clamp(
@@ -644,20 +646,20 @@ main :: proc() {
 			// reset game
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
-			if rl.IsKeyPressed(.P) {state.show_perf = !state.show_perf}
+			if rl.IsKeyPressed(.P) {settings.show_perf = !settings.show_perf}
 
 			if rl.IsKeyPressed(.V) {
-				state.vsync = !state.vsync
-				glfw.SwapInterval(i32(state.vsync))
+				settings.vsync = !settings.vsync
+				glfw.SwapInterval(i32(settings.vsync))
 			}
 
 			if rl.IsKeyPressed(.K) {
-				state.render_scale += 0.05
-				state.scale_changed = true
+				settings.render_scale += 0.05
+				settings.scale_changed = true
 			}
 			if rl.IsKeyPressed(.J) {
-				state.render_scale -= 0.05
-				state.scale_changed = true
+				settings.render_scale -= 0.05
+				settings.scale_changed = true
 			}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
@@ -858,7 +860,7 @@ main :: proc() {
 						rl.BeginShaderMode(background_shader)
 						defer rl.EndShaderMode()
 						rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
-						rl.SetShaderValue(background_shader, hue_loc, &state.hue_shift, .FLOAT)
+						rl.SetShaderValue(background_shader, hue_loc, &settings.hue_shift, .FLOAT)
 						rl.DrawRectangle(
 							0,
 							0,
@@ -876,7 +878,7 @@ main :: proc() {
 				}
 				// ui rendering
 				{
-					if state.menu_visible {settings_menu()}
+					if settings.menu_visible {settings_menu()}
 					// toolbar
 					{
 						if state.has_won {rl.GuiLock()}
@@ -896,7 +898,7 @@ main :: proc() {
 							.SHOW_PERF,
 							rl.DARKGRAY,
 						) {
-							state.show_perf = !state.show_perf
+							settings.show_perf = !settings.show_perf
 						}
 						rl.GuiSlider(
 							{
@@ -907,7 +909,7 @@ main :: proc() {
 							},
 							"",
 							"",
-							&state.hue_shift,
+							&settings.hue_shift,
 							0,
 							2 * math.PI,
 						)
@@ -915,12 +917,12 @@ main :: proc() {
 						if rl.GuiDropdownBox(
 							{(out_loc.x + 2) * 5, 0, out_loc.x * 2, out_loc.y},
 							"Easy;Random",
-							cast(^i32)&state.difficulty,
+							cast(^i32)&settings.difficulty,
 							state.diff_menu_edit,
 						) {state.diff_menu_edit = !state.diff_menu_edit}
 
 						// performance overlay
-						if state.show_perf {
+						if settings.show_perf {
 							perf_px := units_to_px({880, 0})
 							perf_size := units_to_px({120, 50})
 							rl.DrawRectangleRec(
