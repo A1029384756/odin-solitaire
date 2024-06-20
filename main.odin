@@ -630,12 +630,15 @@ main :: proc() {
 				state.held_pile.pos = state.mouse_pos
 				for &card in state.cards {
 					if card.held {
-						mouse_delta := rl.GetMouseDelta()
+						mouse_delta := px_to_units(rl.GetMouseDelta())
 						if linalg.length(mouse_delta) > 0 {
-							angle :=
+							angle := clamp(
 								math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
-								(min(abs(mouse_delta.x), 100) / 40)
-							card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 8)
+								(min(abs(mouse_delta.x), 100) / 40),
+								-math.PI / 2.3,
+								math.PI / 2.3,
+							)
+							card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 4)
 						} else {
 							card.angle = math.angle_lerp(card.angle, 0, rl.GetFrameTime() * 6)
 						}
@@ -712,7 +715,6 @@ main :: proc() {
 								card.flipped = true
 								card.pos = state.discard.pos
 							}
-							state.hand.update_tag = rl.GetTime()
 						case:
 							copy(
 								state.discard.cards[discard_size + 1:],
@@ -725,7 +727,6 @@ main :: proc() {
 								card.flipped = true
 								card.pos = state.discard.pos
 							}
-							state.hand.update_tag = rl.GetTime()
 						}
 					}
 				}
