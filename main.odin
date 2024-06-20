@@ -8,6 +8,7 @@ import "core:math/rand"
 import "core:prof/spall"
 import "core:slice"
 import "core:strings"
+import "vendor:glfw"
 import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
@@ -113,7 +114,7 @@ text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_siz
 }
 
 draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
-	width := rl.MeasureTextEx(rl.GetFontDefault(), message, size, 5)
+	width := rl.MeasureTextEx(rl.GetFontDefault(), message, size, 5 * state.render_scale)
 	rl.DrawText(message, i32(pos.x - width.x / 2), i32(pos.y - width.y / 2), i32(size), color)
 }
 
@@ -437,13 +438,12 @@ create_random_board :: proc(board: ^Board) {
 
 init_state :: proc(state: ^State) {
 	state^ = State {
-		show_perf  = state.show_perf,
-		camera_pos = state.camera_pos,
-		game_time  = state.game_time,
-		hue_shift  = state.hue_shift,
-		render_tex = state.render_tex,
-		resolution = state.resolution,
-		difficulty = state.difficulty,
+		camera_pos        = state.camera_pos,
+		game_time         = state.game_time,
+		render_tex        = state.render_tex,
+		resolution        = state.resolution,
+		screen_resolution = state.screen_resolution,
+		settings          = state.settings,
 	}
 
 	switch state.difficulty {
@@ -486,12 +486,25 @@ init_state :: proc(state: ^State) {
 	state.held_pile.max_visible = 52
 }
 
+Settings :: struct {
+	vsync:         bool,
+	render_scale:  f32,
+	scale_changed: bool,
+	hue_shift:     f32,
+	show_perf:     bool,
+	difficulty:    enum {
+		EASY   = 0,
+		RANDOM = 1,
+	},
+}
+
 State :: struct {
 	// rendering
 	render_tex:         rl.RenderTexture2D,
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	resolution:         Vector2,
+	screen_resolution:  Vector2,
 	unit_to_px_scaling: Vector2,
 	// board
 	using board:        Board,
@@ -500,12 +513,7 @@ State :: struct {
 	// render info
 	mru_piles:          [13]^Pile,
 	// settings
-	hue_shift:          f32,
-	show_perf:          bool,
-	difficulty:         enum {
-		EASY   = 0,
-		RANDOM = 1,
-	},
+	using settings:     Settings,
 	diff_menu_edit:     bool,
 	gui_locked:         bool,
 	// game stats
@@ -540,7 +548,9 @@ main :: proc() {
 
 	init_state(&state)
 	state.hue_shift = 2.91
-	rl.SetConfigFlags({.VSYNC_HINT, .WINDOW_RESIZABLE})
+	state.render_scale = 0.75
+
+	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
 	when !ODIN_DEBUG {
 		rl.SetTraceLogLevel(.ERROR)
@@ -589,9 +599,10 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-				if new_resolution != state.resolution {
-					state.resolution = new_resolution
+				if rl.IsWindowResized() || state.scale_changed {
+					new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+					state.resolution = new_resolution * state.render_scale
+					state.screen_resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
 					state.render_tex = rl.LoadRenderTexture(
 						i32(state.resolution.x),
@@ -599,11 +610,13 @@ main :: proc() {
 					)
 					rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
 					rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
+					state.scale_changed = false
 				}
 			}
 
 			state.game_time += rl.GetFrameTime()
-			state.mouse_pos = rl.GetMousePosition() * (1 / state.unit_to_px_scaling)
+			state.mouse_pos =
+				rl.GetMousePosition() / (state.unit_to_px_scaling / state.render_scale)
 
 			// camera horizontal centering
 			{
@@ -632,7 +645,9 @@ main :: proc() {
 				state.held_pile.pos = state.mouse_pos
 				for &card in state.cards {
 					if card.held {
-						mouse_delta := px_to_units(rl.GetMouseDelta() / (50 * rl.GetFrameTime()))
+						mouse_delta := px_to_units(
+							rl.GetMouseDelta() / (state.render_scale * 50 * rl.GetFrameTime()),
+						)
 						if linalg.length(mouse_delta) > 0 {
 							angle := clamp(
 								math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
@@ -687,6 +702,20 @@ main :: proc() {
 			if rl.IsKeyPressed(.R) {init_state(&state)}
 
 			if rl.IsKeyPressed(.P) {state.show_perf = !state.show_perf}
+
+			if rl.IsKeyPressed(.V) {
+				state.vsync = !state.vsync
+				glfw.SwapInterval(i32(state.vsync))
+			}
+
+			if rl.IsKeyPressed(.K) {
+				state.render_scale += 0.05
+				state.scale_changed = true
+			}
+			if rl.IsKeyPressed(.J) {
+				state.render_scale -= 0.05
+				state.scale_changed = true
+			}
 
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
@@ -943,17 +972,24 @@ main :: proc() {
 
 					// performance overlay
 					if state.show_perf {
-						perf_px := Vector2 {
-							f32(state.resolution.x) - 100,
-							f32(state.resolution.y) - 30,
-						}
-						rl.DrawRectangleRounded(
-							{perf_px.x, perf_px.y, 90, 20},
-							0.5,
-							10,
-							rl.Color{0xF0, 0xF0, 0xF0, 0xF0},
+						perf_px := units_to_px({880, 0})
+						perf_size := units_to_px({120, 50})
+						rl.DrawRectangleRec(
+							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+							rl.LIGHTGRAY,
 						)
-						rl.DrawFPS(i32(perf_px.x) + 5, i32(perf_px.y))
+						rl.DrawRectangleLinesEx(
+							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+							3,
+							rl.DARKGRAY,
+						)
+						fps := fmt.ctprintf("%d FPS", rl.GetFPS())
+						draw_text_centered(
+							fps,
+							20 * state.render_scale,
+							perf_px + perf_size / 2,
+							rl.DARKGRAY,
+						)
 					}
 
 					// victory screen
@@ -1003,20 +1039,18 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					rl.DrawTextureRec(
+					rl.DrawTexturePro(
 						state.render_tex.texture,
-						{
-							0,
-							0,
-							f32(state.render_tex.texture.width),
-							f32(-state.render_tex.texture.height),
-						},
+						{0, 0, state.resolution.x, -state.resolution.y},
+						{0, 0, state.screen_resolution.x, state.screen_resolution.y},
+						0,
 						0,
 						rl.WHITE,
 					)
 				}
 			}
 		}
+		free_all(context.temp_allocator)
 	}
 }
 
