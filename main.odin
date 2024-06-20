@@ -58,13 +58,11 @@ Board :: struct {
 
 STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
 
-CARD_WIDTH :: 100
-CARD_HEIGHT :: 134
+CARD_SIZE_UNITS :: Vector2{100, 134}
 PILE_SPACING :: 40
 
-WIDTH_UNITS :: 1000
-HEIGHT_UNITS :: 1000
-UNIT_ASPECT :: WIDTH_UNITS / HEIGHT_UNITS
+UNIT_SIZE :: Vector2{1000, 1000}
+UNIT_ASPECT :: UNIT_SIZE.x / UNIT_SIZE.y
 
 Icon :: enum {
 	RESET,
@@ -74,59 +72,6 @@ Icon :: enum {
 icon_rect := [Icon]rl.Rectangle {
 	.RESET     = rl.Rectangle{3 * ICON_SIZE, 13 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
 	.SHOW_PERF = rl.Rectangle{14 * ICON_SIZE, 12 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
-}
-
-icon_button :: proc(
-	rect: rl.Rectangle,
-	icon: Icon,
-	icon_color: rl.Color,
-	icon_scale: f32 = 2,
-) -> bool {
-	clicked: bool
-
-	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
-		if rl.IsMouseButtonReleased(
-			.LEFT,
-		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
-	} else {
-		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
-	}
-	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
-
-	rl.BeginBlendMode(.ALPHA)
-	rl.DrawTexturePro(ICONS, icon_rect[icon], rect, 0, 0, rl.DARKGRAY)
-	rl.EndBlendMode()
-	return clicked
-}
-
-text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_size: f32) -> bool {
-	clicked := false
-	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
-		if rl.IsMouseButtonReleased(
-			.LEFT,
-		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
-	} else {
-		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
-	}
-	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
-	draw_text_centered(text, font_size, {rect.x, rect.y} + {rect.width, rect.height} / 2, color)
-	return clicked
-}
-
-draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
-	width := rl.MeasureTextEx(
-		rl.GetFontDefault(),
-		message,
-		size * state.render_scale,
-		5 * state.render_scale,
-	)
-	rl.DrawText(
-		message,
-		i32(pos.x - width.x / 2),
-		i32(pos.y - width.y / 2),
-		i32(size * state.render_scale),
-		color,
-	)
 }
 
 ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
@@ -147,7 +92,7 @@ draw_card :: proc(card: ^Card) {
 
 	win_midpoint := state.resolution.x / 2
 	px_pos := units_to_px(card.drawn_pos + state.camera_pos)
-	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	px_size := units_to_px(CARD_SIZE_UNITS)
 	px_pos += px_size / 2
 	scaled_size := px_size * card.scale
 	px_pos.x -= (scaled_size.x - px_size.x) / 2
@@ -210,13 +155,13 @@ card_collides_point :: proc(card: Vector2, coord: Vector2) -> bool {
 	return(
 		card.x < coord.x - state.camera_pos.x &&
 		card.y < coord.y - state.camera_pos.y &&
-		card.x + CARD_WIDTH > coord.x - state.camera_pos.x &&
-		card.y + CARD_HEIGHT > coord.y - state.camera_pos.y \
+		card.x + CARD_SIZE_UNITS.x > coord.x - state.camera_pos.x &&
+		card.y + CARD_SIZE_UNITS.y > coord.y - state.camera_pos.y \
 	)
 }
 
 cards_collide :: proc(a: Vector2, b: Vector2) -> bool {
-	return abs(a.x - b.x) < CARD_WIDTH && abs(a.y - b.y) < CARD_HEIGHT
+	return abs(a.x - b.x) < CARD_SIZE_UNITS.x && abs(a.y - b.y) < CARD_SIZE_UNITS.y
 }
 
 pile_collides_point :: proc(pile: ^Pile, coord: Vector2) -> bool {
@@ -253,7 +198,7 @@ draw_pile :: proc(pile: ^Pile) {
 	}
 
 	px_pos := units_to_px(pile.pos + state.camera_pos)
-	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	px_size := units_to_px(CARD_SIZE_UNITS)
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 	for card, idx in pile.cards {
@@ -268,7 +213,7 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 	assert(pile != nil, "pile should exist")
 
 	px_pos := units_to_px(pile.pos + state.camera_pos)
-	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
+	px_size := units_to_px(CARD_SIZE_UNITS)
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
 	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 
@@ -466,7 +411,7 @@ init_state :: proc(state: ^State) {
 
 	pile_num := 0
 	for &stack, idx in state.stacks {
-		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 70}
+		stack.pos = {500 + (CARD_SIZE_UNITS.x + 10) * f32(idx), 70}
 		stack.max_visible = 1
 		state.mru_piles[pile_num] = &stack
 		pile_num += 1
@@ -487,7 +432,7 @@ init_state :: proc(state: ^State) {
 
 	for &pile, idx in state.piles {
 		pile.spacing.y = PILE_SPACING
-		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 250}
+		pile.pos = {f32(idx) * (CARD_SIZE_UNITS.x + 10) + 200, 250}
 		pile.max_visible = 52
 		state.mru_piles[pile_num] = &pile
 		pile_num += 1
@@ -495,20 +440,6 @@ init_state :: proc(state: ^State) {
 
 	state.held_pile.spacing.y = PILE_SPACING
 	state.held_pile.max_visible = 52
-}
-
-Settings :: struct {
-	menu_visible:  bool,
-	menu_fade_in:  f32,
-	vsync:         bool,
-	render_scale:  f32,
-	scale_changed: bool,
-	hue_shift:     f32,
-	show_perf:     bool,
-	difficulty:    enum {
-		EASY   = 0,
-		RANDOM = 1,
-	},
 }
 
 State :: struct {
@@ -636,15 +567,15 @@ main :: proc() {
 
 				win_size_unit: Vector2
 				if aspect > UNIT_ASPECT {
-					win_size_unit = {HEIGHT_UNITS * aspect, HEIGHT_UNITS}
+					win_size_unit = {UNIT_SIZE.y * aspect, UNIT_SIZE.y}
 				} else {
-					win_size_unit = {WIDTH_UNITS, WIDTH_UNITS / aspect}
+					win_size_unit = {UNIT_SIZE.x, UNIT_SIZE.x / aspect}
 				}
 
 				state.unit_to_px_scaling = state.resolution / win_size_unit
 				win_size_units := px_to_units(state.resolution)
 
-				horz_overflow := win_size_units.x - WIDTH_UNITS
+				horz_overflow := win_size_units.x - UNIT_SIZE.x
 				if horz_overflow > 0 {
 					state.camera_pos.x = horz_overflow / 2
 				} else {
@@ -849,12 +780,18 @@ main :: proc() {
 							overlap :=
 								max(
 									0,
-									min(held_pos.x + CARD_WIDTH, top_pos.x + CARD_WIDTH) -
+									min(
+										held_pos.x + CARD_SIZE_UNITS.x,
+										top_pos.x + CARD_SIZE_UNITS.y,
+									) -
 									max(held_pos.x, top_pos.x),
 								) *
 								max(
 									0,
-									min(held_pos.y + CARD_HEIGHT, top_pos.y + CARD_HEIGHT) -
+									min(
+										held_pos.y + CARD_SIZE_UNITS.x,
+										top_pos.y + CARD_SIZE_UNITS.y,
+									) -
 									max(held_pos.y, top_pos.y),
 								)
 
@@ -927,7 +864,7 @@ main :: proc() {
 							0,
 							i32(state.resolution.x),
 							i32(state.resolution.y),
-							rl.BLANK,
+							rl.WHITE,
 						)
 					}
 
@@ -939,8 +876,7 @@ main :: proc() {
 				}
 				// ui rendering
 				{
-					if state.menu_visible{
-					}
+					if state.menu_visible {settings_menu()}
 					// toolbar
 					{
 						if state.has_won {rl.GuiLock()}
