@@ -35,21 +35,31 @@ text_button :: proc(rect: rl.Rectangle, text: cstring, color: rl.Color, font_siz
 		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
 	}
 	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
-	draw_text_centered(text, font_size, {rect.x, rect.y} + {rect.width, rect.height} / 2, color)
+	centered_text(text, font_size, {rect.x, rect.y} + {rect.width, rect.height} / 2, color)
 	return clicked
 }
 
-draw_text_centered :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
+centered_text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
 	width := rl.MeasureTextEx(
 		rl.GetFontDefault(),
 		message,
 		size * settings.render_scale,
 		5 * settings.render_scale,
 	)
+
+	text(
+		message,
+		size,
+    pos - width / 2,
+		color,
+	)
+}
+
+text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) {
 	rl.DrawText(
 		message,
-		i32(pos.x - width.x / 2),
-		i32(pos.y - width.y / 2),
+		i32(pos.x),
+		i32(pos.y),
 		i32(size * settings.render_scale),
 		color,
 	)

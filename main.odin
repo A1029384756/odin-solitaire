@@ -890,6 +890,8 @@ main :: proc() {
 						if icon_button({0, 0, out_loc.x, out_loc.y}, .RESET, rl.DARKGRAY) {
 							init_state(&state)
 						}
+
+						if text_button({0, 50, 150, 50}, "Restart", rl.DARKGRAY, 40) {init_state(&state)}
 						if icon_button(
 							{out_loc.x + 2, 0, out_loc.x, out_loc.y},
 							.SHOW_PERF,
@@ -932,7 +934,7 @@ main :: proc() {
 								rl.DARKGRAY,
 							)
 							fps := fmt.ctprintf("%d FPS", rl.GetFPS())
-							draw_text_centered(fps, 20, perf_px + perf_size / 2, rl.DARKGRAY)
+							centered_text(fps, 20, perf_px + perf_size / 2, rl.DARKGRAY)
 						}
 					}
 
@@ -952,7 +954,7 @@ main :: proc() {
 							{0x1F, 0x1F, 0x1, u8(0x5F * state.fade_in)},
 						)
 
-						draw_text_centered("YOU WIN!", 60, state.resolution / 2, rl.WHITE)
+						centered_text("YOU WIN!", 60, state.resolution / 2, rl.WHITE)
 
 						button_px := units_to_px({500, 150})
 						if text_button(
