@@ -399,7 +399,6 @@ init_state :: proc(state: ^State) {
 		render_tex        = state.render_tex,
 		resolution        = state.resolution,
 		screen_resolution = state.screen_resolution,
-		settings          = state.settings,
 	}
 
 	switch settings.difficulty {
@@ -456,8 +455,6 @@ State :: struct {
 	held_pile:          Held_Pile,
 	// render info
 	mru_piles:          [13]^Pile,
-	// settings
-	settings:           Settings,
 	diff_menu_edit:     bool,
 	gui_locked:         bool,
 	// game stats
