@@ -289,7 +289,6 @@ draw_held_pile :: proc(pile: ^Held_Pile) {
 			pile.hold_offset +
 			pile.spacing * f32(idx) -
 			{mouse_vel.x * math.pow(f32(idx), 1.1), 0}
-		// card.drawn_pos = card.pos
 		draw_card(card)
 	}
 }
