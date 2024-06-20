@@ -38,6 +38,7 @@ Pile :: struct {
 	cards:       [24]^Card,
 	spacing:     Vector2,
 	max_visible: int,
+	update_tag:  f64,
 }
 
 Held_Pile :: struct {
@@ -234,6 +235,11 @@ piles_collide :: proc(a: ^Pile, b: ^Pile) -> bool {
 draw_pile :: proc(pile: ^Pile) {
 	assert(pile != nil, "pile should exist")
 
+	if pile == &state.discard {
+		draw_discard(pile, &state.held_pile)
+		return
+	}
+
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px({CARD_WIDTH, CARD_HEIGHT})
 	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
@@ -322,6 +328,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
 	held_pile.source_pile = nil
+	pile.update_tag = rl.GetTime()
 }
 
 pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
@@ -446,23 +453,33 @@ init_state :: proc(state: ^State) {
 		create_random_board(&state.board)
 	}
 
-	for &pile, idx in state.piles {
-		pile.spacing.y = PILE_SPACING
-		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 250}
-		pile.max_visible = 52
+	pile_num := 0
+	for &stack, idx in state.stacks {
+		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 70}
+		stack.max_visible = 1
+		state.mru_piles[pile_num] = &stack
+		pile_num += 1
 	}
 
 	state.hand.spacing.x = 4
 	state.hand.pos = {50, 70}
 	state.hand.max_visible = 52
+	state.mru_piles[pile_num] = &state.hand
+	pile_num += 1
 
 	state.discard.spacing.x = -20
 	state.discard.pos = {350, 70}
 	state.discard.max_visible = 3
+	state.mru_piles[pile_num] = &state.discard
+	pile_num += 1
 
-	for &stack, idx in state.stacks {
-		stack.pos = {500 + (CARD_WIDTH + 10) * f32(idx), 70}
-		stack.max_visible = 1
+
+	for &pile, idx in state.piles {
+		pile.spacing.y = PILE_SPACING
+		pile.pos = {f32(idx) * (CARD_WIDTH + 10) + 200, 250}
+		pile.max_visible = 52
+		state.mru_piles[pile_num] = &pile
+		pile_num += 1
 	}
 
 	state.held_pile.spacing.y = PILE_SPACING
@@ -480,6 +497,8 @@ State :: struct {
 	using board:        Board,
 	// player items
 	held_pile:          Held_Pile,
+	// render info
+	mru_piles:          [13]^Pile,
 	// settings
 	hue_shift:          f32,
 	show_perf:          bool,
@@ -606,38 +625,53 @@ main :: proc() {
 				}
 			}
 
-			state.held_pile.pos = state.mouse_pos
-			for &card in state.cards {
-				if card.held {
-					mouse_delta := rl.GetMouseDelta()
-					if linalg.length(mouse_delta) > 0 {
-						angle :=
-							math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
-							(min(abs(mouse_delta.x), 100) / 40)
-						card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 8)
+			// card animation
+			{
+				state.held_pile.pos = state.mouse_pos
+				for &card in state.cards {
+					if card.held {
+						mouse_delta := rl.GetMouseDelta()
+						if linalg.length(mouse_delta) > 0 {
+							angle :=
+								math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
+								(min(abs(mouse_delta.x), 100) / 40)
+							card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 8)
+						} else {
+							card.angle = math.angle_lerp(card.angle, 0, rl.GetFrameTime() * 6)
+						}
 					} else {
-						card.angle = math.angle_lerp(card.angle, 0, rl.GetFrameTime() * 6)
-					}
-				} else {
-					if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
-						card.angle = math.lerp(card.angle, 0, rl.GetFrameTime() * 20)
-					} else {
-						card.angle = math.lerp(card.angle, card.target_angle, rl.GetFrameTime())
-						if abs(card.angle - card.target_angle) < 0.001 {
-							card.target_angle = rand.float32_range(-0.07, 0.07)
+						if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
+							card.angle = math.lerp(card.angle, 0, rl.GetFrameTime() * 20)
+						} else {
+							card.angle = math.lerp(
+								card.angle,
+								card.target_angle,
+								rl.GetFrameTime(),
+							)
+							if abs(card.angle - card.target_angle) < 0.001 {
+								card.target_angle = rand.float32_range(-0.07, 0.07)
+							}
 						}
 					}
-				}
-				card.flip_prog = math.lerp(
-					card.flip_prog,
-					1 if card.flipped else 0,
-					rl.GetFrameTime() * 20,
-				)
+					card.flip_prog = math.lerp(
+						card.flip_prog,
+						1 if card.flipped else 0,
+						rl.GetFrameTime() * 20,
+					)
 
-				card.scale = math.lerp(card.scale, 1.1 if card.held else 1, rl.GetFrameTime() * 10)
+					card.scale = math.lerp(
+						card.scale,
+						1.1 if card.held else 1,
+						rl.GetFrameTime() * 10,
+					)
 
-				if !card.held {
-					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, rl.GetFrameTime() * 10)
+					if !card.held {
+						card.drawn_pos = math.lerp(
+							card.drawn_pos,
+							card.pos,
+							rl.GetFrameTime() * 10,
+						)
+					}
 				}
 			}
 		}
@@ -678,6 +712,7 @@ main :: proc() {
 								card.flipped = true
 								card.pos = state.discard.pos
 							}
+							state.hand.update_tag = rl.GetTime()
 						case:
 							copy(
 								state.discard.cards[discard_size + 1:],
@@ -690,6 +725,7 @@ main :: proc() {
 								card.flipped = true
 								card.pos = state.discard.pos
 							}
+							state.hand.update_tag = rl.GetTime()
 						}
 					}
 				}
@@ -826,6 +862,11 @@ main :: proc() {
 
 		// rendering 
 		{
+			// update MRU for render
+			slice.sort_by(state.mru_piles[:], proc(a, b: ^Pile) -> bool {
+				return a.update_tag < b.update_tag
+			})
+
 			// viewport
 			{
 				rl.BeginTextureMode(state.render_tex)
@@ -847,33 +888,8 @@ main :: proc() {
 						defer rl.EndShaderMode()
 					}
 
-					for &pile in state.piles {
-						draw_pile(&pile)
-					}
-
-					for &stack in state.stacks {
-						draw_pile(&stack)
-					}
-
-					draw_pile(&state.hand)
-					draw_discard(&state.discard, &state.held_pile)
-
-					for &stack in state.stacks {
-						for card in stack.cards {
-							if card == nil {break}
-							if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
-								draw_card(card)
-							}
-						}
-					}
-
-					for &pile in state.piles {
-						for card in pile.cards {
-							if card == nil {break}
-							if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
-								draw_card(card)
-							}
-						}
+					for pile in state.mru_piles {
+						draw_pile(pile)
 					}
 
 					draw_held_pile(&state.held_pile)
