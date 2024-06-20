@@ -597,6 +597,8 @@ main :: proc() {
 						i32(state.resolution.x),
 						i32(state.resolution.y),
 					)
+					rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
+					rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
 				}
 			}
 
@@ -630,7 +632,7 @@ main :: proc() {
 				state.held_pile.pos = state.mouse_pos
 				for &card in state.cards {
 					if card.held {
-						mouse_delta := px_to_units(rl.GetMouseDelta())
+						mouse_delta := px_to_units(rl.GetMouseDelta() / (50 * rl.GetFrameTime()))
 						if linalg.length(mouse_delta) > 0 {
 							angle := clamp(
 								math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
@@ -876,9 +878,9 @@ main :: proc() {
 				{
 					{
 						rl.BeginShaderMode(background_shader)
+						defer rl.EndShaderMode()
 						rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
 						rl.SetShaderValue(background_shader, hue_loc, &state.hue_shift, .FLOAT)
-						rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
 						rl.DrawRectangle(
 							0,
 							0,
@@ -886,7 +888,6 @@ main :: proc() {
 							i32(state.resolution.y),
 							rl.BLANK,
 						)
-						defer rl.EndShaderMode()
 					}
 
 					for pile in state.mru_piles {
@@ -1002,7 +1003,6 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
 					rl.DrawTextureRec(
 						state.render_tex.texture,
 						{
