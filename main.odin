@@ -615,8 +615,7 @@ main :: proc() {
 			}
 
 			state.game_time += rl.GetFrameTime()
-			state.mouse_pos =
-				rl.GetMousePosition() / (state.unit_to_px_scaling / state.render_scale)
+			state.mouse_pos = state.render_scale * rl.GetMousePosition() / state.unit_to_px_scaling
 
 			// camera horizontal centering
 			{
@@ -646,7 +645,7 @@ main :: proc() {
 				for &card in state.cards {
 					if card.held {
 						mouse_delta := px_to_units(
-							rl.GetMouseDelta() / (state.render_scale * 50 * rl.GetFrameTime()),
+							state.render_scale * rl.GetMouseDelta() / (50 * rl.GetFrameTime()),
 						)
 						if linalg.length(mouse_delta) > 0 {
 							angle := clamp(
