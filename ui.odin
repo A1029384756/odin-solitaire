@@ -138,9 +138,33 @@ stepper :: proc(
 	min, max: i32,
 	fg, bg, inactive: rl.Color,
 ) {
+	mouse_pos := units_to_px(state.mouse_pos)
 	options := strings.split(text, ";", context.temp_allocator)
 	current_option := strings.clone_to_cstring(options[active^], context.temp_allocator)
+
 	rl.DrawRectangleRec(bounds, bg)
+
+	if rl.CheckCollisionPointRec(mouse_pos, bounds) {
+		if mouse_pos.x < bounds.x + bounds.width / 2 && active^ > min {
+			rl.DrawRectangleGradientEx(
+				{bounds.x, bounds.y, bounds.width / 2, bounds.height},
+				inactive,
+				inactive,
+				bg,
+				bg,
+			)
+		}
+		if mouse_pos.x > bounds.x + bounds.width / 2 && active^ < max {
+			rl.DrawRectangleGradientEx(
+				{bounds.x + bounds.width / 2, bounds.y, bounds.width / 2, bounds.height},
+				bg,
+				bg,
+				inactive,
+				inactive,
+			)
+		}
+	}
+
 	rl.DrawTexturePro(
 		ICONS,
 		icon_rect[.BACK],
@@ -163,7 +187,6 @@ stepper :: proc(
 		{bounds.x + bounds.width / 2, bounds.y + bounds.height / 2},
 		fg,
 	)
-	mouse_pos := units_to_px(state.mouse_pos)
 	if rl.IsMouseButtonReleased(.LEFT) && rl.CheckCollisionPointRec(mouse_pos, bounds) {
 		if mouse_pos.x < bounds.x + bounds.width / 2 && active^ > min {
 			active^ -= 1
