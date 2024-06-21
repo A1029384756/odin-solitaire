@@ -58,7 +58,8 @@ settings_menu :: proc() {
 	panel_background(&layout)
 	panel_title(&layout, "Settings")
 	panel_row(&layout, "Performance")
-	if panel_button(&layout, "Show FPS") {settings.show_perf = true}
+	perf_str := fmt.ctprintf("Show FPS: %s", "On" if settings.show_perf else "Off")
+	if panel_button(&layout, perf_str) {settings.show_perf = !settings.show_perf}
 
 	vsync_str := fmt.ctprintf("VSync: %s", "On" if settings.vsync else "Off")
 	if panel_button(&layout, vsync_str) {

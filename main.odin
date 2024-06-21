@@ -494,7 +494,7 @@ main :: proc() {
 
 	init_state(&state)
 	settings.hue_shift = 2.91
-	settings.render_scale = 0.75
+	settings.render_scale = 1
 	settings.menu_fade = 1
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
@@ -644,7 +644,7 @@ main :: proc() {
 		}
 
 		// input handlers
-		if !state.has_won && !settings.menu_visible && rl.IsWindowFocused() {
+		if !state.has_won && rl.IsWindowFocused() {
 			if rl.IsKeyPressed(.K) {
 				settings.render_scale += 0.05
 				settings.scale_changed = true
