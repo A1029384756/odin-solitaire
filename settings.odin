@@ -45,6 +45,40 @@ settings_menu :: proc() {
 		2 * math.PI,
 	)
 
+	show_fps := units_to_px({300, 75})
+	if text_button(
+		   {
+			   state.resolution.x / 2 - show_fps.x / 2,
+			   anim * state.resolution.y / 2 - show_fps.y / 2 - 150 * state.unit_to_px_scaling.y,
+			   show_fps.x,
+			   show_fps.y,
+		   },
+		   "Show FPS",
+		   rl.DARKGRAY,
+		   40,
+	   ) &&
+	   settings.menu_fade_in == 1 {
+		settings.show_perf = !settings.show_perf
+	}
+
+	select_diffuculty := units_to_px({300, 75})
+	if dropdown(
+		   {
+			   state.resolution.x / 2 - select_diffuculty.x / 2,
+			   anim * state.resolution.y / 2 -
+			   select_diffuculty.y / 2 -
+			   300 * state.unit_to_px_scaling.y,
+			   show_fps.x,
+			   show_fps.y,
+		   },
+		   "Easy;Random",
+		   cast(^i32)&settings.difficulty,
+		   state.diff_menu_edit,
+	   ) &&
+	   settings.menu_fade_in == 1 {
+		state.diff_menu_edit = !state.diff_menu_edit
+	}
+
 	button_px := units_to_px({500, 150})
 	if text_button(
 		   {

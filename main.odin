@@ -898,25 +898,6 @@ main :: proc() {
 							40,
 						) {settings.menu_visible = true}
 
-						// if icon_button(
-						// 	{out_loc.x + 2, 0, out_loc.x, out_loc.y},
-						// 	.SHOW_PERF,
-						// 	rl.DARKGRAY,
-						// ) {
-						// 	settings.show_perf = !settings.show_perf
-						// }
-
-						out_loc := units_to_px({50, 50})
-
-						if dropdown(
-							{(out_loc.x + 2) * 7, 0, out_loc.x * 2, out_loc.y},
-							"Easy;Random",
-							cast(^i32)&settings.difficulty,
-							state.diff_menu_edit,
-						) {
-							state.diff_menu_edit = !state.diff_menu_edit
-						}
-
 						// performance overlay
 						if settings.show_perf {
 							perf_px := units_to_px({880, 0})
