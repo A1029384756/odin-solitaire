@@ -75,8 +75,8 @@ icon_rect := [Icon]rl.Rectangle {
 }
 
 ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
-	C4: f32 = 2 * math.PI / 3
-	return math.pow(2, -10 * state.fade_in) * math.sin((state.fade_in * 10 - 0.75) * C4) + 1
+	C4: f32 : 2 * math.PI / 3
+	return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * C4) + 1
 }
 
 units_to_px :: #force_inline proc(coord: Vector2) -> Vector2 {
@@ -875,50 +875,47 @@ main :: proc() {
 				}
 				// ui rendering
 				{
-					if settings.menu_visible {settings_menu()}
 					// toolbar
 					{
-						if state.has_won {rl.GuiLock()}
-						out_loc := units_to_px({50, 50})
-						rl.DrawRectangle(
-							0,
-							0,
-							i32(state.resolution.x),
-							i32(out_loc.y),
-							rl.LIGHTGRAY,
-						)
-						if icon_button({0, 0, out_loc.x, out_loc.y}, .RESET, rl.DARKGRAY) {
-							init_state(&state)
-						}
+						if state.has_won || settings.menu_visible {rl.GuiLock()}
+						defer rl.GuiUnlock()
 
-						if text_button({0, 50, 150, 50}, "Restart", rl.DARKGRAY, 40) {init_state(&state)}
-						if icon_button(
-							{out_loc.x + 2, 0, out_loc.x, out_loc.y},
-							.SHOW_PERF,
+						restart_loc := units_to_px({0, 0})
+						restart_size := units_to_px({150, 50})
+						if text_button(
+							{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
+							"Restart",
 							rl.DARKGRAY,
-						) {
-							settings.show_perf = !settings.show_perf
-						}
-						rl.GuiSlider(
-							{
-								(out_loc.x + 2) * 2,
-								15 * state.unit_to_px_scaling.y,
-								out_loc.x * 3,
-								20 * state.unit_to_px_scaling.y,
-							},
-							"",
-							"",
-							&settings.hue_shift,
-							0,
-							2 * math.PI,
-						)
+							40,
+						) {init_state(&state)}
 
-						if rl.GuiDropdownBox(
-							{(out_loc.x + 2) * 5, 0, out_loc.x * 2, out_loc.y},
+						settings_loc := units_to_px({155, 0})
+						settings_size := units_to_px({150, 50})
+						if text_button(
+							{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
+							"Settings",
+							rl.DARKGRAY,
+							40,
+						) {settings.menu_visible = true}
+
+						// if icon_button(
+						// 	{out_loc.x + 2, 0, out_loc.x, out_loc.y},
+						// 	.SHOW_PERF,
+						// 	rl.DARKGRAY,
+						// ) {
+						// 	settings.show_perf = !settings.show_perf
+						// }
+
+						out_loc := units_to_px({50, 50})
+
+						if dropdown(
+							{(out_loc.x + 2) * 7, 0, out_loc.x * 2, out_loc.y},
 							"Easy;Random",
 							cast(^i32)&settings.difficulty,
 							state.diff_menu_edit,
-						) {state.diff_menu_edit = !state.diff_menu_edit}
+						) {
+							state.diff_menu_edit = !state.diff_menu_edit
+						}
 
 						// performance overlay
 						if settings.show_perf {
@@ -938,41 +935,12 @@ main :: proc() {
 						}
 					}
 
-					// victory screen
+					if settings.menu_visible {
+						settings_menu()
+					}
+
 					if state.has_won {
-						rl.GuiUnlock()
-						state.fade_in =
-							state.fade_in + rl.GetFrameTime() if state.fade_in < 1 else 1
-
-						anim := ease_out_elastic(state.fade_in)
-
-						rl.DrawRectangle(
-							0,
-							0,
-							i32(state.resolution.x),
-							i32(state.resolution.y),
-							{0x1F, 0x1F, 0x1, u8(0x5F * state.fade_in)},
-						)
-
-						centered_text("YOU WIN!", 60, state.resolution / 2, rl.WHITE)
-
-						button_px := units_to_px({500, 150})
-						if text_button(
-							   {
-								   state.resolution.x / 2 - button_px.x / 2,
-								   anim * state.resolution.y / 2 -
-								   button_px.y / 2 +
-								   200 * state.unit_to_px_scaling.y,
-								   button_px.x,
-								   button_px.y,
-							   },
-							   "RESTART",
-							   rl.WHITE,
-							   60,
-						   ) &&
-						   state.fade_in == 1 {
-							init_state(&state)
-						}
+						victory_screen()
 					}
 				}
 			}
