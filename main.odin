@@ -79,6 +79,10 @@ ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
 	return math.pow(2, -10 * t) * math.sin((t * 10 - 0.75) * C4) + 1
 }
 
+ease_out_quint :: #force_inline proc(t: f32) -> f32 {
+	return 1 - math.pow(1 - t, 5)
+}
+
 units_to_px :: #force_inline proc(coord: Vector2) -> Vector2 {
 	return coord * state.unit_to_px_scaling
 }
@@ -491,6 +495,7 @@ main :: proc() {
 	init_state(&state)
 	settings.hue_shift = 2.91
 	settings.render_scale = 0.75
+	settings.menu_fade = 1
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
@@ -639,17 +644,7 @@ main :: proc() {
 		}
 
 		// input handlers
-		if !state.has_won && rl.IsWindowFocused() {
-			// reset game
-			if rl.IsKeyPressed(.R) {init_state(&state)}
-
-			if rl.IsKeyPressed(.P) {settings.show_perf = !settings.show_perf}
-
-			if rl.IsKeyPressed(.V) {
-				settings.vsync = !settings.vsync
-				glfw.SwapInterval(i32(settings.vsync))
-			}
-
+		if !state.has_won && !settings.menu_visible && rl.IsWindowFocused() {
 			if rl.IsKeyPressed(.K) {
 				settings.render_scale += 0.05
 				settings.scale_changed = true
@@ -900,12 +895,17 @@ main :: proc() {
 							rl.LIGHTGRAY,
 							rl.SKYBLUE,
 							40,
-						) {settings.menu_visible = true}
+						) {
+							settings.menu_visible = true
+							settings.menu_fade = 0
+						}
 
 						// performance overlay
 						if settings.show_perf {
-							perf_px := units_to_px({880, 0})
-							perf_size := units_to_px({120, 50})
+							perf_px := units_to_px(
+								{state.resolution.x / state.unit_to_px_scaling.x - 150, 0},
+							)
+							perf_size := units_to_px({150, 50})
 							rl.DrawRectangleRec(
 								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
 								rl.LIGHTGRAY,
@@ -920,9 +920,7 @@ main :: proc() {
 						}
 					}
 
-					if settings.menu_visible {
-						settings_menu()
-					}
+					settings_menu()
 
 					if state.has_won {
 						victory_screen()

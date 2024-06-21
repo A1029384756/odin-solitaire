@@ -77,7 +77,7 @@ text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) -> Vect
 	)
 }
 
-slider :: proc(bounds: rl.Rectangle, value: ^f32, min: f32, max: f32) {
+slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) {
 	rl.DrawRectangleRec(bounds, rl.LIGHTGRAY)
 	rl.DrawRectangleLinesEx(bounds, 1, rl.DARKGRAY)
 	rl.DrawRectangle(
@@ -134,6 +134,8 @@ Panel_Layout :: struct {
 	pos:                      Vector2,
 	size:                     Vector2,
 	padding:                  f32,
+	max_width:                f32,
+	min_width:                f32,
 	// background
 	background_color:         rl.Color,
 	background_outline_color: rl.Color,
@@ -158,6 +160,7 @@ panel_init :: proc(panel: ^Panel_Layout) {
 		panel.body_font_size * settings.render_scale,
 		5 * settings.render_scale,
 	)
+	panel.size.x = clamp(panel.size.x, panel.min_width, panel.max_width)
 	panel._row_height = text_size.y
 }
 
@@ -212,4 +215,35 @@ panel_button :: proc(panel: ^Panel_Layout, button_text: cstring) -> bool {
 
 	panel.pos.y += panel._row_height + 3 * panel.padding
 	return button
+}
+
+panel_slider :: proc(panel: ^Panel_Layout, value: ^f32, min, max: f32) {
+	slider(
+		{
+			panel.pos.x + panel.padding,
+			panel.pos.y,
+			panel.size.x - 2 * panel.padding,
+			panel._row_height + 2 * panel.padding,
+		},
+		value,
+		min,
+		max,
+	)
+	panel.pos.y += panel._row_height + 3 * panel.padding
+}
+
+panel_dropdown :: proc(panel: ^Panel_Layout, text: string, active: ^i32, editing: bool) -> bool {
+	menu := dropdown(
+		{
+			panel.pos.x + panel.padding,
+			panel.pos.y,
+			panel.size.x - 2 * panel.padding,
+			panel._row_height + 2 * panel.padding,
+		},
+		text,
+		active,
+		editing,
+	)
+	panel.pos.y += panel._row_height + 3 * panel.padding
+	return menu
 }
