@@ -130,6 +130,49 @@ dropdown :: proc(bounds: rl.Rectangle, text: string, active: ^i32, editing: bool
 	return false
 }
 
+stepper :: proc(
+	bounds: rl.Rectangle,
+	text: string,
+	text_size: f32,
+	active: ^i32,
+	min, max: i32,
+	fg, bg, inactive: rl.Color,
+) {
+	options := strings.split(text, ";", context.temp_allocator)
+	current_option := strings.clone_to_cstring(options[active^], context.temp_allocator)
+	rl.DrawRectangleRec(bounds, bg)
+	rl.DrawTexturePro(
+		ICONS,
+		icon_rect[.BACK],
+		{bounds.x, bounds.y, bounds.height, bounds.height},
+		0,
+		0,
+		inactive if active^ == min else fg,
+	)
+	rl.DrawTexturePro(
+		ICONS,
+		icon_rect[.FORWARD],
+		{bounds.x + bounds.width - bounds.height, bounds.y, bounds.height, bounds.height},
+		0,
+		0,
+		inactive if active^ == max else fg,
+	)
+	centered_text(
+		current_option,
+		text_size,
+		{bounds.x + bounds.width / 2, bounds.y + bounds.height / 2},
+		fg,
+	)
+	mouse_pos := units_to_px(state.mouse_pos)
+	if rl.IsMouseButtonReleased(.LEFT) && rl.CheckCollisionPointRec(mouse_pos, bounds) {
+		if mouse_pos.x < bounds.x + bounds.width / 2 && active^ > min {
+			active^ -= 1
+		} else if mouse_pos.x > bounds.x + bounds.width / 2 && active^ < max {
+			active^ += 1
+		}
+	}
+}
+
 Panel_Layout :: struct {
 	pos:                      Vector2,
 	size:                     Vector2,
@@ -246,4 +289,25 @@ panel_dropdown :: proc(panel: ^Panel_Layout, text: string, active: ^i32, editing
 	)
 	panel.pos.y += panel._row_height + 3 * panel.padding
 	return menu
+}
+
+panel_stepper :: proc(panel: ^Panel_Layout, text: string, active: ^i32, min, max: i32) {
+	stepper(
+		{
+			panel.pos.x + panel.padding,
+			panel.pos.y,
+			panel.size.x - 2 * panel.padding,
+			panel._row_height + 2 * panel.padding,
+		},
+		text,
+		panel.body_font_size,
+		active,
+		min,
+		max,
+		panel.title_color,
+		panel.background_color,
+		panel.body_color,
+	)
+
+	panel.pos.y += panel._row_height + 3 * panel.padding
 }

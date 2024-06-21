@@ -68,12 +68,7 @@ settings_menu :: proc() {
 	}
 
 	panel_row(&layout, "Difficulty")
-	if panel_dropdown(
-		&layout,
-		"Easy;Random",
-		cast(^i32)&settings.difficulty,
-		state.diff_menu_edit,
-	) {state.diff_menu_edit = !state.diff_menu_edit}
+	panel_stepper(&layout, "Easy;Random", cast(^i32)&settings.difficulty, 0, 1)
 
 	panel_row(&layout, "Background Hue")
 	panel_slider(&layout, &settings.hue_shift, 0, 2 * math.PI)

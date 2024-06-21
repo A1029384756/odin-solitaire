@@ -67,11 +67,15 @@ UNIT_ASPECT :: UNIT_SIZE.x / UNIT_SIZE.y
 Icon :: enum {
 	RESET,
 	SHOW_PERF,
+	BACK,
+	FORWARD,
 }
 
 icon_rect := [Icon]rl.Rectangle {
 	.RESET     = rl.Rectangle{3 * ICON_SIZE, 13 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
 	.SHOW_PERF = rl.Rectangle{14 * ICON_SIZE, 12 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.BACK      = rl.Rectangle{2 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.FORWARD   = rl.Rectangle{3 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
 }
 
 ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
