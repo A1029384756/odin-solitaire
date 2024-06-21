@@ -120,4 +120,7 @@ settings_menu :: proc() {
 	panel_row(&layout, "demo text 2")
 	panel_button(&layout, "demo_button 1")
 	panel_button(&layout, "demo_button 2")
+	panel_row(&layout, "centered demo text 3", true)
+  panel_title(&layout, "Heading")
+	panel_button(&layout, "demo_button 3")
 }

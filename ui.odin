@@ -180,19 +180,19 @@ panel_title :: proc(panel: ^Panel_Layout, title: cstring) {
 	loc := Vector2{panel.pos.x + panel.size.x / 2, panel.pos.y}
 	title_size := centered_text(title, panel.title_font_size, loc, panel.title_color, false)
 
-	panel.pos.y += title_size.y
+	panel.pos.y += title_size.y + panel.padding
 }
 
 panel_row :: proc(panel: ^Panel_Layout, row_text: cstring, centered: bool = false) {
 	if centered {
 		loc := Vector2{panel.pos.x + panel.size.x / 2, panel.pos.y}
-		centered_text(row_text, panel.title_font_size, loc, panel.title_color)
+		centered_text(row_text, panel.body_font_size, loc, panel.body_color, false)
 	} else {
 		loc := Vector2{panel.pos.x + panel.padding, panel.pos.y}
 		text(row_text, panel.body_font_size, loc, panel.body_color)
 	}
 
-	panel.pos.y += panel._row_height
+	panel.pos.y += panel._row_height + panel.padding
 }
 
 panel_button :: proc(panel: ^Panel_Layout, button_text: cstring) -> bool {
@@ -210,6 +210,6 @@ panel_button :: proc(panel: ^Panel_Layout, button_text: cstring) -> bool {
 		panel.body_font_size,
 	)
 
-	panel.pos.y += panel._row_height + 2 * panel.padding + panel.padding
+	panel.pos.y += panel._row_height + 3 * panel.padding
 	return button
 }

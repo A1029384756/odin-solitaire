@@ -881,7 +881,7 @@ main :: proc() {
 						defer rl.GuiUnlock()
 
 						restart_loc := units_to_px({0, 0})
-						restart_size := units_to_px({150, 50})
+						restart_size := units_to_px({225, 50})
 						if text_button(
 							{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
 							"Restart",
@@ -891,8 +891,8 @@ main :: proc() {
 							40,
 						) {init_state(&state)}
 
-						settings_loc := units_to_px({155, 0})
-						settings_size := units_to_px({150, 50})
+						settings_loc := units_to_px({250, 0})
+						settings_size := units_to_px({225, 50})
 						if text_button(
 							{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
 							"Settings",
