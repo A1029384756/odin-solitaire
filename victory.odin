@@ -26,6 +26,8 @@ victory_screen :: proc() {
 		   },
 		   "RESTART",
 		   rl.WHITE,
+		   rl.LIGHTGRAY,
+		   rl.SKYBLUE,
 		   60,
 	   ) &&
 	   state.fade_in == 1 {

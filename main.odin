@@ -886,6 +886,8 @@ main :: proc() {
 							{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
 							"Restart",
 							rl.DARKGRAY,
+							rl.LIGHTGRAY,
+							rl.SKYBLUE,
 							40,
 						) {init_state(&state)}
 
@@ -895,6 +897,8 @@ main :: proc() {
 							{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
 							"Settings",
 							rl.DARKGRAY,
+							rl.LIGHTGRAY,
+							rl.SKYBLUE,
 							40,
 						) {settings.menu_visible = true}
 
