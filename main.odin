@@ -935,7 +935,9 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} * rl.GetWindowScaleDPI()
+					res :=
+						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+						rl.GetWindowScaleDPI()
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,
