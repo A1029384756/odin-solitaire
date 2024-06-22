@@ -1,6 +1,5 @@
 package main
 
-import "core:math"
 import rl "vendor:raylib"
 
 set_vsync :: proc(on: bool) {
