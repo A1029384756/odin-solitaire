@@ -59,7 +59,7 @@ centered_text :: proc(
 	width := rl.MeasureTextEx(
 		rl.GetFontDefault(),
 		message,
-		size * settings.render_scale,
+		size * state.unit_to_px_scaling.x,
 		5 * settings.render_scale,
 	)
 
@@ -68,11 +68,11 @@ centered_text :: proc(
 }
 
 text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) -> Vector2 {
-	rl.DrawText(message, i32(pos.x), i32(pos.y), i32(size * settings.render_scale), color)
+	rl.DrawText(message, i32(pos.x), i32(pos.y), i32(size * state.unit_to_px_scaling.x), color)
 	return rl.MeasureTextEx(
 		rl.GetFontDefault(),
 		message,
-		size * settings.render_scale,
+		size * state.unit_to_px_scaling.x,
 		5 * settings.render_scale,
 	)
 }
@@ -223,7 +223,7 @@ panel_init :: proc(panel: ^Panel_Layout) {
 	text_size := rl.MeasureTextEx(
 		rl.GetFontDefault(),
 		"a",
-		panel.body_font_size * settings.render_scale,
+		panel.body_font_size * state.unit_to_px_scaling.x,
 		5 * settings.render_scale,
 	)
 	panel.size.x = clamp(panel.size.x, panel.min_width, panel.max_width)
