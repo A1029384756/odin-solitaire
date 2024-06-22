@@ -547,7 +547,9 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+				new_resolution :=
+					Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+					rl.GetWindowScaleDPI()
 				if settings.scale_changed || rl.IsWindowResized() {
 					state.resolution = new_resolution * settings.render_scale
 					rl.UnloadRenderTexture(state.render_tex)
