@@ -97,8 +97,8 @@ slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) -> bool {
 				min,
 				max,
 			)
+			return true
 		}
-		return true
 	}
 	return false
 }

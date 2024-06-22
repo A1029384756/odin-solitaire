@@ -1,10 +1,13 @@
 package main
 
 import "base:runtime"
+import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
+import "core:mem"
+import "core:os"
 import "core:prof/spall"
 import "core:slice"
 import "core:strings"
@@ -12,6 +15,7 @@ import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
 PROFILING :: #config(PROFILING, false)
+MEMTRACK :: #config(MEMTRACK, false)
 
 when PROFILING {
 	spall_ctx: spall.Context
@@ -453,6 +457,7 @@ State :: struct {
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	resolution:         Vector2,
+	screen_resolution:  Vector2,
 	unit_to_px_scaling: Vector2,
 	// board
 	using board:        Board,
@@ -493,10 +498,27 @@ main :: proc() {
 		spall.SCOPED_EVENT(&spall_ctx, &spall_buffer, #procedure)
 	}
 
-	init_state(&state)
-	settings.hue_shift = 2.91
-	settings.render_scale = 1
-	settings.menu_fade = 1
+	when MEMTRACK {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+
+		defer {
+			if len(track.allocation_map) > 0 {
+				fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					fmt.eprintf("- %p @ %v\n", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
@@ -504,8 +526,11 @@ main :: proc() {
 		rl.SetTraceLogLevel(.ERROR)
 	}
 
-	rl.InitWindow(800, 800, "Solitaire")
+	rl.InitWindow(rl.GetRenderWidth() / 3, rl.GetRenderHeight() / 3, "Solitaire")
 	defer rl.CloseWindow()
+
+	load_settings()
+	init_state(&state)
 
 	rl.ChangeDirectory(rl.GetApplicationDirectory())
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
@@ -547,11 +572,17 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution :=
-					Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-					rl.GetWindowScaleDPI()
-				if settings.scale_changed || rl.IsWindowResized() {
+				new_resolution: Vector2
+				when ODIN_OS == .Darwin {
+					new_resolution =
+						{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+						rl.GetWindowScaleDPI()
+				} else {
+					new_resolution = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+				}
+				if settings.scale_changed || state.screen_resolution != new_resolution {
 					state.resolution = new_resolution * settings.render_scale
+					state.screen_resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
 					state.render_tex = rl.LoadRenderTexture(
 						i32(state.resolution.x),
@@ -647,15 +678,6 @@ main :: proc() {
 
 		// input handlers
 		if !state.has_won && rl.IsWindowFocused() && !settings.menu_visible {
-			if rl.IsKeyPressed(.K) {
-				settings.render_scale += 0.05
-				settings.scale_changed = true
-			}
-			if rl.IsKeyPressed(.J) {
-				settings.render_scale -= 0.05
-				settings.scale_changed = true
-			}
-
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
 				{
@@ -937,9 +959,12 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res :=
-						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-						rl.GetWindowScaleDPI()
+					res: Vector2
+					when ODIN_OS == .Darwin {
+						res = state.screen_resolution / rl.GetWindowScaleDPI()
+					} else {
+						res = state.screen_resolution
+					}
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,

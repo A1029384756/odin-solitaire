@@ -1,21 +1,52 @@
 package main
 
+import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
+import "core:os"
+import "core:strings"
 import rl "vendor:raylib"
 
-Settings :: struct {
-	menu_visible:  bool,
-	menu_fade:     f32,
-	vsync:         bool,
-	render_scale:  f32,
-	scale_changed: bool,
-	hue_shift:     f32,
-	show_perf:     bool,
-	difficulty:    enum {
+Persistent_Settings :: struct {
+	render_scale: f32,
+	hue_shift:    f32,
+	vsync:        bool,
+	show_perf:    bool,
+	difficulty:   enum {
 		EASY   = 0,
 		RANDOM = 1,
 	},
+}
+
+Settings :: struct {
+	menu_visible:     bool,
+	menu_fade:        f32,
+	scale_changed:    bool,
+	using persistent: Persistent_Settings,
+}
+
+load_settings :: proc() {
+	conf_bin, success := os.read_entire_file(
+		get_config_dir("solitodin.txt"),
+		context.temp_allocator,
+	)
+	if !success {
+		fmt.println("could not find settings, loading defaults")
+		settings.hue_shift = 2.91
+		settings.render_scale = 1
+		settings.menu_fade = 1
+		return
+	}
+
+	d_err := cbor.unmarshal_from_string(string(conf_bin), &settings.persistent)
+	if d_err == nil {
+		set_vsync(settings.vsync)
+	} else {
+		fmt.println("could not read settings, loading defaults")
+		settings.hue_shift = 2.91
+		settings.render_scale = 1
+		settings.menu_fade = 1
+	}
 }
 
 settings_menu :: proc() {
@@ -77,5 +108,15 @@ settings_menu :: proc() {
 	if panel_button(&layout, "Exit") {
 		settings.menu_visible = false
 		settings.menu_fade = 0
+
+		encoded, err := cbor.marshal(settings.persistent, cbor.ENCODE_FULLY_DETERMINISTIC)
+		assert(err == nil)
+		defer delete(encoded)
+
+		success := os.write_entire_file(get_config_dir("solitodin.txt"), encoded)
+		if !success {
+			fmt.println("could not open settings file:", get_config_dir("solitodin.txt"))
+			return
+		}
 	}
 }
