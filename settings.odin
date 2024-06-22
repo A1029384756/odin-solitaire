@@ -2,7 +2,6 @@ package main
 
 import "core:fmt"
 import "core:math"
-import "vendor:glfw"
 import rl "vendor:raylib"
 
 Settings :: struct {
@@ -66,7 +65,7 @@ settings_menu :: proc() {
 	vsync_str := fmt.ctprintf("VSync: %s", "On" if settings.vsync else "Off")
 	if panel_button(&layout, vsync_str) {
 		settings.vsync = !settings.vsync
-		glfw.SwapInterval(i32(settings.vsync))
+		set_vsync(settings.vsync)
 	}
 
 	panel_row(&layout, "Difficulty")
