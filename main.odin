@@ -8,7 +8,6 @@ import "core:math/rand"
 import "core:prof/spall"
 import "core:slice"
 import "core:strings"
-import "vendor:glfw"
 import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
