@@ -498,7 +498,7 @@ main :: proc() {
 	settings.render_scale = 1
 	settings.menu_fade = 1
 
-	rl.SetConfigFlags({.WINDOW_RESIZABLE})
+	rl.SetConfigFlags({.WINDOW_RESIZABLE, .WINDOW_HIGHDPI})
 
 	when !ODIN_DEBUG {
 		rl.SetTraceLogLevel(.ERROR)
@@ -937,9 +937,7 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res :=
-						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-						rl.GetWindowScaleDPI()
+					res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,
