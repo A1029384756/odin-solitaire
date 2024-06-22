@@ -77,7 +77,7 @@ text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) -> Vect
 	)
 }
 
-slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) {
+slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) -> bool {
 	rl.DrawRectangleRec(bounds, rl.LIGHTGRAY)
 	rl.DrawRectangleLinesEx(bounds, 1, rl.DARKGRAY)
 	rl.DrawRectangle(
@@ -98,7 +98,9 @@ slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) {
 				max,
 			)
 		}
+		return true
 	}
+	return false
 }
 
 dropdown :: proc(bounds: rl.Rectangle, text: string, active: ^i32, editing: bool) -> bool {
@@ -283,8 +285,8 @@ panel_button :: proc(panel: ^Panel_Layout, button_text: cstring) -> bool {
 	return button
 }
 
-panel_slider :: proc(panel: ^Panel_Layout, value: ^f32, min, max: f32) {
-	slider(
+panel_slider :: proc(panel: ^Panel_Layout, value: ^f32, min, max: f32) -> bool {
+	result := slider(
 		{
 			panel.pos.x + panel.padding,
 			panel.pos.y,
@@ -296,6 +298,7 @@ panel_slider :: proc(panel: ^Panel_Layout, value: ^f32, min, max: f32) {
 		max,
 	)
 	panel.pos.y += panel._row_height + 3 * panel.padding
+	return result
 }
 
 panel_dropdown :: proc(panel: ^Panel_Layout, text: string, active: ^i32, editing: bool) -> bool {

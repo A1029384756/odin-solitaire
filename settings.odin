@@ -39,8 +39,8 @@ settings_menu :: proc() {
 
 	layout := Panel_Layout {
 		size             = units_to_px(state.resolution / state.unit_to_px_scaling - {60, 60}),
-		max_width        = 1200,
-		min_width        = 400,
+		max_width        = units_to_px({1200, 0}).x,
+		min_width        = units_to_px({400, 0}).x,
 		padding          = 10 * settings.render_scale,
 		background_color = rl.DARKGRAY,
 		title_color      = rl.WHITE,
@@ -60,6 +60,8 @@ settings_menu :: proc() {
 	panel_row(&layout, "Performance")
 	perf_str := fmt.ctprintf("Show FPS: %s", "On" if settings.show_perf else "Off")
 	if panel_button(&layout, perf_str) {settings.show_perf = !settings.show_perf}
+	panel_row(&layout, "Render Scale")
+	if panel_slider(&layout, &settings.render_scale, 0.7, 2) {settings.scale_changed = true}
 
 	vsync_str := fmt.ctprintf("VSync: %s", "On" if settings.vsync else "Off")
 	if panel_button(&layout, vsync_str) {
