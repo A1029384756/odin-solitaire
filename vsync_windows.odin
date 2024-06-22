@@ -1,7 +1,9 @@
 package main
 
+import "core:math"
 import rl "vendor:raylib"
 
 set_vsync :: proc(on: bool) {
-	rl.SetTargetFPS(rl.GetMonitorRefreshRate(0))
+	target := rl.GetMonitorRefreshRate(0) if on else max(i32)
+	rl.SetTargetFPS()
 }
