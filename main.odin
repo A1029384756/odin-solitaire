@@ -402,11 +402,10 @@ create_random_board :: proc(board: ^Board) {
 
 init_state :: proc(state: ^State) {
 	state^ = State {
-		camera_pos        = state.camera_pos,
-		game_time         = state.game_time,
-		render_tex        = state.render_tex,
-		resolution        = state.resolution,
-		screen_resolution = state.screen_resolution,
+		camera_pos = state.camera_pos,
+		game_time  = state.game_time,
+		render_tex = state.render_tex,
+		resolution = state.resolution,
 	}
 
 	switch settings.difficulty {
@@ -455,7 +454,6 @@ State :: struct {
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	resolution:         Vector2,
-	screen_resolution:  Vector2,
 	unit_to_px_scaling: Vector2,
 	// board
 	using board:        Board,
@@ -550,10 +548,11 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-				if settings.scale_changed || state.screen_resolution != new_resolution {
+				new_resolution :=
+					Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+					rl.GetWindowScaleDPI()
+				if settings.scale_changed || rl.IsWindowResized() {
 					state.resolution = new_resolution * settings.render_scale
-					state.screen_resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
 					state.render_tex = rl.LoadRenderTexture(
 						i32(state.resolution.x),
@@ -936,14 +935,17 @@ main :: proc() {
 			{
 				rl.BeginDrawing()
 				defer rl.EndDrawing()
-
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
+					res :=
+						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+						rl.GetWindowScaleDPI()
+
 					rl.DrawTexturePro(
 						state.render_tex.texture,
 						{0, 0, state.resolution.x, -state.resolution.y},
-						{0, 0, state.screen_resolution.x, state.screen_resolution.y},
+						{0, 0, res.x, res.y},
 						0,
 						0,
 						rl.WHITE,
