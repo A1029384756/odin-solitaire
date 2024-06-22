@@ -547,9 +547,13 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution :=
-					Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-					rl.GetWindowScaleDPI()
+				when ODIN_OS == .Darwin {
+					new_resolution :=
+						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+						rl.GetWindowScaleDPI()
+				} else {
+					new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+				}
 				if settings.scale_changed || rl.IsWindowResized() {
 					state.resolution = new_resolution * settings.render_scale
 					rl.UnloadRenderTexture(state.render_tex)
@@ -937,9 +941,13 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res :=
-						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-						rl.GetWindowScaleDPI()
+					when ODIN_OS == .Darwin {
+						res :=
+							Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+							rl.GetWindowScaleDPI()
+					} else {
+						res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+					}
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,
