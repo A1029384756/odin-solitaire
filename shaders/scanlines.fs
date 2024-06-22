@@ -29,7 +29,7 @@ const vec3 kBackgroundColor = RGBA(0x00, 0x60, 0xb8, 0xff).rgb; // medium-blue s
 //const vec3 kBackgroundColor = RGBA(0xff, 0x00, 0xff, 0xff).rgb; // test magenta
 
 // Emulated input resolution.
-vec2 res = u_resolution.xy / 3.0;
+vec2 res = vec2(u_resolution.x / 3.0, 480.0);
 
 // Hardness of scanline.
 //	-8.0 = soft

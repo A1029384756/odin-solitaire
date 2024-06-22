@@ -2,14 +2,14 @@
   description = "Odin Devshell";
 
   inputs = {
-    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url      = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url  = "github:numtide/flake-utils";
   };
 
   outputs = { nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
 
         nativeBuildInputs = with pkgs; [ 
           xorg.libX11
@@ -22,6 +22,7 @@
           ols
           gdb
           glslls
+          renderdoc
           #put your runtime and build dependencies here
         ];
       in
