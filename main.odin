@@ -498,7 +498,7 @@ main :: proc() {
 	settings.render_scale = 1
 	settings.menu_fade = 1
 
-	rl.SetConfigFlags({.WINDOW_RESIZABLE, .WINDOW_HIGHDPI})
+	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
 	when !ODIN_DEBUG {
 		rl.SetTraceLogLevel(.ERROR)
@@ -547,9 +547,7 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution :=
-					Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-					rl.GetWindowScaleDPI()
+				new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
 				if settings.scale_changed || rl.IsWindowResized() {
 					state.resolution = new_resolution * settings.render_scale
 					rl.UnloadRenderTexture(state.render_tex)
@@ -937,7 +935,7 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+					res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} * rl.GetWindowScaleDPI()
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,
