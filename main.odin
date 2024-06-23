@@ -505,7 +505,7 @@ main :: proc() {
 		rl.SetTraceLogLevel(.ERROR)
 	}
 
-	rl.InitWindow(800, 800, "Solitaire")
+	rl.InitWindow(rl.GetRenderWidth() / 3, rl.GetRenderHeight() / 3, "Solitaire")
 	defer rl.CloseWindow()
 
 	rl.ChangeDirectory(rl.GetApplicationDirectory())
