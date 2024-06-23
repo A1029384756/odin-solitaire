@@ -453,6 +453,7 @@ State :: struct {
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	resolution:         Vector2,
+	screen_resolution:  Vector2,
 	unit_to_px_scaling: Vector2,
 	// board
 	using board:        Board,
@@ -547,15 +548,17 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
+				new_resolution: Vector2
 				when ODIN_OS == .Darwin {
-					new_resolution :=
-						Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
+					new_resolution =
+						{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
 						rl.GetWindowScaleDPI()
 				} else {
-					new_resolution := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+					new_resolution = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
 				}
-				if settings.scale_changed || rl.IsWindowResized() {
+				if settings.scale_changed || state.screen_resolution != new_resolution {
 					state.resolution = new_resolution * settings.render_scale
+					state.screen_resolution = new_resolution
 					rl.UnloadRenderTexture(state.render_tex)
 					state.render_tex = rl.LoadRenderTexture(
 						i32(state.resolution.x),
@@ -941,12 +944,11 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
+					res: Vector2
 					when ODIN_OS == .Darwin {
-						res :=
-							Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-							rl.GetWindowScaleDPI()
+						res = state.screen_resolution / rl.GetWindowScaleDPI()
 					} else {
-						res := Vector2{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
+						res = state.screen_resolution
 					}
 
 					rl.DrawTexturePro(
