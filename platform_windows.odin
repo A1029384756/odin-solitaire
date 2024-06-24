@@ -23,6 +23,7 @@ get_config_dir :: proc(
 	allocator: mem.Allocator = context.temp_allocator,
 ) -> string {
 	context.allocator = allocator
+
 	sub: string = strings.trim(subfolder, "/")
 	sub = strings.to_lower_camel_case(sub)
 	dir := os.get_env("LocalAppData")
