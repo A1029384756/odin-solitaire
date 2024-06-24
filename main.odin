@@ -1,10 +1,13 @@
 package main
 
 import "base:runtime"
+import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
+import "core:mem"
+import "core:os"
 import "core:prof/spall"
 import "core:slice"
 import "core:strings"
@@ -12,6 +15,7 @@ import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
 PROFILING :: #config(PROFILING, false)
+MEMTRACK :: #config(MEMTRACK, false)
 
 when PROFILING {
 	spall_ctx: spall.Context
@@ -494,10 +498,27 @@ main :: proc() {
 		spall.SCOPED_EVENT(&spall_ctx, &spall_buffer, #procedure)
 	}
 
-	init_state(&state)
-	settings.hue_shift = 2.91
-	settings.render_scale = 1
-	settings.menu_fade = 1
+	when MEMTRACK {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+
+		defer {
+			if len(track.allocation_map) > 0 {
+				fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					fmt.eprintf("- %p @ %v\n", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
 
 	rl.SetConfigFlags({.WINDOW_RESIZABLE})
 
@@ -507,6 +528,9 @@ main :: proc() {
 
 	rl.InitWindow(rl.GetRenderWidth() / 3, rl.GetRenderHeight() / 3, "Solitaire")
 	defer rl.CloseWindow()
+
+	load_settings()
+	init_state(&state)
 
 	rl.ChangeDirectory(rl.GetApplicationDirectory())
 	CARDS = rl.LoadTexture("assets/playing_cards.png")
