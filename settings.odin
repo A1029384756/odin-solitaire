@@ -35,6 +35,7 @@ load_settings :: proc() {
 		settings.hue_shift = 2.91
 		settings.render_scale = 1
 		settings.menu_fade = 1
+		return
 	}
 
 	d_err := cbor.unmarshal_from_string(string(conf_bin), &settings.persistent)
@@ -112,15 +113,10 @@ settings_menu :: proc() {
 		assert(err == nil)
 		defer delete(encoded)
 
-		conf_dir := get_config_dir("solitodin.txt")
-
-		fd, f_err := os.open(conf_dir, os.O_CREATE | os.O_WRONLY | os.O_TRUNC)
-		if f_err != 0 {
-			fmt.println("could not open settings file:", conf_dir)
+		success := os.write_entire_file(get_config_dir("solitodin.txt"), encoded)
+		if !success {
+			fmt.println("could not open settings file:", get_config_dir("solitodin.txt"))
 			return
 		}
-		defer os.close(fd)
-
-		os.write(fd, encoded)
 	}
 }

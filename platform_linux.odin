@@ -17,7 +17,7 @@ get_config_dir :: proc(
 
 	sub: string = strings.trim(subfolder, "/")
 	sub = strings.to_lower_camel_case(sub)
-	dir := os.get_env("XDG_CACHE_HOME")
+	dir := os.get_env("HOME")
 	dir = strings.concatenate({dir, "/.config"})
 	if dir != "" {
 		dir = strings.concatenate({dir, "/", sub})
