@@ -678,15 +678,6 @@ main :: proc() {
 
 		// input handlers
 		if !state.has_won && rl.IsWindowFocused() && !settings.menu_visible {
-			if rl.IsKeyPressed(.K) {
-				settings.render_scale += 0.05
-				settings.scale_changed = true
-			}
-			if rl.IsKeyPressed(.J) {
-				settings.render_scale -= 0.05
-				settings.scale_changed = true
-			}
-
 			if rl.IsMouseButtonPressed(.LEFT) {
 				// handle discard
 				{
