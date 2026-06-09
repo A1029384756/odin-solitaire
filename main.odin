@@ -1,21 +1,18 @@
 package main
 
 import "base:runtime"
-import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
-import "core:os"
 import "core:prof/spall"
 import "core:slice"
-import "core:strings"
 import rl "vendor:raylib"
 
 EASYWIN :: #config(EASYWIN, false)
 PROFILING :: #config(PROFILING, false)
-MEMTRACK :: #config(MEMTRACK, false)
+MEMTRACK :: #config(MEMTRACK, ODIN_DEBUG)
 
 when PROFILING {
 	spall_ctx: spall.Context
@@ -520,13 +517,13 @@ main :: proc() {
 		}
 	}
 
-	rl.SetConfigFlags({.WINDOW_RESIZABLE})
+	rl.SetConfigFlags({.WINDOW_HIGHDPI})
 
 	when !ODIN_DEBUG {
 		rl.SetTraceLogLevel(.ERROR)
 	}
 
-	rl.InitWindow(rl.GetRenderWidth() / 3, rl.GetRenderHeight() / 3, "Solitaire")
+	rl.InitWindow(800, 600, "Solitaire")
 	defer rl.CloseWindow()
 
 	load_settings()
@@ -572,14 +569,7 @@ main :: proc() {
 		if rl.IsWindowFocused() {
 			// window resizing
 			{
-				new_resolution: Vector2
-				when ODIN_OS == .Darwin {
-					new_resolution =
-						{f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())} /
-						rl.GetWindowScaleDPI()
-				} else {
-					new_resolution = {f32(rl.GetRenderWidth()), f32(rl.GetRenderHeight())}
-				}
+				new_resolution := Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
 				if settings.scale_changed || state.screen_resolution != new_resolution {
 					state.resolution = new_resolution * settings.render_scale
 					state.screen_resolution = new_resolution
@@ -596,7 +586,9 @@ main :: proc() {
 
 			state.game_time += rl.GetFrameTime()
 			state.mouse_pos =
-				settings.render_scale * rl.GetMousePosition() / state.unit_to_px_scaling
+				settings.render_scale *
+				(rl.GetMousePosition() * rl.GetWindowScaleDPI()) /
+				state.unit_to_px_scaling
 
 			// camera horizontal centering
 			{
@@ -723,7 +715,7 @@ main :: proc() {
 					}
 				}
 
-				// pick up from discard 
+				// pick up from discard
 				{
 					top, idx := pile_get_top(&state.discard)
 					if idx != -1 && card_collides_point(top, state.mouse_pos) {
@@ -735,7 +727,7 @@ main :: proc() {
 					}
 				}
 
-				// pick up from stack 
+				// pick up from stack
 				{
 					for &stack in state.stacks {
 						top, idx := pile_get_top(&stack)
@@ -750,7 +742,7 @@ main :: proc() {
 					}
 				}
 
-				// pick up from pile 
+				// pick up from pile
 				{
 					for &pile in state.piles {
 						#reverse for card, idx in pile.cards {
@@ -859,7 +851,7 @@ main :: proc() {
 			}
 		}
 
-		// rendering 
+		// rendering
 		{
 			// update MRU for render
 			slice.sort_by(state.mru_piles[:], proc(a, b: ^Pile) -> bool {
@@ -959,17 +951,16 @@ main :: proc() {
 				{
 					rl.BeginShaderMode(scanline_shader)
 					defer rl.EndShaderMode()
-					res: Vector2
-					when ODIN_OS == .Darwin {
-						res = state.screen_resolution / rl.GetWindowScaleDPI()
-					} else {
-						res = state.screen_resolution
-					}
 
 					rl.DrawTexturePro(
 						state.render_tex.texture,
-						{0, 0, state.resolution.x, -state.resolution.y},
-						{0, 0, res.x, res.y},
+						{
+							0,
+							0,
+							f32(state.render_tex.texture.width),
+							-f32(state.render_tex.texture.height),
+						},
+						{0, 0, state.screen_resolution.x, state.screen_resolution.y},
 						0,
 						0,
 						rl.WHITE,

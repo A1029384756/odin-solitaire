@@ -3,8 +3,8 @@ package main
 import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:os"
-import "core:strings"
 import rl "vendor:raylib"
 
 Persistent_Settings :: struct {
@@ -25,16 +25,19 @@ Settings :: struct {
 	using persistent: Persistent_Settings,
 }
 
+SETTINGS_DEFAULT :: Settings {
+	hue_shift    = 2.91,
+	render_scale = 1,
+	menu_fade    = 1,
+	vsync        = true,
+}
+
 load_settings :: proc() {
-	conf_bin, success := os.read_entire_file(
-		get_config_dir("solitodin.txt"),
-		context.temp_allocator,
-	)
-	if !success {
+	conf_bin, read_err := os.read_entire_file(get_config("solitodin.txt"), context.temp_allocator)
+	if read_err != nil {
 		fmt.println("could not find settings, loading defaults")
-		settings.hue_shift = 2.91
-		settings.render_scale = 1
-		settings.menu_fade = 1
+		settings = SETTINGS_DEFAULT
+		set_vsync(true)
 		return
 	}
 
@@ -43,9 +46,8 @@ load_settings :: proc() {
 		set_vsync(settings.vsync)
 	} else {
 		fmt.println("could not read settings, loading defaults")
-		settings.hue_shift = 2.91
-		settings.render_scale = 1
-		settings.menu_fade = 1
+		settings = SETTINGS_DEFAULT
+		set_vsync(true)
 	}
 }
 
@@ -113,10 +115,19 @@ settings_menu :: proc() {
 		assert(err == nil)
 		defer delete(encoded)
 
-		success := os.write_entire_file(get_config_dir("solitodin.txt"), encoded)
-		if !success {
-			fmt.println("could not open settings file:", get_config_dir("solitodin.txt"))
+		write_err := os.write_entire_file(get_config("solitodin.txt"), encoded)
+		if write_err != nil {
+			fmt.println("could not open settings file:", get_config("solitodin.txt"))
 			return
 		}
 	}
+}
+
+get_config :: proc(
+	subfolder: string,
+	allocator: mem.Allocator = context.temp_allocator,
+) -> string {
+	dir, _ := os.user_config_dir(allocator)
+	joined, _ := os.join_path({dir, subfolder}, allocator)
+	return joined
 }
