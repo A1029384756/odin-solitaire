@@ -8,7 +8,7 @@ import "core:math/rand"
 import "core:mem"
 import "core:prof/spall"
 import "core:slice"
-import rl "vendor:raylib"
+import k2 "karl2d"
 
 EASYWIN :: #config(EASYWIN, false)
 PROFILING :: #config(PROFILING, false)
@@ -56,7 +56,7 @@ Board :: struct {
 	stacks:  [4]Pile,
 }
 
-STACK_COLOR :: rl.Color{0x1F, 0x1F, 0x1F, 0x5F}
+STACK_COLOR :: k2.Color{0x1F, 0x1F, 0x1F, 0x5F}
 
 CARD_SIZE_UNITS :: Vector2{100, 134}
 PILE_SPACING :: 40
@@ -71,11 +71,11 @@ Icon :: enum {
 	FORWARD,
 }
 
-icon_rect := [Icon]rl.Rectangle {
-	.RESET     = rl.Rectangle{3 * ICON_SIZE, 13 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
-	.SHOW_PERF = rl.Rectangle{14 * ICON_SIZE, 12 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
-	.BACK      = rl.Rectangle{2 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
-	.FORWARD   = rl.Rectangle{3 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+icon_rect := [Icon]k2.Rect {
+	.RESET     = k2.Rect{3 * ICON_SIZE, 13 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.SHOW_PERF = k2.Rect{14 * ICON_SIZE, 12 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.BACK      = k2.Rect{2 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
+	.FORWARD   = k2.Rect{3 * ICON_SIZE, 7 * ICON_SIZE, ICON_SIZE, ICON_SIZE},
 }
 
 ease_out_elastic :: #force_inline proc(t: f32) -> f32 {
@@ -111,50 +111,49 @@ draw_card :: proc(card: ^Card) {
 	px_pos.y -= 2 * (scaled_size.y - px_size.y)
 	px_size = scaled_size
 
-	output_pos := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	output_pos := k2.Rect{px_pos.x, px_pos.y, px_size.x, px_size.y}
 
 	parabolic_show: f32 = max(0.3, math.pow((card.flip_prog - 0.5) * 2, 2))
-	output_pos.x += (1 - parabolic_show) * output_pos.width / 2
-	output_pos.width *= parabolic_show
+	output_pos.x += (1 - parabolic_show) * output_pos.w / 2
+	output_pos.w *= parabolic_show
 
 	if card.scale > 1 {
-		shadow_rect := rl.Rectangle{shadow_pos.x, shadow_pos.y, px_size.x, px_size.y}
-		rl.DrawTexturePro(
+		shadow_rect := k2.Rect{shadow_pos.x, shadow_pos.y, px_size.x, px_size.y}
+		k2.draw_texture_fit(
 			BLANK,
 			{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 			shadow_rect,
 			px_size / 2,
-			math.to_degrees(card.angle),
-			rl.Color{0x2F, 0x2F, 0x2F, 0x2F},
+			card.angle,
+			{0x2F, 0x2F, 0x2F, 0x2F},
 		)
 	}
 
-	rl.DrawTexturePro(
+	k2.draw_texture_fit(
 		BLANK,
 		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 		output_pos,
 		px_size / 2,
-		math.to_degrees(card.angle),
-		rl.WHITE,
+		card.angle,
 	)
 
 	tex_coord: Vector2 = {f32(card.rank), f32(card.suit)} * CARD_TEX_SIZE
-	tex_rect := rl.Rectangle{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
+	tex_rect := k2.Rect{tex_coord.x, tex_coord.y, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}
 
-	rl.DrawTexturePro(
+	k2.draw_texture_fit(
 		CARDS,
 		tex_rect,
 		output_pos,
 		px_size / 2,
-		math.to_degrees(card.angle),
+		card.angle,
 		{0xFF, 0xFF, 0xFF, u8(255 * card.flip_prog)},
 	)
-	rl.DrawTexturePro(
+	k2.draw_texture_fit(
 		BACKS,
 		{0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y},
 		output_pos,
 		px_size / 2,
-		math.to_degrees(card.angle),
+		card.angle,
 		{0xFF, 0xFF, 0xFF, u8(255 * (1 - card.flip_prog))},
 	)
 }
@@ -207,8 +206,8 @@ draw_pile :: proc(pile: ^Pile) {
 
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px(CARD_SIZE_UNITS)
-	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
+	rect := k2.Rect{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	k2.draw_texture_fit(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 	for card, idx in pile.cards {
 		if card == nil {break}
 		card.pos = pile.pos + pile.spacing * f32(idx)
@@ -222,8 +221,8 @@ draw_discard :: proc(pile: ^Pile, held: ^Held_Pile) {
 
 	px_pos := units_to_px(pile.pos + state.camera_pos)
 	px_size := units_to_px(CARD_SIZE_UNITS)
-	rect := rl.Rectangle{px_pos.x, px_pos.y, px_size.x, px_size.y}
-	rl.DrawTexturePro(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
+	rect := k2.Rect{px_pos.x, px_pos.y, px_size.x, px_size.y}
+	k2.draw_texture_fit(BLANK, {0, 0, CARD_TEX_SIZE.x, CARD_TEX_SIZE.y}, rect, 0, 0, STACK_COLOR)
 
 	top, top_idx := pile_get_top(pile)
 	_, held_idx := pile_get_top(held)
@@ -258,7 +257,7 @@ draw_held_pile :: proc(pile: ^Held_Pile) {
 		card.drawn_pos = math.lerp(
 			card.drawn_pos,
 			card.pos,
-			rl.GetFrameTime() * 40 / math.pow(f32(idx + 1), 0.6),
+			k2.get_frame_time() * 40 / math.pow(f32(idx + 1), 0.6),
 		)
 		draw_card(card)
 	}
@@ -293,7 +292,7 @@ held_pile_send_to_pile :: proc(held_pile: ^Held_Pile, pile: ^Pile) {
 	slice.zero(held_pile.cards[:])
 	held_pile.hold_offset = 0
 	held_pile.source_pile = nil
-	pile.update_tag = rl.GetTime()
+	pile.update_tag = k2.get_time()
 }
 
 pile_can_place :: proc(pile: ^Pile, held: ^Held_Pile) -> bool {
@@ -450,7 +449,7 @@ init_state :: proc(state: ^State) {
 
 State :: struct {
 	// rendering
-	render_tex:         rl.RenderTexture2D,
+	render_tex:         k2.Render_Texture,
 	camera_pos:         Vector2,
 	mouse_pos:          Vector2,
 	resolution:         Vector2,
@@ -471,12 +470,12 @@ State :: struct {
 	fade_in:            f32,
 }
 
-CARDS: rl.Texture
-BLANK: rl.Texture
-BACKS: rl.Texture
+CARDS: k2.Texture
+BLANK: k2.Texture
+BACKS: k2.Texture
 CARD_TEX_SIZE: Vector2 : {71, 95}
 
-ICONS: rl.Texture
+ICONS: k2.Texture
 ICON_SIZE :: 18
 
 state: State
@@ -517,160 +516,142 @@ main :: proc() {
 		}
 	}
 
-	rl.SetConfigFlags({.WINDOW_HIGHDPI})
-
-	when !ODIN_DEBUG {
-		rl.SetTraceLogLevel(.ERROR)
-	}
-
-	rl.InitWindow(800, 600, "Solitaire")
-	defer rl.CloseWindow()
+	k2.init(800, 600, "Solitaire", {window_mode = .Windowed_Resizable})
+	defer k2.shutdown()
 
 	load_settings()
 	init_state(&state)
 
-	rl.ChangeDirectory(rl.GetApplicationDirectory())
-	CARDS = rl.LoadTexture("assets/playing_cards.png")
-	defer rl.UnloadTexture(CARDS)
+	CARDS = k2.load_texture_from_file("assets/playing_cards.png")
+	defer k2.destroy_texture(CARDS)
 
-	BLANK = rl.LoadTexture("assets/blank_card.png")
-	defer rl.UnloadTexture(BLANK)
+	BLANK = k2.load_texture_from_file("assets/blank_card.png")
+	defer k2.destroy_texture(BLANK)
 
-	BACKS = rl.LoadTexture("assets/card_backs.png")
-	defer rl.UnloadTexture(BACKS)
+	BACKS = k2.load_texture_from_file("assets/card_backs.png")
+	defer k2.destroy_texture(BACKS)
 
-	ICONS = rl.LoadTexture("assets/icons.png")
-	defer rl.UnloadTexture(ICONS)
+	ICONS = k2.load_texture_from_file("assets/icons.png")
+	defer k2.destroy_texture(ICONS)
 
-	state.render_tex = rl.LoadRenderTexture(800, 800)
-	defer rl.UnloadRenderTexture(state.render_tex)
+	state.render_tex = k2.create_render_texture(800, 800)
+	defer k2.destroy_render_texture(state.render_tex)
 
-	background_shader := rl.LoadShader(nil, "shaders/fbm.fs")
-	defer rl.UnloadShader(background_shader)
+	background_shader := k2.load_shader_from_file("shaders/default.vs", "shaders/fbm.fs")
+	defer k2.destroy_shader(background_shader)
 
-	time_loc := rl.GetShaderLocation(background_shader, "u_time")
-	rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
+	time_loc := background_shader.constant_lookup["u_time"]
+	k2.set_shader_constant(background_shader, time_loc, state.game_time)
 
-	hue_loc := rl.GetShaderLocation(background_shader, "u_hue")
-	rl.SetShaderValue(background_shader, hue_loc, &settings.hue_shift, .FLOAT)
+	hue_loc := background_shader.constant_lookup["u_hue"]
+	k2.set_shader_constant(background_shader, hue_loc, settings.hue_shift)
 
-	res_loc := rl.GetShaderLocation(background_shader, "u_resolution")
-	state.resolution = Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-	rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
+	res_loc := background_shader.constant_lookup["u_resolution"]
+	state.resolution = k2.get_screen_size()
+	k2.set_shader_constant(background_shader, res_loc, state.resolution)
 
-	scanline_shader := rl.LoadShader(nil, "shaders/scanlines.fs")
-	defer rl.UnloadShader(scanline_shader)
+	scanline_shader := k2.load_shader_from_file("shaders/default.vs", "shaders/scanlines.fs")
+	defer k2.destroy_shader(scanline_shader)
 
-	scanline_res_loc := rl.GetShaderLocation(scanline_shader, "u_resolution")
-	rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
+	scanline_res_loc := scanline_shader.constant_lookup["u_resolution"]
+	k2.set_shader_constant(scanline_shader, scanline_res_loc, state.resolution)
 
-	for !rl.WindowShouldClose() {
+	for k2.update() {
 		// general update
-		if rl.IsWindowFocused() {
-			// window resizing
-			{
-				new_resolution := Vector2{f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())}
-				if settings.scale_changed || state.screen_resolution != new_resolution {
-					state.resolution = new_resolution * settings.render_scale
-					state.screen_resolution = new_resolution
-					rl.UnloadRenderTexture(state.render_tex)
-					state.render_tex = rl.LoadRenderTexture(
-						i32(state.resolution.x),
-						i32(state.resolution.y),
+		k2.clear(k2.BLACK)
+		// window resizing
+		{
+			new_resolution := k2.get_screen_size()
+			if settings.scale_changed || state.screen_resolution != new_resolution {
+				state.resolution = new_resolution * settings.render_scale
+				state.screen_resolution = new_resolution
+				k2.destroy_render_texture(state.render_tex)
+				state.render_tex = k2.create_render_texture(
+					int(state.resolution.x),
+					int(state.resolution.y),
+				)
+				k2.set_shader_constant(background_shader, res_loc, state.resolution)
+				k2.set_shader_constant(scanline_shader, scanline_res_loc, state.resolution)
+				settings.scale_changed = false
+			}
+		}
+
+		state.game_time += k2.get_frame_time()
+		state.mouse_pos =
+			settings.render_scale * k2.get_mouse_position() / state.unit_to_px_scaling
+
+		// camera horizontal centering
+		{
+			aspect := state.resolution.x / state.resolution.y
+
+			win_size_unit: Vector2
+			if aspect > UNIT_ASPECT {
+				win_size_unit = {UNIT_SIZE.y * aspect, UNIT_SIZE.y}
+			} else {
+				win_size_unit = {UNIT_SIZE.x, UNIT_SIZE.x / aspect}
+			}
+
+			state.unit_to_px_scaling = state.resolution / win_size_unit
+			win_size_units := px_to_units(state.resolution)
+
+			horz_overflow := win_size_units.x - UNIT_SIZE.x
+			if horz_overflow > 0 {
+				state.camera_pos.x = horz_overflow / 2
+			} else {
+				state.camera_pos.x = 0
+			}
+		}
+
+		// card animation
+		{
+			state.held_pile.pos = state.mouse_pos
+			for &card in state.cards {
+				if card.held {
+					mouse_delta := px_to_units(
+						settings.render_scale * k2.get_mouse_delta() / (50 * k2.get_frame_time()),
 					)
-					rl.SetShaderValue(background_shader, res_loc, &state.resolution, .VEC2)
-					rl.SetShaderValue(scanline_shader, scanline_res_loc, &state.resolution, .VEC2)
-					settings.scale_changed = false
-				}
-			}
-
-			state.game_time += rl.GetFrameTime()
-			state.mouse_pos =
-				settings.render_scale *
-				(rl.GetMousePosition() * rl.GetWindowScaleDPI()) /
-				state.unit_to_px_scaling
-
-			// camera horizontal centering
-			{
-				aspect := state.resolution.x / state.resolution.y
-
-				win_size_unit: Vector2
-				if aspect > UNIT_ASPECT {
-					win_size_unit = {UNIT_SIZE.y * aspect, UNIT_SIZE.y}
-				} else {
-					win_size_unit = {UNIT_SIZE.x, UNIT_SIZE.x / aspect}
-				}
-
-				state.unit_to_px_scaling = state.resolution / win_size_unit
-				win_size_units := px_to_units(state.resolution)
-
-				horz_overflow := win_size_units.x - UNIT_SIZE.x
-				if horz_overflow > 0 {
-					state.camera_pos.x = horz_overflow / 2
-				} else {
-					state.camera_pos.x = 0
-				}
-			}
-
-			// card animation
-			{
-				state.held_pile.pos = state.mouse_pos
-				for &card in state.cards {
-					if card.held {
-						mouse_delta := px_to_units(
-							settings.render_scale * rl.GetMouseDelta() / (50 * rl.GetFrameTime()),
+					if linalg.length(mouse_delta) > 0 {
+						angle := clamp(
+							math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
+							(min(abs(mouse_delta.x), 100) / 40),
+							-math.PI / 2.3,
+							math.PI / 2.3,
 						)
-						if linalg.length(mouse_delta) > 0 {
-							angle := clamp(
-								math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
-								(min(abs(mouse_delta.x), 100) / 40),
-								-math.PI / 2.3,
-								math.PI / 2.3,
-							)
-							card.angle = math.angle_lerp(card.angle, angle, rl.GetFrameTime() * 4)
-						} else {
-							card.angle = math.angle_lerp(card.angle, 0, rl.GetFrameTime() * 6)
-						}
+						card.angle = math.angle_lerp(card.angle, angle, k2.get_frame_time() * 4)
 					} else {
-						if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
-							card.angle = math.lerp(card.angle, 0, rl.GetFrameTime() * 20)
-						} else {
-							card.angle = math.lerp(
-								card.angle,
-								card.target_angle,
-								rl.GetFrameTime(),
-							)
-							if abs(card.angle - card.target_angle) < 0.001 {
-								card.target_angle = rand.float32_range(-0.07, 0.07)
-							}
+						card.angle = math.angle_lerp(card.angle, 0, k2.get_frame_time() * 6)
+					}
+				} else {
+					if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
+						card.angle = math.lerp(card.angle, 0, k2.get_frame_time() * 20)
+					} else {
+						card.angle = math.lerp(card.angle, card.target_angle, k2.get_frame_time())
+						if abs(card.angle - card.target_angle) < 0.001 {
+							card.target_angle = rand.float32_range(-0.07, 0.07)
 						}
 					}
-					card.flip_prog = math.lerp(
-						card.flip_prog,
-						1 if card.flipped else 0,
-						rl.GetFrameTime() * 20,
-					)
+				}
+				card.flip_prog = math.lerp(
+					card.flip_prog,
+					1 if card.flipped else 0,
+					k2.get_frame_time() * 20,
+				)
 
-					card.scale = math.lerp(
-						card.scale,
-						1.1 if card.held else 1,
-						rl.GetFrameTime() * 10,
-					)
+				card.scale = math.lerp(
+					card.scale,
+					1.1 if card.held else 1,
+					k2.get_frame_time() * 10,
+				)
 
-					if !card.held {
-						card.drawn_pos = math.lerp(
-							card.drawn_pos,
-							card.pos,
-							rl.GetFrameTime() * 10,
-						)
-					}
+				if !card.held {
+					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, k2.get_frame_time() * 10)
 				}
 			}
 		}
 
 		// input handlers
-		if !state.has_won && rl.IsWindowFocused() && !settings.menu_visible {
-			if rl.IsMouseButtonPressed(.LEFT) {
+		if !state.has_won && !settings.menu_visible {
+			if k2.mouse_button_went_down(.Left) {
 				// handle discard
 				{
 					if pile_collides_point(&state.hand, state.mouse_pos) {
@@ -762,91 +743,91 @@ main :: proc() {
 					}
 				}
 			}
+		}
 
-			if rl.IsMouseButtonReleased(.LEFT) {
-				// add hand pile to pile
-				if state.held_pile.source_pile != nil {
-					candidate_piles: [7]^Pile
-					num_candidates := 0
+		if k2.mouse_button_went_up(.Left) {
+			// add hand pile to pile
+			if state.held_pile.source_pile != nil {
+				candidate_piles: [7]^Pile
+				num_candidates := 0
 
-					for &pile in state.piles {
-						if state.held_pile.source_pile == &pile {continue}
-						if piles_collide(&state.held_pile, &pile) &&
-						   pile_can_place(&pile, &state.held_pile) {
-							candidate_piles[num_candidates] = &pile
-							num_candidates += 1
+				for &pile in state.piles {
+					if state.held_pile.source_pile == &pile {continue}
+					if piles_collide(&state.held_pile, &pile) &&
+					   pile_can_place(&pile, &state.held_pile) {
+						candidate_piles[num_candidates] = &pile
+						num_candidates += 1
+					}
+				}
+
+				if num_candidates > 0 {
+					closest_pile: ^Pile
+					max_overlap := min(f32)
+					for i in 0 ..< num_candidates {
+						candidate_top, top_idx := pile_get_top(candidate_piles[i])
+						top_pos :=
+							candidate_top == nil ? candidate_piles[i].pos : candidate_top.pos
+						held_pos := state.held_pile.cards[0].pos
+
+						overlap :=
+							max(
+								0,
+								min(
+									held_pos.x + CARD_SIZE_UNITS.x,
+									top_pos.x + CARD_SIZE_UNITS.y,
+								) -
+								max(held_pos.x, top_pos.x),
+							) *
+							max(
+								0,
+								min(
+									held_pos.y + CARD_SIZE_UNITS.x,
+									top_pos.y + CARD_SIZE_UNITS.y,
+								) -
+								max(held_pos.y, top_pos.y),
+							)
+
+						if overlap >= max_overlap {
+							closest_pile = candidate_piles[i]
+							max_overlap = overlap
 						}
 					}
 
-					if num_candidates > 0 {
-						closest_pile: ^Pile
-						max_overlap := min(f32)
-						for i in 0 ..< num_candidates {
-							candidate_top, top_idx := pile_get_top(candidate_piles[i])
-							top_pos :=
-								candidate_top == nil ? candidate_piles[i].pos : candidate_top.pos
-							held_pos := state.held_pile.cards[0].pos
+					top, idx := pile_get_top(state.held_pile.source_pile)
+					if top != nil {top.flipped = true}
 
-							overlap :=
-								max(
-									0,
-									min(
-										held_pos.x + CARD_SIZE_UNITS.x,
-										top_pos.x + CARD_SIZE_UNITS.y,
-									) -
-									max(held_pos.x, top_pos.x),
-								) *
-								max(
-									0,
-									min(
-										held_pos.y + CARD_SIZE_UNITS.x,
-										top_pos.y + CARD_SIZE_UNITS.y,
-									) -
-									max(held_pos.y, top_pos.y),
-								)
+					when EASYWIN {
+						state.has_won = true
+					}
 
-							if overlap >= max_overlap {
-								closest_pile = candidate_piles[i]
-								max_overlap = overlap
-							}
-						}
+					held_pile_send_to_pile(&state.held_pile, closest_pile)
+				}
+			}
 
+			// add card to stack
+			if state.held_pile.source_pile != nil {
+				for &stack in state.stacks {
+					if piles_collide(&state.held_pile, &stack) &&
+					   stack_can_place(&stack, &state.held_pile) {
 						top, idx := pile_get_top(state.held_pile.source_pile)
 						if top != nil {top.flipped = true}
-
-						when EASYWIN {
-							state.has_won = true
-						}
-
-						held_pile_send_to_pile(&state.held_pile, closest_pile)
+						held_pile_send_to_pile(&state.held_pile, &stack)
+						break
 					}
 				}
+			}
 
-				// add card to stack
-				if state.held_pile.source_pile != nil {
-					for &stack in state.stacks {
-						if piles_collide(&state.held_pile, &stack) &&
-						   stack_can_place(&stack, &state.held_pile) {
-							top, idx := pile_get_top(state.held_pile.source_pile)
-							if top != nil {top.flipped = true}
-							held_pile_send_to_pile(&state.held_pile, &stack)
-							break
-						}
-					}
-				}
+			// return unassigned hand pile to source
+			if state.held_pile.source_pile != nil {
+				held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
+			}
 
-				// return unassigned hand pile to source
-				if state.held_pile.source_pile != nil {
-					held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
-				}
-
-				// win condition
-				{
-					for &stack, idx in state.stacks {
-						top, top_idx := pile_get_top(&stack)
-						if top_idx != 12 {break}
-						if idx == 3 {state.has_won = true}
-					}
+			// win condition
+			{
+				for &stack, idx in state.stacks {
+					top, top_idx := pile_get_top(&stack)
+					if top_idx != 12 {break}
+					if idx == 3 {state.has_won = true}
 				}
 			}
 		}
@@ -860,22 +841,17 @@ main :: proc() {
 
 			// viewport
 			{
-				rl.BeginTextureMode(state.render_tex)
-				defer rl.EndTextureMode()
+				k2.set_render_texture(state.render_tex)
+				defer k2.set_render_texture(nil)
+				k2.clear(k2.BLACK)
 				// card rendering
 				{
 					{
-						rl.BeginShaderMode(background_shader)
-						defer rl.EndShaderMode()
-						rl.SetShaderValue(background_shader, time_loc, &state.game_time, .FLOAT)
-						rl.SetShaderValue(background_shader, hue_loc, &settings.hue_shift, .FLOAT)
-						rl.DrawRectangle(
-							0,
-							0,
-							i32(state.resolution.x),
-							i32(state.resolution.y),
-							rl.WHITE,
-						)
+						k2.set_shader(background_shader)
+						defer k2.set_shader(nil)
+						k2.set_shader_constant(background_shader, time_loc, state.game_time)
+						k2.set_shader_constant(background_shader, hue_loc, settings.hue_shift)
+						k2.draw_rect({0, 0, state.resolution.x, state.resolution.y}, k2.WHITE)
 					}
 
 					for pile in state.mru_piles {
@@ -888,17 +864,17 @@ main :: proc() {
 				{
 					// toolbar
 					{
-						if state.has_won || settings.menu_visible {rl.GuiLock()}
-						defer rl.GuiUnlock()
+						if state.has_won || settings.menu_visible {gui_locked = true}
+						defer gui_locked = false
 
 						restart_loc := units_to_px({0, 0})
 						restart_size := units_to_px({225, 50})
 						if text_button(
 							{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
 							"Restart",
-							rl.DARKGRAY,
-							rl.LIGHTGRAY,
-							rl.SKYBLUE,
+							k2.DARK_GRAY,
+							k2.LIGHT_GRAY,
+							k2.RL_SKYBLUE,
 							40,
 						) {init_state(&state)}
 
@@ -907,9 +883,9 @@ main :: proc() {
 						if text_button(
 							{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
 							"Settings",
-							rl.DARKGRAY,
-							rl.LIGHTGRAY,
-							rl.SKYBLUE,
+							k2.DARK_GRAY,
+							k2.LIGHT_GRAY,
+							k2.RL_SKYBLUE,
 							40,
 						) {
 							settings.menu_visible = true
@@ -922,17 +898,17 @@ main :: proc() {
 								{state.resolution.x / state.unit_to_px_scaling.x - 150, 0},
 							)
 							perf_size := units_to_px({150, 50})
-							rl.DrawRectangleRec(
+							k2.draw_rect(
 								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
-								rl.LIGHTGRAY,
+								k2.LIGHT_GRAY,
 							)
-							rl.DrawRectangleLinesEx(
+							k2.draw_rect_outline(
 								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
 								3,
-								rl.DARKGRAY,
+								k2.DARK_GRAY,
 							)
-							fps := fmt.ctprintf("%d FPS", rl.GetFPS())
-							centered_text(fps, 20, perf_px + perf_size / 2, rl.DARKGRAY)
+							fps := fmt.tprintf("%v FPS", 1 / k2.get_frame_time())
+							centered_text(fps, 20, perf_px + perf_size / 2, k2.DARK_GRAY)
 						}
 					}
 
@@ -946,29 +922,20 @@ main :: proc() {
 
 			// postprocessing
 			{
-				rl.BeginDrawing()
-				defer rl.EndDrawing()
-				{
-					rl.BeginShaderMode(scanline_shader)
-					defer rl.EndShaderMode()
+				k2.set_shader(scanline_shader)
+				defer k2.set_shader(nil)
+				scanline_shader.texture_bindpoints[scanline_shader.texture_lookup["texture0"]] =
+					state.render_tex.texture.handle
 
-					rl.DrawTexturePro(
-						state.render_tex.texture,
-						{
-							0,
-							0,
-							f32(state.render_tex.texture.width),
-							-f32(state.render_tex.texture.height),
-						},
-						{0, 0, state.screen_resolution.x, state.screen_resolution.y},
-						0,
-						0,
-						rl.WHITE,
-					)
-				}
+				k2.draw_texture_fit(
+					state.render_tex.texture,
+					k2.get_texture_rect(state.render_tex.texture),
+					{0, 0, state.screen_resolution.x, state.screen_resolution.y},
+				)
 			}
+			k2.present()
+			free_all(context.temp_allocator)
 		}
-		free_all(context.temp_allocator)
 	}
 }
 

@@ -1,0 +1,17 @@
+#version 330
+precision highp float;
+layout(location = 0) in vec2 position;
+layout(location = 1) in vec2 texcoord;
+layout(location = 2) in vec4 color;
+
+out vec2 fragTexCoord;
+out vec4 fragColor;
+
+uniform mat4 view_projection;
+
+void main()
+{
+    fragTexCoord = texcoord;
+    fragColor = color;
+    gl_Position = view_projection * vec4(position, 0, 1.0);
+}

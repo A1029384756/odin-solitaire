@@ -5,12 +5,11 @@ import "core:fmt"
 import "core:math"
 import "core:mem"
 import "core:os"
-import rl "vendor:raylib"
+import k2 "karl2d"
 
 Persistent_Settings :: struct {
 	render_scale: f32,
 	hue_shift:    f32,
-	vsync:        bool,
 	show_perf:    bool,
 	difficulty:   enum {
 		EASY   = 0,
@@ -29,7 +28,6 @@ SETTINGS_DEFAULT :: Settings {
 	hue_shift    = 2.91,
 	render_scale = 1,
 	menu_fade    = 1,
-	vsync        = true,
 }
 
 load_settings :: proc() {
@@ -37,23 +35,19 @@ load_settings :: proc() {
 	if read_err != nil {
 		fmt.println("could not find settings, loading defaults")
 		settings = SETTINGS_DEFAULT
-		set_vsync(true)
 		return
 	}
 
 	d_err := cbor.unmarshal_from_string(string(conf_bin), &settings.persistent)
-	if d_err == nil {
-		set_vsync(settings.vsync)
-	} else {
+	if d_err != nil {
 		fmt.println("could not read settings, loading defaults")
 		settings = SETTINGS_DEFAULT
-		set_vsync(true)
 	}
 }
 
 settings_menu :: proc() {
 	settings.menu_fade =
-		settings.menu_fade + 2 * rl.GetFrameTime() if settings.menu_fade < 1 else 1
+		settings.menu_fade + 2 * k2.get_frame_time() if settings.menu_fade < 1 else 1
 	anim: f32
 	if settings.menu_visible {
 		anim = ease_out_quint(settings.menu_fade)
@@ -61,11 +55,8 @@ settings_menu :: proc() {
 		anim = 1 - ease_out_quint(settings.menu_fade)
 	}
 
-	rl.DrawRectangle(
-		0,
-		0,
-		i32(state.resolution.x),
-		i32(state.resolution.y),
+	k2.draw_rect(
+		{0, 0, state.resolution.x, state.resolution.y},
 		{0x1F, 0x1F, 0x1, u8(0x5F * settings.menu_fade) * u8(settings.menu_visible)},
 	)
 
@@ -74,14 +65,14 @@ settings_menu :: proc() {
 		max_width        = units_to_px({1200, 0}).x,
 		min_width        = units_to_px({400, 0}).x,
 		padding          = 10 * settings.render_scale,
-		background_color = rl.DARKGRAY,
-		title_color      = rl.WHITE,
+		background_color = k2.DARK_GRAY,
+		title_color      = k2.WHITE,
 		title_font_size  = 40,
-		body_color       = rl.LIGHTGRAY,
+		body_color       = k2.LIGHT_GRAY,
 		body_font_size   = 20,
-		button_text      = rl.LIGHTGRAY,
-		button_bg        = rl.GRAY,
-		button_highlight = rl.SKYBLUE,
+		button_text      = k2.LIGHT_GRAY,
+		button_bg        = k2.GRAY,
+		button_highlight = k2.RL_SKYBLUE,
 	}
 	panel_init(&layout)
 	layout.pos =
@@ -90,16 +81,10 @@ settings_menu :: proc() {
 	panel_background(&layout)
 	panel_title(&layout, "Settings")
 	panel_row(&layout, "Performance")
-	perf_str := fmt.ctprintf("Show FPS: %s", "On" if settings.show_perf else "Off")
+	perf_str := fmt.tprintf("Show FPS: %s", "On" if settings.show_perf else "Off")
 	if panel_button(&layout, perf_str) {settings.show_perf = !settings.show_perf}
 	panel_row(&layout, "Render Scale")
 	if panel_slider(&layout, &settings.render_scale, 0.7, 2) {settings.scale_changed = true}
-
-	vsync_str := fmt.ctprintf("VSync: %s", "On" if settings.vsync else "Off")
-	if panel_button(&layout, vsync_str) {
-		settings.vsync = !settings.vsync
-		set_vsync(settings.vsync)
-	}
 
 	panel_row(&layout, "Difficulty")
 	panel_stepper(&layout, "Easy;Random", cast(^i32)&settings.difficulty, 0, 1)

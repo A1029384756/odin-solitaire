@@ -2,98 +2,86 @@ package main
 
 import "core:math"
 import "core:strings"
-import rl "vendor:raylib"
+import k2 "karl2d"
 
+gui_locked := false
 icon_button :: proc(
-	rect: rl.Rectangle,
+	rect: k2.Rect,
 	icon: Icon,
-	icon_color: rl.Color,
+	icon_color: k2.Color,
 	icon_scale: f32 = 2,
 	border_width: f32 = 3,
 ) -> bool {
 	clicked: bool
 
-	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
-		if rl.IsMouseButtonReleased(
-			.LEFT,
-		) {clicked = true} else {rl.DrawRectangleRec(rect, rl.SKYBLUE)}
+	if !gui_locked && k2.point_in_rect(units_to_px(state.mouse_pos), rect) {
+		if k2.mouse_button_went_up(.Left) {clicked = true} else {k2.draw_rect(rect, k2.RL_SKYBLUE)}
 	} else {
-		rl.DrawRectangleRec(rect, rl.LIGHTGRAY)
+		k2.draw_rect(rect, k2.LIGHT_GRAY)
 	}
-	rl.DrawRectangleLinesEx(rect, 3, rl.DARKGRAY)
+	k2.draw_rect_outline(rect, 3, k2.DARK_GRAY)
 
-	rl.BeginBlendMode(.ALPHA)
-	rl.DrawTexturePro(ICONS, icon_rect[icon], rect, 0, 0, rl.DARKGRAY)
-	rl.EndBlendMode()
+	k2.draw_texture_fit(ICONS, icon_rect[icon], rect, tint = k2.DARK_GRAY)
 	return clicked
 }
 
 text_button :: proc(
-	rect: rl.Rectangle,
-	text: cstring,
-	text_color, bg_color, highlight_color: rl.Color,
+	rect: k2.Rect,
+	text: string,
+	text_color, bg_color, highlight_color: k2.Color,
 	font_size: f32,
 	border_width: f32 = 0,
-	border_color: rl.Color = 0,
+	border_color: k2.Color = 0,
 ) -> bool {
 	clicked := false
-	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), rect) {
-		if rl.IsMouseButtonReleased(
-			.LEFT,
-		) {clicked = true} else {rl.DrawRectangleRec(rect, highlight_color)}
+	if !gui_locked && k2.point_in_rect(units_to_px(state.mouse_pos), rect) {
+		if k2.mouse_button_went_up(
+			.Left,
+		) {clicked = true} else {k2.draw_rect(rect, highlight_color)}
 	} else {
-		rl.DrawRectangleRec(rect, bg_color)
+		k2.draw_rect(rect, bg_color)
 	}
-	rl.DrawRectangleLinesEx(rect, border_width, border_color)
-	centered_text(text, font_size, {rect.x, rect.y} + {rect.width, rect.height} / 2, text_color)
+	k2.draw_rect_outline(rect, border_width, border_color)
+	centered_text(text, font_size, {rect.x, rect.y} + {rect.w, rect.h} / 2, text_color)
 	return clicked
 }
 
 centered_text :: proc(
-	message: cstring,
+	message: string,
 	size: f32,
 	pos: Vector2,
-	color: rl.Color,
+	color: k2.Color,
 	center_vert: bool = true,
 ) -> Vector2 {
-	width := rl.MeasureTextEx(
-		rl.GetFontDefault(),
-		message,
-		size * state.unit_to_px_scaling.x,
-		5 * settings.render_scale,
-	)
-
+	width := k2.measure_text(message, size * state.unit_to_px_scaling.x)
 	text_pos := pos - width / 2 if center_vert else pos - {width.x / 2, 0}
 	return text(message, size, text_pos, color)
 }
 
-text :: proc(message: cstring, size: f32, pos: Vector2, color: rl.Color) -> Vector2 {
-	rl.DrawText(message, i32(pos.x), i32(pos.y), i32(size * state.unit_to_px_scaling.x), color)
-	return rl.MeasureTextEx(
-		rl.GetFontDefault(),
-		message,
-		size * state.unit_to_px_scaling.x,
-		5 * settings.render_scale,
-	)
+text :: proc(message: string, size: f32, pos: Vector2, color: k2.Color) -> Vector2 {
+	k2.draw_text(message, pos, size * state.unit_to_px_scaling.x, color)
+	return k2.measure_text(message, size * state.unit_to_px_scaling.x)
 }
 
-slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) -> bool {
-	rl.DrawRectangleRec(bounds, rl.LIGHTGRAY)
-	rl.DrawRectangleLinesEx(bounds, 1, rl.DARKGRAY)
-	rl.DrawRectangle(
-		i32(math.remap(value^, min, max, bounds.x, bounds.x + bounds.width - bounds.height)),
-		i32(bounds.y),
-		i32(bounds.height),
-		i32(bounds.height),
-		rl.LIME,
+slider :: proc(bounds: k2.Rect, value: ^f32, min, max: f32) -> bool {
+	k2.draw_rect(bounds, k2.LIGHT_GRAY)
+	k2.draw_rect_outline(bounds, 1, k2.DARK_GRAY)
+	k2.draw_rect(
+		{
+			math.remap(value^, min, max, bounds.x, bounds.x + bounds.w - bounds.h),
+			bounds.y,
+			bounds.h,
+			bounds.h,
+		},
+		k2.RL_LIME,
 	)
 
-	if !rl.GuiIsLocked() && rl.CheckCollisionPointRec(units_to_px(state.mouse_pos), bounds) {
-		if rl.IsMouseButtonDown(.LEFT) {
+	if !gui_locked && k2.point_in_rect(units_to_px(state.mouse_pos), bounds) {
+		if k2.mouse_button_is_held(.Left) {
 			value^ = math.remap(
 				units_to_px(state.mouse_pos).x,
 				bounds.x,
-				bounds.x + bounds.width,
+				bounds.x + bounds.w,
 				min,
 				max,
 			)
@@ -103,27 +91,17 @@ slider :: proc(bounds: rl.Rectangle, value: ^f32, min, max: f32) -> bool {
 	return false
 }
 
-dropdown :: proc(bounds: rl.Rectangle, text: string, active: ^i32, editing: bool) -> bool {
+dropdown :: proc(bounds: k2.Rect, text: string, active: ^i32, editing: bool) -> bool {
 	options := strings.split(text, ";", context.temp_allocator)
 
-	current_option := strings.clone_to_cstring(options[active^], context.temp_allocator)
-
-	if text_button(bounds, current_option, rl.DARKGRAY, rl.LIGHTGRAY, rl.SKYBLUE, 20) {
+	if text_button(bounds, options[active^], k2.DARK_GRAY, k2.LIGHT_BLUE, k2.RL_SKYBLUE, 20) {
 		return true
 	}
 
 	if editing {
 		for option, idx in options {
-			box := rl.Rectangle {
-				bounds.x,
-				bounds.y + f32(idx + 1) * bounds.height,
-				bounds.width,
-				bounds.height,
-			}
-
-			option := strings.clone_to_cstring(option, context.temp_allocator)
-
-			if text_button(box, option, rl.DARKGRAY, rl.LIGHTGRAY, rl.SKYBLUE, 15, 1) {
+			box := k2.Rect{bounds.x, bounds.y + f32(idx + 1) * bounds.h, bounds.w, bounds.h}
+			if text_button(box, option, k2.DARK_GRAY, k2.LIGHT_GRAY, k2.RL_SKYBLUE, 15, 1) {
 				active^ = i32(idx)
 				return true
 			}
@@ -133,66 +111,49 @@ dropdown :: proc(bounds: rl.Rectangle, text: string, active: ^i32, editing: bool
 }
 
 stepper :: proc(
-	bounds: rl.Rectangle,
+	bounds: k2.Rect,
 	text: string,
 	text_size: f32,
 	active: ^i32,
 	min, max: i32,
-	fg, bg, inactive: rl.Color,
+	fg, bg, inactive: k2.Color,
 ) {
 	mouse_pos := units_to_px(state.mouse_pos)
 	options := strings.split(text, ";", context.temp_allocator)
-	current_option := strings.clone_to_cstring(options[active^], context.temp_allocator)
+	k2.draw_rect(bounds, bg)
 
-	rl.DrawRectangleRec(bounds, bg)
-
-	if rl.CheckCollisionPointRec(mouse_pos, bounds) {
-		if mouse_pos.x < bounds.x + bounds.width / 2 && active^ > min {
-			rl.DrawRectangleGradientEx(
-				{bounds.x, bounds.y, bounds.width / 2, bounds.height},
-				inactive,
-				inactive,
-				bg,
-				bg,
-			)
-		}
-		if mouse_pos.x > bounds.x + bounds.width / 2 && active^ < max {
-			rl.DrawRectangleGradientEx(
-				{bounds.x + bounds.width / 2, bounds.y, bounds.width / 2, bounds.height},
-				bg,
-				bg,
-				inactive,
-				inactive,
-			)
-		}
+	left, right: bool
+	if k2.point_in_rect(mouse_pos, bounds) {
+		left = mouse_pos.x < bounds.x + bounds.w / 2 && active^ > min
+		right = mouse_pos.x > bounds.x + bounds.w / 2 && active^ < max
 	}
 
-	rl.DrawTexturePro(
+	k2.draw_texture_fit(
 		ICONS,
 		icon_rect[.BACK],
-		{bounds.x, bounds.y, bounds.height, bounds.height},
+		{bounds.x, bounds.y, bounds.h, bounds.h},
 		0,
 		0,
 		inactive if active^ == min else fg,
 	)
-	rl.DrawTexturePro(
+	k2.draw_texture_fit(
 		ICONS,
 		icon_rect[.FORWARD],
-		{bounds.x + bounds.width - bounds.height, bounds.y, bounds.height, bounds.height},
+		{bounds.x + bounds.w - bounds.h, bounds.y, bounds.h, bounds.h},
 		0,
 		0,
 		inactive if active^ == max else fg,
 	)
 	centered_text(
-		current_option,
+		options[active^],
 		text_size,
-		{bounds.x + bounds.width / 2, bounds.y + bounds.height / 2},
+		{bounds.x + bounds.w / 2, bounds.y + bounds.h / 2},
 		fg,
 	)
-	if rl.IsMouseButtonReleased(.LEFT) && rl.CheckCollisionPointRec(mouse_pos, bounds) {
-		if mouse_pos.x < bounds.x + bounds.width / 2 && active^ > min {
+	if k2.mouse_button_went_up(.Left) && k2.point_in_rect(mouse_pos, bounds) {
+		if mouse_pos.x < bounds.x + bounds.w / 2 && active^ > min {
 			active^ -= 1
-		} else if mouse_pos.x > bounds.x + bounds.width / 2 && active^ < max {
+		} else if mouse_pos.x > bounds.x + bounds.w / 2 && active^ < max {
 			active^ += 1
 		}
 	}
@@ -205,47 +166,39 @@ Panel_Layout :: struct {
 	max_width:                f32,
 	min_width:                f32,
 	// background
-	background_color:         rl.Color,
-	background_outline_color: rl.Color,
+	background_color:         k2.Color,
+	background_outline_color: k2.Color,
 	background_outline:       f32,
 	// text info
-	title_color:              rl.Color,
+	title_color:              k2.Color,
 	title_font_size:          f32,
-	body_color:               rl.Color,
+	body_color:               k2.Color,
 	body_font_size:           f32,
 	// button info
-	button_bg:                rl.Color,
-	button_highlight:         rl.Color,
-	button_text:              rl.Color,
+	button_bg:                k2.Color,
+	button_highlight:         k2.Color,
+	button_text:              k2.Color,
 	// private
 	_row_height:              f32,
 }
 
 panel_init :: proc(panel: ^Panel_Layout) {
-	text_size := rl.MeasureTextEx(
-		rl.GetFontDefault(),
-		"a",
-		panel.body_font_size * state.unit_to_px_scaling.x,
-		5 * settings.render_scale,
-	)
+	text_size := k2.measure_text("a", panel.body_font_size * state.unit_to_px_scaling.x)
 	panel.size.x = clamp(panel.size.x, panel.min_width, panel.max_width)
 	panel._row_height = text_size.y
 }
 
 panel_background :: proc(panel: ^Panel_Layout) {
-	rl.DrawRectangleRec(
-		{panel.pos.x, panel.pos.y, panel.size.x, panel.size.y},
-		panel.background_color,
-	)
+	k2.draw_rect({panel.pos.x, panel.pos.y, panel.size.x, panel.size.y}, panel.background_color)
 
-	rl.DrawRectangleLinesEx(
+	k2.draw_rect_outline(
 		{panel.pos.x, panel.pos.y, panel.size.x, panel.size.y},
 		panel.background_outline,
 		panel.background_outline_color,
 	)
 }
 
-panel_title :: proc(panel: ^Panel_Layout, title: cstring) {
+panel_title :: proc(panel: ^Panel_Layout, title: string) {
 	panel.pos.y += panel.padding
 
 	loc := Vector2{panel.pos.x + panel.size.x / 2, panel.pos.y}
@@ -254,7 +207,7 @@ panel_title :: proc(panel: ^Panel_Layout, title: cstring) {
 	panel.pos.y += title_size.y + panel.padding
 }
 
-panel_row :: proc(panel: ^Panel_Layout, row_text: cstring, centered: bool = false) {
+panel_row :: proc(panel: ^Panel_Layout, row_text: string, centered: bool = false) {
 	if centered {
 		loc := Vector2{panel.pos.x + panel.size.x / 2, panel.pos.y}
 		centered_text(row_text, panel.body_font_size, loc, panel.body_color, false)
@@ -266,7 +219,7 @@ panel_row :: proc(panel: ^Panel_Layout, row_text: cstring, centered: bool = fals
 	panel.pos.y += panel._row_height + panel.padding
 }
 
-panel_button :: proc(panel: ^Panel_Layout, button_text: cstring) -> bool {
+panel_button :: proc(panel: ^Panel_Layout, button_text: string) -> bool {
 	button := text_button(
 		{
 			panel.pos.x + panel.padding,
