@@ -1,5 +1,5 @@
-#version 330
-
+#version 300 es
+precision highp float;
 in vec2 fragTexCoord;
 in vec4 fragColor;
 
@@ -27,9 +27,6 @@ out vec4 finalColor;
 
 const vec3 kBackgroundColor = RGBA(0x00, 0x60, 0xb8, 0xff).rgb; // medium-blue sky
 //const vec3 kBackgroundColor = RGBA(0xff, 0x00, 0xff, 0xff).rgb; // test magenta
-
-// Emulated input resolution.
-vec2 res = vec2(u_resolution.x / 3.0, 480.0);
 
 // Hardness of scanline.
 //	-8.0 = soft
@@ -99,6 +96,8 @@ vec4 fetch(vec2 pos, vec2 off)
 
 // Distance in emulated pixels to nearest texel.
 vec2 dist(vec2 pos) {
+	// Emulated input resolution.
+	vec2 res = vec2(u_resolution.x / 3.0, 480.0);
 	pos = pos * res;
 	return -((pos - floor(pos)) - vec2(0.5));
 }

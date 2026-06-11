@@ -6,18 +6,11 @@ import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
-import "core:prof/spall"
 import "core:slice"
 import k2 "karl2d"
 
 EASYWIN :: #config(EASYWIN, false)
-PROFILING :: #config(PROFILING, false)
 MEMTRACK :: #config(MEMTRACK, ODIN_DEBUG)
-
-when PROFILING {
-	spall_ctx: spall.Context
-	spall_buffer: spall.Buffer
-}
 
 Vector2 :: [2]f32
 
@@ -475,6 +468,14 @@ BLANK: k2.Texture
 BACKS: k2.Texture
 CARD_TEX_SIZE: Vector2 : {71, 95}
 
+BG_SHADER: k2.Shader
+BG_TIME_LOC: k2.Shader_Constant_Location
+BG_HUE_LOC: k2.Shader_Constant_Location
+BG_RES_LOC: k2.Shader_Constant_Location
+
+SCANLINE_SHADER: k2.Shader
+SCANLINE_RES_LOC: k2.Shader_Constant_Location
+
 ICONS: k2.Texture
 ICON_SIZE :: 18
 
@@ -482,18 +483,6 @@ state: State
 settings: Settings
 
 main :: proc() {
-	when PROFILING {
-		spall_ctx = spall.context_create("solitaire.spall")
-		defer spall.context_destroy(&spall_ctx)
-
-		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
-
-		spall_buffer = spall.buffer_create(buffer_backing)
-		defer spall.buffer_destroy(&spall_ctx, &spall_buffer)
-
-		spall.SCOPED_EVENT(&spall_ctx, &spall_buffer, #procedure)
-	}
-
 	when MEMTRACK {
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
@@ -516,443 +505,417 @@ main :: proc() {
 		}
 	}
 
+	init()
+	for step() {}
+	shutdown()
+}
+
+init :: proc() {
 	k2.init(800, 600, "Solitaire", {window_mode = .Windowed_Resizable})
-	defer k2.shutdown()
 
 	load_settings()
 	init_state(&state)
 
-	CARDS = k2.load_texture_from_file("assets/playing_cards.png")
-	defer k2.destroy_texture(CARDS)
-
-	BLANK = k2.load_texture_from_file("assets/blank_card.png")
-	defer k2.destroy_texture(BLANK)
-
-	BACKS = k2.load_texture_from_file("assets/card_backs.png")
-	defer k2.destroy_texture(BACKS)
-
-	ICONS = k2.load_texture_from_file("assets/icons.png")
-	defer k2.destroy_texture(ICONS)
-
+	CARDS = k2.load_texture_from_bytes(#load("assets/playing_cards.png"))
+	BLANK = k2.load_texture_from_bytes(#load("assets/blank_card.png"))
+	BACKS = k2.load_texture_from_bytes(#load("assets/card_backs.png"))
+	ICONS = k2.load_texture_from_bytes(#load("assets/icons.png"))
 	state.render_tex = k2.create_render_texture(800, 800)
-	defer k2.destroy_render_texture(state.render_tex)
+	fmt.println("textures loaded")
 
-	background_shader := k2.load_shader_from_file("shaders/default.vs", "shaders/fbm.fs")
-	defer k2.destroy_shader(background_shader)
-
-	time_loc := background_shader.constant_lookup["u_time"]
-	k2.set_shader_constant(background_shader, time_loc, state.game_time)
-
-	hue_loc := background_shader.constant_lookup["u_hue"]
-	k2.set_shader_constant(background_shader, hue_loc, settings.hue_shift)
-
-	res_loc := background_shader.constant_lookup["u_resolution"]
+	BG_SHADER = k2.load_shader_from_bytes(#load("shaders/default.vs"), #load("shaders/fbm.fs"))
+	BG_TIME_LOC = BG_SHADER.constant_lookup["u_time"]
+	k2.set_shader_constant(BG_SHADER, BG_TIME_LOC, state.game_time)
+	BG_HUE_LOC = BG_SHADER.constant_lookup["u_hue"]
+	k2.set_shader_constant(BG_SHADER, BG_HUE_LOC, settings.hue_shift)
+	BG_RES_LOC = BG_SHADER.constant_lookup["u_resolution"]
 	state.resolution = k2.get_screen_size()
-	k2.set_shader_constant(background_shader, res_loc, state.resolution)
+	k2.set_shader_constant(BG_SHADER, BG_RES_LOC, state.resolution)
+	fmt.println("background shader loaded")
 
-	scanline_shader := k2.load_shader_from_file("shaders/default.vs", "shaders/scanlines.fs")
-	defer k2.destroy_shader(scanline_shader)
+	SCANLINE_SHADER = k2.load_shader_from_bytes(
+		#load("shaders/default.vs"),
+		#load("shaders/scanlines.fs"),
+	)
+	SCANLINE_RES_LOC := SCANLINE_SHADER.constant_lookup["u_resolution"]
+	k2.set_shader_constant(SCANLINE_SHADER, SCANLINE_RES_LOC, state.resolution)
+	fmt.println("scanline shader loaded")
+}
 
-	scanline_res_loc := scanline_shader.constant_lookup["u_resolution"]
-	k2.set_shader_constant(scanline_shader, scanline_res_loc, state.resolution)
+step :: proc() -> bool {
+	if !k2.update() {return false}
 
-	for k2.update() {
-		// general update
-		k2.clear(k2.BLACK)
-		// window resizing
-		{
-			new_resolution := k2.get_screen_size()
-			if settings.scale_changed || state.screen_resolution != new_resolution {
-				state.resolution = new_resolution * settings.render_scale
-				state.screen_resolution = new_resolution
-				k2.destroy_render_texture(state.render_tex)
-				state.render_tex = k2.create_render_texture(
-					int(state.resolution.x),
-					int(state.resolution.y),
+	// general update
+	k2.clear(k2.BLACK)
+	// window resizing
+	{
+		new_resolution := k2.get_screen_size()
+		if settings.scale_changed || state.screen_resolution != new_resolution {
+			state.resolution = new_resolution * settings.render_scale
+			state.screen_resolution = new_resolution
+			k2.destroy_render_texture(state.render_tex)
+			state.render_tex = k2.create_render_texture(
+				int(state.resolution.x),
+				int(state.resolution.y),
+			)
+			k2.set_shader_constant(BG_SHADER, BG_RES_LOC, state.resolution)
+			k2.set_shader_constant(SCANLINE_SHADER, SCANLINE_RES_LOC, state.resolution)
+			settings.scale_changed = false
+		}
+	}
+
+	state.game_time += k2.get_frame_time()
+	state.mouse_pos = settings.render_scale * k2.get_mouse_position() / state.unit_to_px_scaling
+
+	// camera horizontal centering
+	{
+		aspect := state.resolution.x / state.resolution.y
+
+		win_size_unit: Vector2
+		if aspect > UNIT_ASPECT {
+			win_size_unit = {UNIT_SIZE.y * aspect, UNIT_SIZE.y}
+		} else {
+			win_size_unit = {UNIT_SIZE.x, UNIT_SIZE.x / aspect}
+		}
+
+		state.unit_to_px_scaling = state.resolution / win_size_unit
+		win_size_units := px_to_units(state.resolution)
+
+		horz_overflow := win_size_units.x - UNIT_SIZE.x
+		if horz_overflow > 0 {
+			state.camera_pos.x = horz_overflow / 2
+		} else {
+			state.camera_pos.x = 0
+		}
+	}
+
+	// card animation
+	{
+		state.held_pile.pos = state.mouse_pos
+		for &card in state.cards {
+			if card.held {
+				mouse_delta := px_to_units(
+					settings.render_scale * k2.get_mouse_delta() / (50 * k2.get_frame_time()),
 				)
-				k2.set_shader_constant(background_shader, res_loc, state.resolution)
-				k2.set_shader_constant(scanline_shader, scanline_res_loc, state.resolution)
-				settings.scale_changed = false
-			}
-		}
-
-		state.game_time += k2.get_frame_time()
-		state.mouse_pos =
-			settings.render_scale * k2.get_mouse_position() / state.unit_to_px_scaling
-
-		// camera horizontal centering
-		{
-			aspect := state.resolution.x / state.resolution.y
-
-			win_size_unit: Vector2
-			if aspect > UNIT_ASPECT {
-				win_size_unit = {UNIT_SIZE.y * aspect, UNIT_SIZE.y}
-			} else {
-				win_size_unit = {UNIT_SIZE.x, UNIT_SIZE.x / aspect}
-			}
-
-			state.unit_to_px_scaling = state.resolution / win_size_unit
-			win_size_units := px_to_units(state.resolution)
-
-			horz_overflow := win_size_units.x - UNIT_SIZE.x
-			if horz_overflow > 0 {
-				state.camera_pos.x = horz_overflow / 2
-			} else {
-				state.camera_pos.x = 0
-			}
-		}
-
-		// card animation
-		{
-			state.held_pile.pos = state.mouse_pos
-			for &card in state.cards {
-				if card.held {
-					mouse_delta := px_to_units(
-						settings.render_scale * k2.get_mouse_delta() / (50 * k2.get_frame_time()),
+				if linalg.length(mouse_delta) > 0 {
+					angle := clamp(
+						math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
+						(min(abs(mouse_delta.x), 100) / 40),
+						-math.PI / 2.3,
+						math.PI / 2.3,
 					)
-					if linalg.length(mouse_delta) > 0 {
-						angle := clamp(
-							math.asin(mouse_delta.x / linalg.length(mouse_delta)) *
-							(min(abs(mouse_delta.x), 100) / 40),
-							-math.PI / 2.3,
-							math.PI / 2.3,
-						)
-						card.angle = math.angle_lerp(card.angle, angle, k2.get_frame_time() * 4)
-					} else {
-						card.angle = math.angle_lerp(card.angle, 0, k2.get_frame_time() * 6)
-					}
+					card.angle = math.angle_lerp(card.angle, angle, k2.get_frame_time() * 4)
 				} else {
-					if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
-						card.angle = math.lerp(card.angle, 0, k2.get_frame_time() * 20)
-					} else {
-						card.angle = math.lerp(card.angle, card.target_angle, k2.get_frame_time())
-						if abs(card.angle - card.target_angle) < 0.001 {
-							card.target_angle = rand.float32_range(-0.07, 0.07)
-						}
-					}
+					card.angle = math.angle_lerp(card.angle, 0, k2.get_frame_time() * 6)
 				}
-				card.flip_prog = math.lerp(
-					card.flip_prog,
-					1 if card.flipped else 0,
-					k2.get_frame_time() * 20,
-				)
-
-				card.scale = math.lerp(
-					card.scale,
-					1.1 if card.held else 1,
-					k2.get_frame_time() * 10,
-				)
-
-				if !card.held {
-					card.drawn_pos = math.lerp(card.drawn_pos, card.pos, k2.get_frame_time() * 10)
+			} else {
+				if linalg.distance(card.pos, card.drawn_pos) > 0.1 {
+					card.angle = math.lerp(card.angle, 0, k2.get_frame_time() * 20)
+				} else {
+					card.angle = math.lerp(card.angle, card.target_angle, k2.get_frame_time())
+					if abs(card.angle - card.target_angle) < 0.001 {
+						card.target_angle = rand.float32_range(-0.07, 0.07)
+					}
 				}
 			}
-		}
+			card.flip_prog = math.lerp(
+				card.flip_prog,
+				1 if card.flipped else 0,
+				k2.get_frame_time() * 20,
+			)
 
-		// input handlers
-		if !state.has_won && !settings.menu_visible {
-			if k2.mouse_button_went_down(.Left) {
-				// handle discard
-				{
-					if pile_collides_point(&state.hand, state.mouse_pos) {
-						top, idx := pile_get_top(&state.hand)
-						_, discard_size := pile_get_top(&state.discard)
-						switch idx {
-						case -1:
-							copy(state.hand.cards[:], state.discard.cards[:])
-							slice.zero(state.discard.cards[:])
-							slice.reverse(state.hand.cards[:discard_size + 1])
-							for card, idx in state.hand.cards {
-								if card == nil {break}
-								card.flipped = false
-							}
-						case 0 ..< 3:
-							copy(
-								state.discard.cards[discard_size + 1:],
-								state.hand.cards[:idx + 1],
-							)
-							slice.zero(state.hand.cards[:idx + 1])
-							slice.reverse(
-								state.discard.cards[discard_size + 1:discard_size + 1 + idx + 1],
-							)
-							for card in state.discard.cards[discard_size + 1:] {
-								if card == nil {break}
-								card.flipped = true
-								card.pos = state.discard.pos
-							}
-						case:
-							copy(
-								state.discard.cards[discard_size + 1:],
-								state.hand.cards[idx - 2:],
-							)
-							slice.zero(state.hand.cards[idx - 2:])
-							slice.reverse(state.discard.cards[discard_size + 1:discard_size + 4])
-							for card in state.discard.cards[discard_size + 1:] {
-								if card == nil {break}
-								card.flipped = true
-								card.pos = state.discard.pos
-							}
+			card.scale = math.lerp(card.scale, 1.1 if card.held else 1, k2.get_frame_time() * 10)
+
+			if !card.held {
+				card.drawn_pos = math.lerp(card.drawn_pos, card.pos, k2.get_frame_time() * 10)
+			}
+		}
+	}
+
+	// input handlers
+	if !state.has_won && !settings.menu_visible {
+		if k2.mouse_button_went_down(.Left) {
+			// handle discard
+			{
+				if pile_collides_point(&state.hand, state.mouse_pos) {
+					top, idx := pile_get_top(&state.hand)
+					_, discard_size := pile_get_top(&state.discard)
+					switch idx {
+					case -1:
+						copy(state.hand.cards[:], state.discard.cards[:])
+						slice.zero(state.discard.cards[:])
+						slice.reverse(state.hand.cards[:discard_size + 1])
+						for card, idx in state.hand.cards {
+							if card == nil {break}
+							card.flipped = false
+						}
+					case 0 ..< 3:
+						copy(state.discard.cards[discard_size + 1:], state.hand.cards[:idx + 1])
+						slice.zero(state.hand.cards[:idx + 1])
+						slice.reverse(
+							state.discard.cards[discard_size + 1:discard_size + 1 + idx + 1],
+						)
+						for card in state.discard.cards[discard_size + 1:] {
+							if card == nil {break}
+							card.flipped = true
+							card.pos = state.discard.pos
+						}
+					case:
+						copy(state.discard.cards[discard_size + 1:], state.hand.cards[idx - 2:])
+						slice.zero(state.hand.cards[idx - 2:])
+						slice.reverse(state.discard.cards[discard_size + 1:discard_size + 4])
+						for card in state.discard.cards[discard_size + 1:] {
+							if card == nil {break}
+							card.flipped = true
+							card.pos = state.discard.pos
 						}
 					}
 				}
+			}
 
-				// pick up from discard
-				{
-					top, idx := pile_get_top(&state.discard)
+			// pick up from discard
+			{
+				top, idx := pile_get_top(&state.discard)
+				if idx != -1 && card_collides_point(top, state.mouse_pos) {
+					state.held_pile.cards[0] = top
+					state.held_pile.cards[0].held = true
+					state.held_pile.hold_offset = state.mouse_pos - top.pos
+					state.held_pile.source_pile = &state.discard
+					state.discard.cards[idx] = nil
+				}
+			}
+
+			// pick up from stack
+			{
+				for &stack in state.stacks {
+					top, idx := pile_get_top(&stack)
 					if idx != -1 && card_collides_point(top, state.mouse_pos) {
 						state.held_pile.cards[0] = top
 						state.held_pile.cards[0].held = true
 						state.held_pile.hold_offset = state.mouse_pos - top.pos
-						state.held_pile.source_pile = &state.discard
-						state.discard.cards[idx] = nil
-					}
-				}
-
-				// pick up from stack
-				{
-					for &stack in state.stacks {
-						top, idx := pile_get_top(&stack)
-						if idx != -1 && card_collides_point(top, state.mouse_pos) {
-							state.held_pile.cards[0] = top
-							state.held_pile.cards[0].held = true
-							state.held_pile.hold_offset = state.mouse_pos - top.pos
-							state.held_pile.source_pile = &stack
-							stack.cards[idx] = nil
-							break
-						}
-					}
-				}
-
-				// pick up from pile
-				{
-					for &pile in state.piles {
-						#reverse for card, idx in pile.cards {
-							if card == nil {continue}
-							if card.flipped && card_collides_point(card, state.mouse_pos) {
-								copy(state.held_pile.cards[:], pile.cards[idx:])
-								for card in state.held_pile.cards {
-									if card == nil {break}
-									card.held = true
-								}
-								state.held_pile.hold_offset = state.mouse_pos - card.pos
-								state.held_pile.source_pile = &pile
-								slice.zero(pile.cards[idx:])
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if k2.mouse_button_went_up(.Left) {
-			// add hand pile to pile
-			if state.held_pile.source_pile != nil {
-				candidate_piles: [7]^Pile
-				num_candidates := 0
-
-				for &pile in state.piles {
-					if state.held_pile.source_pile == &pile {continue}
-					if piles_collide(&state.held_pile, &pile) &&
-					   pile_can_place(&pile, &state.held_pile) {
-						candidate_piles[num_candidates] = &pile
-						num_candidates += 1
-					}
-				}
-
-				if num_candidates > 0 {
-					closest_pile: ^Pile
-					max_overlap := min(f32)
-					for i in 0 ..< num_candidates {
-						candidate_top, top_idx := pile_get_top(candidate_piles[i])
-						top_pos :=
-							candidate_top == nil ? candidate_piles[i].pos : candidate_top.pos
-						held_pos := state.held_pile.cards[0].pos
-
-						overlap :=
-							max(
-								0,
-								min(
-									held_pos.x + CARD_SIZE_UNITS.x,
-									top_pos.x + CARD_SIZE_UNITS.y,
-								) -
-								max(held_pos.x, top_pos.x),
-							) *
-							max(
-								0,
-								min(
-									held_pos.y + CARD_SIZE_UNITS.x,
-									top_pos.y + CARD_SIZE_UNITS.y,
-								) -
-								max(held_pos.y, top_pos.y),
-							)
-
-						if overlap >= max_overlap {
-							closest_pile = candidate_piles[i]
-							max_overlap = overlap
-						}
-					}
-
-					top, idx := pile_get_top(state.held_pile.source_pile)
-					if top != nil {top.flipped = true}
-
-					when EASYWIN {
-						state.has_won = true
-					}
-
-					held_pile_send_to_pile(&state.held_pile, closest_pile)
-				}
-			}
-
-			// add card to stack
-			if state.held_pile.source_pile != nil {
-				for &stack in state.stacks {
-					if piles_collide(&state.held_pile, &stack) &&
-					   stack_can_place(&stack, &state.held_pile) {
-						top, idx := pile_get_top(state.held_pile.source_pile)
-						if top != nil {top.flipped = true}
-						held_pile_send_to_pile(&state.held_pile, &stack)
+						state.held_pile.source_pile = &stack
+						stack.cards[idx] = nil
 						break
 					}
 				}
 			}
 
-			// return unassigned hand pile to source
-			if state.held_pile.source_pile != nil {
-				held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
-			}
-
-			// win condition
+			// pick up from pile
 			{
-				for &stack, idx in state.stacks {
-					top, top_idx := pile_get_top(&stack)
-					if top_idx != 12 {break}
-					if idx == 3 {state.has_won = true}
-				}
-			}
-		}
-
-		// rendering
-		{
-			// update MRU for render
-			slice.sort_by(state.mru_piles[:], proc(a, b: ^Pile) -> bool {
-				return a.update_tag < b.update_tag
-			})
-
-			// viewport
-			{
-				k2.set_render_texture(state.render_tex)
-				defer k2.set_render_texture(nil)
-				k2.clear(k2.BLACK)
-				// card rendering
-				{
-					{
-						k2.set_shader(background_shader)
-						defer k2.set_shader(nil)
-						k2.set_shader_constant(background_shader, time_loc, state.game_time)
-						k2.set_shader_constant(background_shader, hue_loc, settings.hue_shift)
-						k2.draw_rect({0, 0, state.resolution.x, state.resolution.y}, k2.WHITE)
-					}
-
-					for pile in state.mru_piles {
-						draw_pile(pile)
-					}
-
-					draw_held_pile(&state.held_pile)
-				}
-				// ui rendering
-				{
-					// toolbar
-					{
-						if state.has_won || settings.menu_visible {gui_locked = true}
-						defer gui_locked = false
-
-						restart_loc := units_to_px({0, 0})
-						restart_size := units_to_px({225, 50})
-						if text_button(
-							{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
-							"Restart",
-							k2.DARK_GRAY,
-							k2.LIGHT_GRAY,
-							k2.RL_SKYBLUE,
-							40,
-						) {init_state(&state)}
-
-						settings_loc := units_to_px({250, 0})
-						settings_size := units_to_px({225, 50})
-						if text_button(
-							{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
-							"Settings",
-							k2.DARK_GRAY,
-							k2.LIGHT_GRAY,
-							k2.RL_SKYBLUE,
-							40,
-						) {
-							settings.menu_visible = true
-							settings.menu_fade = 0
-						}
-
-						// performance overlay
-						if settings.show_perf {
-							perf_px := units_to_px(
-								{state.resolution.x / state.unit_to_px_scaling.x - 150, 0},
-							)
-							perf_size := units_to_px({150, 50})
-							k2.draw_rect(
-								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
-								k2.LIGHT_GRAY,
-							)
-							k2.draw_rect_outline(
-								{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
-								3,
-								k2.DARK_GRAY,
-							)
-							fps := fmt.tprintf("%v FPS", 1 / k2.get_frame_time())
-							centered_text(fps, 20, perf_px + perf_size / 2, k2.DARK_GRAY)
+				for &pile in state.piles {
+					#reverse for card, idx in pile.cards {
+						if card == nil {continue}
+						if card.flipped && card_collides_point(card, state.mouse_pos) {
+							copy(state.held_pile.cards[:], pile.cards[idx:])
+							for card in state.held_pile.cards {
+								if card == nil {break}
+								card.held = true
+							}
+							state.held_pile.hold_offset = state.mouse_pos - card.pos
+							state.held_pile.source_pile = &pile
+							slice.zero(pile.cards[idx:])
+							break
 						}
 					}
-
-					settings_menu()
-
-					if state.has_won {
-						victory_screen()
-					}
 				}
 			}
-
-			// postprocessing
-			{
-				k2.set_shader(scanline_shader)
-				defer k2.set_shader(nil)
-				scanline_shader.texture_bindpoints[scanline_shader.texture_lookup["texture0"]] =
-					state.render_tex.texture.handle
-
-				k2.draw_texture_fit(
-					state.render_tex.texture,
-					k2.get_texture_rect(state.render_tex.texture),
-					{0, 0, state.screen_resolution.x, state.screen_resolution.y},
-				)
-			}
-			k2.present()
-			free_all(context.temp_allocator)
 		}
 	}
+
+	if k2.mouse_button_went_up(.Left) {
+		// add hand pile to pile
+		if state.held_pile.source_pile != nil {
+			candidate_piles: [7]^Pile
+			num_candidates := 0
+
+			for &pile in state.piles {
+				if state.held_pile.source_pile == &pile {continue}
+				if piles_collide(&state.held_pile, &pile) &&
+				   pile_can_place(&pile, &state.held_pile) {
+					candidate_piles[num_candidates] = &pile
+					num_candidates += 1
+				}
+			}
+
+			if num_candidates > 0 {
+				closest_pile: ^Pile
+				max_overlap := min(f32)
+				for i in 0 ..< num_candidates {
+					candidate_top, top_idx := pile_get_top(candidate_piles[i])
+					top_pos := candidate_top == nil ? candidate_piles[i].pos : candidate_top.pos
+					held_pos := state.held_pile.cards[0].pos
+
+					overlap :=
+						max(
+							0,
+							min(held_pos.x + CARD_SIZE_UNITS.x, top_pos.x + CARD_SIZE_UNITS.y) -
+							max(held_pos.x, top_pos.x),
+						) *
+						max(
+							0,
+							min(held_pos.y + CARD_SIZE_UNITS.x, top_pos.y + CARD_SIZE_UNITS.y) -
+							max(held_pos.y, top_pos.y),
+						)
+
+					if overlap >= max_overlap {
+						closest_pile = candidate_piles[i]
+						max_overlap = overlap
+					}
+				}
+
+				top, idx := pile_get_top(state.held_pile.source_pile)
+				if top != nil {top.flipped = true}
+
+				when EASYWIN {
+					state.has_won = true
+				}
+
+				held_pile_send_to_pile(&state.held_pile, closest_pile)
+			}
+		}
+
+		// add card to stack
+		if state.held_pile.source_pile != nil {
+			for &stack in state.stacks {
+				if piles_collide(&state.held_pile, &stack) &&
+				   stack_can_place(&stack, &state.held_pile) {
+					top, idx := pile_get_top(state.held_pile.source_pile)
+					if top != nil {top.flipped = true}
+					held_pile_send_to_pile(&state.held_pile, &stack)
+					break
+				}
+			}
+		}
+
+		// return unassigned hand pile to source
+		if state.held_pile.source_pile != nil {
+			held_pile_send_to_pile(&state.held_pile, state.held_pile.source_pile)
+		}
+
+		// win condition
+		{
+			for &stack, idx in state.stacks {
+				top, top_idx := pile_get_top(&stack)
+				if top_idx != 12 {break}
+				if idx == 3 {state.has_won = true}
+			}
+		}
+	}
+
+	// rendering
+	{
+		// update MRU for render
+		slice.sort_by(state.mru_piles[:], proc(a, b: ^Pile) -> bool {
+			return a.update_tag < b.update_tag
+		})
+
+		// viewport
+		{
+			k2.set_render_texture(state.render_tex)
+			defer k2.set_render_texture(nil)
+			k2.clear(k2.BLACK)
+			// card rendering
+			{
+				{
+					k2.set_shader(BG_SHADER)
+					defer k2.set_shader(nil)
+					k2.set_shader_constant(BG_SHADER, BG_TIME_LOC, state.game_time)
+					k2.set_shader_constant(BG_SHADER, BG_HUE_LOC, settings.hue_shift)
+					k2.draw_rect({0, 0, state.resolution.x, state.resolution.y}, k2.WHITE)
+				}
+
+				for pile in state.mru_piles {
+					draw_pile(pile)
+				}
+
+				draw_held_pile(&state.held_pile)
+			}
+			// ui rendering
+			{
+				// toolbar
+				{
+					if state.has_won || settings.menu_visible {gui_locked = true}
+					defer gui_locked = false
+
+					restart_loc := units_to_px({0, 0})
+					restart_size := units_to_px({225, 50})
+					if text_button(
+						{restart_loc.x, restart_loc.y, restart_size.x, restart_size.y},
+						"Restart",
+						k2.DARK_GRAY,
+						k2.LIGHT_GRAY,
+						k2.RL_SKYBLUE,
+						40,
+					) {init_state(&state)}
+
+					settings_loc := units_to_px({250, 0})
+					settings_size := units_to_px({225, 50})
+					if text_button(
+						{settings_loc.x, settings_loc.y, settings_size.x, settings_size.y},
+						"Settings",
+						k2.DARK_GRAY,
+						k2.LIGHT_GRAY,
+						k2.RL_SKYBLUE,
+						40,
+					) {
+						settings.menu_visible = true
+						settings.menu_fade = 0
+					}
+
+					// performance overlay
+					if settings.show_perf {
+						perf_px := units_to_px(
+							{state.resolution.x / state.unit_to_px_scaling.x - 150, 0},
+						)
+						perf_size := units_to_px({150, 50})
+						k2.draw_rect(
+							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+							k2.LIGHT_GRAY,
+						)
+						k2.draw_rect_outline(
+							{perf_px.x, perf_px.y, perf_size.x, perf_size.y},
+							3,
+							k2.DARK_GRAY,
+						)
+						fps := fmt.tprintf("%v FPS", 1 / k2.get_frame_time())
+						centered_text(fps, 20, perf_px + perf_size / 2, k2.DARK_GRAY)
+					}
+				}
+
+				settings_menu()
+
+				if state.has_won {
+					victory_screen()
+				}
+			}
+		}
+
+		// postprocessing
+		{
+			k2.set_shader(SCANLINE_SHADER)
+			defer k2.set_shader(nil)
+			SCANLINE_SHADER.texture_bindpoints[SCANLINE_SHADER.texture_lookup["texture0"]] =
+				state.render_tex.texture.handle
+
+			k2.draw_texture_fit(
+				state.render_tex.texture,
+				k2.get_texture_rect(state.render_tex.texture),
+				{0, 0, state.screen_resolution.x, state.screen_resolution.y},
+			)
+		}
+		k2.present()
+		free_all(context.temp_allocator)
+	}
+	return true
 }
 
-when PROFILING {
-	@(instrumentation_enter)
-	spall_enter :: proc "contextless" (
-		proc_address, call_site_return_address: rawptr,
-		loc: runtime.Source_Code_Location,
-	) {
-		spall._buffer_begin(&spall_ctx, &spall_buffer, "", "", loc)
-	}
-
-	@(instrumentation_exit)
-	spall_exit :: proc "contextless" (
-		proc_address, call_site_return_address: rawptr,
-		loc: runtime.Source_Code_Location,
-	) {
-		spall._buffer_end(&spall_ctx, &spall_buffer)
-	}
+shutdown :: proc() {
+	k2.destroy_shader(SCANLINE_SHADER)
+	k2.destroy_shader(BG_SHADER)
+	k2.destroy_render_texture(state.render_tex)
+	k2.destroy_texture(ICONS)
+	k2.destroy_texture(BACKS)
+	k2.destroy_texture(BLANK)
+	k2.destroy_texture(CARDS)
+	k2.shutdown()
 }

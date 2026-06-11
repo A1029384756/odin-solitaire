@@ -1,10 +1,7 @@
 package main
 
-import "core:encoding/cbor"
 import "core:fmt"
 import "core:math"
-import "core:mem"
-import "core:os"
 import k2 "karl2d"
 
 Persistent_Settings :: struct {
@@ -28,21 +25,6 @@ SETTINGS_DEFAULT :: Settings {
 	hue_shift    = 2.91,
 	render_scale = 1,
 	menu_fade    = 1,
-}
-
-load_settings :: proc() {
-	conf_bin, read_err := os.read_entire_file(get_config("solitodin.txt"), context.temp_allocator)
-	if read_err != nil {
-		fmt.println("could not find settings, loading defaults")
-		settings = SETTINGS_DEFAULT
-		return
-	}
-
-	d_err := cbor.unmarshal_from_string(string(conf_bin), &settings.persistent)
-	if d_err != nil {
-		fmt.println("could not read settings, loading defaults")
-		settings = SETTINGS_DEFAULT
-	}
 }
 
 settings_menu :: proc() {
@@ -95,24 +77,6 @@ settings_menu :: proc() {
 	if panel_button(&layout, "Exit") {
 		settings.menu_visible = false
 		settings.menu_fade = 0
-
-		encoded, err := cbor.marshal(settings.persistent, cbor.ENCODE_FULLY_DETERMINISTIC)
-		assert(err == nil)
-		defer delete(encoded)
-
-		write_err := os.write_entire_file(get_config("solitodin.txt"), encoded)
-		if write_err != nil {
-			fmt.println("could not open settings file:", get_config("solitodin.txt"))
-			return
-		}
+		write_config()
 	}
-}
-
-get_config :: proc(
-	subfolder: string,
-	allocator: mem.Allocator = context.temp_allocator,
-) -> string {
-	dir, _ := os.user_config_dir(allocator)
-	joined, _ := os.join_path({dir, subfolder}, allocator)
-	return joined
 }
