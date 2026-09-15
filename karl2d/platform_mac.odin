@@ -5,12 +5,15 @@
 package karl2d
 
 import NS "core:sys/darwin/Foundation"
+import CF "core:sys/darwin/CoreFoundation"
 import ce "platform_bindings/mac/cocoa_extras"
 import gc "platform_bindings/mac/gamecontroller"
 import "core:os"
 import "base:intrinsics"
 import "base:runtime"
 import "core:time"
+import "core:slice"
+import hm "core:container/handle_map"
 import "log"
 
 @(private="package")
@@ -25,12 +28,18 @@ PLATFORM_MAC :: Platform_Interface {
 	get_screen_width = mac_get_screen_width,
 	get_screen_height = mac_get_screen_height,
 	set_window_position = mac_set_window_position,
+	get_window_position = mac_get_window_position,
 	get_window_scale = mac_get_window_scale,
 	set_window_mode = mac_set_window_mode,
+	set_window_icon = mac_set_window_icon,
+
 	set_cursor_hidden = mac_set_cursor_hidden,
 	is_cursor_hidden = mac_is_cursor_hidden,
-	set_cursor_locked = mac_set_cursor_locked,
-	is_cursor_locked = mac_is_cursor_locked,
+	set_mouse_locked = mac_set_mouse_locked,
+	is_mouse_locked = mac_is_mouse_locked,
+	create_custom_cursor = mac_create_custom_cursor,
+	set_cursor = mac_set_cursor,
+	destroy_custom_cursor = mac_destroy_custom_cursor,
 
 	is_gamepad_active = mac_is_gamepad_active,
 	get_gamepad_axis = mac_get_gamepad_axis,
@@ -56,7 +65,12 @@ Mac_State :: struct {
 	cursor_hidden_by_us: bool,
 	cursor_tracker:      NS.id,
 
-	cursor_locked: bool,
+	custom_cursors: hm.Dynamic_Handle_Map(Mac_Cursor, Custom_Cursor),
+
+	// The cursor most recently passed to mac_set_cursor. The zero value is Standard_Cursor.Default.
+	current_cursor: Cursor,
+
+	mouse_locked: bool,
 	mouse_ignore_next_move: bool,
 
 	screen_width:     int,
@@ -67,11 +81,38 @@ Mac_State :: struct {
 	// for emitting mouse up events after a live resize
 	left_mouse_held:  bool,
 
+	// macOS reports modifier keys as flag changes, not key up/down. Tracks which ones we've
+	// already reported as held so we can tell a press from a release. See `.FlagsChanged`.
+	modifier_key_is_held: #sparse [Keyboard_Key]bool,
+
 	window_render_glue: Window_Render_Glue,
+
+	// The application icon and the pixels it was built from. Both nil until
+	// `mac_set_window_icon` runs.
+	icon:        ^NS.Image,
+	icon_pixels: []Color,
 
 	gamepads:           [MAX_GAMEPADS]Gamepad,
 	gc_connect_blk:     ^NS.Block,
 	gc_disconnect_blk:  ^NS.Block,
+}
+
+Mac_Cursor :: struct {
+	handle: Custom_Cursor,
+	cursor: ^NS.Cursor,
+
+	// Hotspot in physical pixels, as Karl2D takes it. See `mac_build_cursor`.
+	hotspot: [2]int,
+	built_for_scale: f32,
+
+	// Size in physical pixels.
+	width: int,
+	height: int,
+
+	// NSBitmapImageRep does not copy the pixel planes it is handed, so a copy of the pixels must
+	// stay alive for as long as the cursor does. It is also what the cursor is rebuilt from when
+	// the scale changes. The caller's Image is not ours to hold on to.
+	pixels: []Color,
 }
 
 Gamepad :: struct {
@@ -103,6 +144,7 @@ mac_init :: proc(
 	s.odin_ctx = context
 	s.allocator = allocator
 	s.events = make([dynamic]Event, allocator)
+	hm.dynamic_init(&s.custom_cursors, allocator)
 
 	// Initialize NSApplication
 	s.app = NS.Application_sharedApplication()
@@ -207,7 +249,11 @@ mac_init :: proc(
 
 			windowShouldClose = proc(_: ^NS.Window) -> bool {
 				append(&s.events, Event_Close_Window_Requested{})
-				return true
+
+				// Returning true closes the window, which also releases it. It's up to the
+				// application to decide what a close request means, it may want to show a
+				// confirmation dialogue. The window is closed in `mac_shutdown`.
+				return false
 			},
 
 			// Focus and unfocus events
@@ -221,6 +267,7 @@ mac_init :: proc(
 				// loss. Restore the OS cursor so it stays visible in other apps / the menu bar.
 				unhide_cursor_now()
 				append(&s.events, Event_Window_Unfocused{})
+				s.modifier_key_is_held = {}
 			},
 
 			windowDidEndLiveResize = proc(_: ^NS.Notification) {
@@ -267,6 +314,18 @@ mac_init :: proc(
 }
 
 mac_shutdown :: proc() {
+	for it := hm.dynamic_iterator_make(&s.custom_cursors); cd, _ in hm.dynamic_iterate(&it) {
+		cd.cursor->release()
+		delete(cd.pixels, s.allocator)
+	}
+	hm.dynamic_destroy(&s.custom_cursors)
+
+	if s.icon != nil {
+		s.icon->release()
+		delete(s.icon_pixels, s.allocator)
+		s.icon = nil
+	}
+
 	if s.window != nil {
 		s.window->close()
 	}
@@ -298,10 +357,25 @@ mac_get_events :: proc(events: ^[dynamic]Event) {
 
 		#partial switch event_type {
 		case .KeyDown:
-			if !event->isARepeat() {
-				key := key_from_macos_keycode(event->keyCode())
-				if key != .None {
+			key := key_from_macos_keycode(event->keyCode())
+
+			if key != .None {
+				if event->isARepeat() {
+					append(&s.events, Event_Key_Repeat{key = key})
+				} else {
 					append(&s.events, Event_Key_Went_Down{key = key})
+				}
+			}
+
+			// Note: `characters()` gives us the text produced by the current keyboard layout, but
+			// it doesn't run the input method, so dead keys / accent composition (for example
+			// option-e then e to get "e" with an acute accent) won't compose correctly. Doing
+			// that properly would require `interpretKeyEvents:` and `insertText:`.
+			if event->modifierFlags() & {.Command} == {} {
+				for r in event->characters()->odinString() {
+					if is_typable_rune(r) && !mac_is_function_key_rune(r) {
+						append(&s.events, Event_Typed_Rune{typed = r})
+					}
 				}
 			}
 
@@ -309,6 +383,38 @@ mac_get_events :: proc(events: ^[dynamic]Event) {
 			key := key_from_macos_keycode(event->keyCode())
 			if key != .None {
 				append(&s.events, Event_Key_Went_Up{key = key})
+			}
+
+		case .FlagsChanged:
+			key := key_from_macos_keycode(event->keyCode())
+			flags := event->modifierFlags()
+			is_held := false
+			is_modifier := true
+			#partial switch key {
+			case .Left_Shift, .Right_Shift:     is_held = .Shift in flags
+			case .Left_Control, .Right_Control: is_held = .Control in flags
+			case .Left_Alt, .Right_Alt:         is_held = .Option in flags
+			case .Left_Super, .Right_Super:     is_held = .Command in flags
+			case .Caps_Lock:                    is_held = .CapsLock in flags
+			case:
+				// Not one of the modifier keys above (includes .None); FlagsChanged has nothing
+				// useful to say about it, so don't synthesize a key event for it.
+				is_modifier = false
+			}
+
+			if is_modifier {
+				// Left and right share a single modifier flag, so the flag being set doesn't
+				// mean _this_ key went down: the other side may still be held. The keycode says
+				// which key changed, so if we already had it down, this event must be its release.
+				if is_held && s.modifier_key_is_held[key] {
+					is_held = false
+				}
+				s.modifier_key_is_held[key] = is_held
+				if is_held {
+					append(&s.events, Event_Key_Went_Down{key = key})
+				} else {
+					append(&s.events, Event_Key_Went_Up{key = key})
+				}
 			}
 
 		case .LeftMouseDown:
@@ -356,7 +462,7 @@ mac_get_events :: proc(events: ^[dynamic]Event) {
 			px := loc.x * scale
 			py := NS.Float(s.screen_height) - loc.y * scale
 			
-			if s.cursor_locked {
+			if s.mouse_locked {
 				dx := f32(ce.Event_deltaX(event)) * f32(s.window->backingScaleFactor())
 				dy := f32(ce.Event_deltaY(event)) * f32(s.window->backingScaleFactor())
 				cx := f32(s.screen_width/2)
@@ -368,12 +474,21 @@ mac_get_events :: proc(events: ^[dynamic]Event) {
 			}
 
 		case .ScrollWheel:
-			delta := event->scrollingDeltaY()
+			delta := f32(event->scrollingDeltaY())
+			// AppKit measures the horizontal wheel to the left, so that one gets flipped.
+			delta_horizontal := f32(-event->scrollingDeltaX())
+
 			// Normalize: trackpad gives precise deltas, mouse wheel gives line deltas
 			if event->hasPreciseScrollingDeltas() {
-				append(&s.events, Event_Mouse_Wheel{delta = f32(delta) / 10.0})
-			} else {
-				append(&s.events, Event_Mouse_Wheel{delta = f32(delta)})
+				delta /= 10.0
+				delta_horizontal /= 10.0
+			}
+
+			append(&s.events, Event_Mouse_Wheel{delta = delta})
+
+			// A vertical-only scroll reports zero here, which is not worth an event.
+			if delta_horizontal != 0 {
+				append(&s.events, Event_Mouse_Wheel_Horizontal{delta = delta_horizontal})
 			}
 		}
 
@@ -431,6 +546,12 @@ mac_set_window_position :: proc(x: int, y: int) {
 	s.window->setFrameOrigin(origin)
 }
 
+mac_get_window_position :: proc() -> Vec2 {
+	// macOS uses bottom-left origin for screen coordinates
+	origin := s.window->frame().origin
+	return {f32(origin.x), f32(origin.y)}
+}
+
 mac_set_screen_size :: proc(w, h: int) {
 	scale := mac_get_window_scale()
 	s.screen_width = int(f32(w) * scale)
@@ -451,8 +572,8 @@ mac_is_cursor_hidden :: proc() -> bool {
 	return s.cursor_hidden
 }
 
-mac_set_cursor_locked :: proc(locked: bool) {
-	s.cursor_locked = locked
+mac_set_mouse_locked :: proc(locked: bool) {
+	s.mouse_locked = locked
 
 	if locked {
 		s.mouse_ignore_next_move = true
@@ -463,8 +584,8 @@ mac_set_cursor_locked :: proc(locked: bool) {
 	}
 }
 
-mac_is_cursor_locked :: proc() -> bool {
-	return s.cursor_locked
+mac_is_mouse_locked :: proc() -> bool {
+	return s.mouse_locked
 }
 
 _mac_teleport_cursor_to_center :: proc() {
@@ -687,6 +808,229 @@ mac_set_window_mode :: proc(window_mode: Window_Mode) {
 		s.screen_width  = int(f32(content_rect.width) * scale)
 		s.screen_height = int(f32(content_rect.height) * scale)
 	}
+}
+
+// Wraps `pixels` in an NSImage of `point_size` points. The pixels are not copied: they must stay
+// alive for as long as the image does, and stay valid RGBA8 with straight alpha.
+//
+// Returns nil when AppKit rejects the bitmap, which is logged.
+mac_make_ns_image :: proc(
+	pixels: []Color,
+	width: int,
+	height: int,
+	point_size: NS.Size,
+) -> ^NS.Image {
+	planes := [?]^u8 {(^u8)(raw_data(pixels))}
+
+	rep := NS.BitmapImageRep_alloc()->initWithBitmapDataPlanes(
+		&planes[0],
+		NS.Integer(width),
+		NS.Integer(height),
+		8,
+		4,
+		true,
+		false,
+		NS.DeviceRGBColorSpace,
+		NS.BitmapFormatFlags{.AlphaNonpremultiplied},
+		NS.Integer(width * 4),
+		32,
+	)
+
+	if rep == nil {
+		log.errorf("initWithBitmapDataPlanes failed for a %vx%v image", width, height)
+		return nil
+	}
+
+	ns_image := NS.Image_alloc()->initWithSize(point_size)
+	ns_image->addRepresentation((^NS.ImageRep)(rep))
+
+	// The image retains the representation, so that can go now.
+	rep->release()
+
+	return ns_image
+}
+
+// macOS windows have no icon of their own, so this sets the application's icon, the one in the
+// Dock. It lasts for as long as the process runs. An app bundle takes its icon from the .icns file
+// inside it until this replaces it.
+mac_set_window_icon :: proc(image: Image, _: bool) -> bool {
+	// The NSImage points at these rather than copying them, so a copy of the pixels must stay
+	// alive for as long as it does.
+	pixels := slice.clone(image.pixels, s.allocator)
+
+	// The Dock decides how big to draw the icon, so the size in points only has to carry the
+	// aspect ratio of the pixels.
+	ns_image := mac_make_ns_image(pixels, image.width, image.height, {
+		CF.CGFloat(image.width),
+		CF.CGFloat(image.height),
+	})
+
+	if ns_image == nil {
+		delete(pixels, s.allocator)
+		return false
+	}
+
+	ce.Application_setApplicationIconImage(s.app, ns_image)
+
+	// The icon that was in the Dock is only safe to release now that this one has replaced it.
+	if s.icon != nil {
+		s.icon->release()
+		delete(s.icon_pixels, s.allocator)
+	}
+
+	s.icon = ns_image
+	s.icon_pixels = pixels
+	return true
+}
+
+mac_create_custom_cursor :: proc(image: Image, hotspot: [2]int) -> (Custom_Cursor, bool) {
+	cursor := Mac_Cursor {
+		pixels  = slice.clone(image.pixels, s.allocator),
+		width   = image.width,
+		height  = image.height,
+		hotspot = hotspot,
+	}
+	mac_build_cursor(&cursor)
+
+	if cursor.cursor == nil {
+		delete(cursor.pixels, s.allocator)
+		return {}, false
+	}
+
+	handle, add_err := hm.add(&s.custom_cursors, cursor)
+
+	if add_err != nil {
+		log.errorf("Failed to create cursor. Error: %v", add_err)
+		cursor.cursor->release()
+		delete(cursor.pixels, s.allocator)
+		return {}, false
+	}
+
+	return handle, true
+}
+
+// Cursor images are in physical pixels, like the rest of Karl2D, but an NSImage is sized in
+// points. Without dividing by the backing scale factor a 128x128 cursor would cover 256x256
+// physical pixels on a Retina display, and be blurry from the upscale.
+//
+// Neither an NSImage's size nor an NSCursor's hotspot can be changed after the fact, so this
+// rebuilds from scratch whenever the scale changes.
+mac_build_cursor :: proc(cursor: ^Mac_Cursor) {
+	// Released at the end, so that the cursor being replaced stays alive until its replacement
+	// exists. It may still be the one on screen at this point.
+	old := cursor.cursor
+
+	scale := mac_get_window_scale()
+
+	ns_image := mac_make_ns_image(cursor.pixels, cursor.width, cursor.height, {
+		CF.CGFloat(f32(cursor.width) / scale),
+		CF.CGFloat(f32(cursor.height) / scale),
+	})
+
+	// Whatever cursor was there stays on.
+	if ns_image == nil {
+		return
+	}
+
+	// The hotspot is in the image's coordinate system, so it is in points too.
+	cursor.cursor = NS.Cursor_alloc()->initWithImage(ns_image, {
+		CF.CGFloat(f32(cursor.hotspot.x) / scale),
+		CF.CGFloat(f32(cursor.hotspot.y) / scale),
+	})
+
+	// The NSCursor retains the image, so it can go now.
+	ns_image->release()
+
+	cursor.built_for_scale = scale
+
+	if old != nil {
+		old->release()
+	}
+}
+
+mac_set_cursor :: proc(cursor: Cursor) {
+	// Reject a stale handle, so a programming error leaves the cursor alone.
+	if c, is_custom := cursor.(Custom_Cursor); is_custom {
+		if hm.get(&s.custom_cursors, c) == nil {
+			log.errorf("Trying to set invalid cursor %v. It may have been destroyed.", c)
+			return
+		}
+	}
+
+	s.current_cursor = cursor
+	mac_apply_cursor()
+}
+
+// Sets the OS cursor from s.current_cursor, falling back to the default arrow when a custom
+// cursor no longer resolves (it was destroyed while on screen).
+mac_apply_cursor :: proc() {
+	switch c in s.current_cursor {
+	case Standard_Cursor:
+		mac_standard_cursor(c)->set()
+
+	case Custom_Cursor:
+		cd := hm.get(&s.custom_cursors, c)
+
+		if cd == nil {
+			mac_standard_cursor(.Default)->set()
+			return
+		}
+
+		// The scale can change while the game runs, for instance when the window is moved to a
+		// monitor with different DPI settings.
+		if cd.built_for_scale != mac_get_window_scale() {
+			mac_build_cursor(cd)
+		}
+
+		cd.cursor->set()
+	}
+}
+
+// The returned cursor is a shared one owned by AppKit, so it must not be released.
+mac_standard_cursor :: proc(cursor: Standard_Cursor) -> ^NS.Cursor {
+	switch cursor {
+	case .Default:     return NS.Cursor_arrowCursor()
+	case .Text:        return NS.Cursor_IBeamCursor()
+	case .Hand:        return NS.Cursor_pointingHandCursor()
+	case .Crosshair:   return ce.Cursor_crosshairCursor()
+	case .Move:        return ce.Cursor_closedHandCursor()
+	case .Resize_EW:   return ce.Cursor_resizeLeftRightCursor()
+	case .Resize_NS:   return ce.Cursor_resizeUpDownCursor()
+	case .Not_Allowed: return ce.Cursor_operationNotAllowedCursor()
+
+	// AppKit has no public busy cursor and no public diagonal resize cursors. The private
+	// selectors that do exist aren't worth shipping in a library, so these show the arrow.
+	case .Wait, .Progress, .Resize_NESW, .Resize_NWSE:
+		return NS.Cursor_arrowCursor()
+	}
+
+	return NS.Cursor_arrowCursor()
+}
+
+mac_destroy_custom_cursor :: proc(custom_cursor: Custom_Cursor) {
+	cd := hm.get(&s.custom_cursors, custom_cursor)
+
+	if cd == nil {
+		log.errorf(
+			"Trying to destroy invalid cursor %v. It may already be destroyed.",
+			custom_cursor,
+		)
+		return
+	}
+
+	cd.cursor->release()
+	delete(cd.pixels, s.allocator)
+	hm.remove(&s.custom_cursors, custom_cursor)
+
+	// Falls back to the default if that was the cursor on screen.
+	mac_apply_cursor()
+}
+
+// macOS reports keys that aren't on a standard keyboard (arrows, F1-F35, Home, End, Page Up/Down,
+// forward Delete, etc) as characters in the Unicode Private Use Area range U+F700 to U+F8FF. Those
+// are not text, so they must not end up as typed runes.
+mac_is_function_key_rune :: proc(r: rune) -> bool {
+	return r >= 0xf700 && r <= 0xf8ff
 }
 
 // Key code mapping from macOS virtual key codes to Keyboard_Key

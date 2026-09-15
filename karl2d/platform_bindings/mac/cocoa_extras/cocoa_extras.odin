@@ -18,6 +18,11 @@ Application_presentationOptions :: proc "c" (self: ^NS.Application) -> NS.Applic
 	return msgSend(NS.ApplicationPresentationOptions, self, "presentationOptions")
 }
 
+// The icon the application shows in the Dock. macOS windows have no icon of their own.
+Application_setApplicationIconImage :: proc "c" (self: ^NS.Application, image: ^NS.Image) {
+	msgSend(nil, self, "setApplicationIconImage:", image)
+}
+
 // NSWindow content size (sets the size of the content area, excluding decorations)
 Window_setContentSize :: proc "c" (self: ^NS.Window, size: NS.Size) {
 	msgSend(nil, self, "setContentSize:", size)
@@ -69,6 +74,31 @@ View_mouse_inRect :: proc "c" (self: ^NS.View, point: NS.Point, rect: NS.Rect) -
 
 Window_mouseLocationOutsideOfEventStream :: proc "c" (self: ^NS.Window) -> NS.Point {
 	return msgSend(NS.Point, self, "mouseLocationOutsideOfEventStream")
+}
+
+// NSCursor shapes that Odin's Foundation bindings don't cover. These are all public AppKit class
+// methods returning a shared cursor owned by the system, so they must not be released.
+//
+// AppKit has no public busy/wait cursor and no public diagonal resize cursors, so there is nothing
+// to bind for those shapes.
+Cursor_crosshairCursor :: proc "c" () -> ^NS.Cursor {
+	return msgSend(^NS.Cursor, NS.Cursor, "crosshairCursor")
+}
+
+Cursor_closedHandCursor :: proc "c" () -> ^NS.Cursor {
+	return msgSend(^NS.Cursor, NS.Cursor, "closedHandCursor")
+}
+
+Cursor_resizeLeftRightCursor :: proc "c" () -> ^NS.Cursor {
+	return msgSend(^NS.Cursor, NS.Cursor, "resizeLeftRightCursor")
+}
+
+Cursor_resizeUpDownCursor :: proc "c" () -> ^NS.Cursor {
+	return msgSend(^NS.Cursor, NS.Cursor, "resizeUpDownCursor")
+}
+
+Cursor_operationNotAllowedCursor :: proc "c" () -> ^NS.Cursor {
+	return msgSend(^NS.Cursor, NS.Cursor, "operationNotAllowedCursor")
 }
 
 CGPoint :: [2]f64

@@ -19,15 +19,26 @@ Platform_Interface :: struct #all_or_none {
 	get_events: proc(events: ^[dynamic]Event),
 	set_window_title: proc(title: string),
 	set_window_position: proc(x: int, y: int),
+	get_window_position: proc() -> Vec2,
 	set_screen_size: proc(w, h: int),
 	get_screen_width: proc() -> int,
 	get_screen_height: proc() -> int,
 	get_window_scale: proc() -> f32,
 	set_window_mode: proc(window_mode: Window_Mode),
+
+	// `warn_if_unsupported` says whether to log when the platform or its setup cannot show icons
+	// at all, such as a Wayland compositor without the icon protocol. `init` passes false when it
+	// applies the default icon, so the game is not warned about a call it never made. Actual
+	// errors are always logged.
+	set_window_icon: proc(image: Image, warn_if_unsupported: bool) -> bool,
+
 	set_cursor_hidden: proc(hidden: bool),
 	is_cursor_hidden: proc() -> bool,
-	set_cursor_locked: proc(locked: bool),
-	is_cursor_locked: proc() -> bool,
+	set_mouse_locked: proc(locked: bool),
+	is_mouse_locked: proc() -> bool,
+	create_custom_cursor: proc(image: Image, hotspot: [2]int) -> (Custom_Cursor, bool),
+	set_cursor: proc(cursor: Cursor),
+	destroy_custom_cursor: proc(custom_cursor: Custom_Cursor),
 
 	is_gamepad_active: proc(gamepad: int) -> bool,
 	get_gamepad_axis: proc(gamepad: int, axis: Gamepad_Axis) -> f32,
