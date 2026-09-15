@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+import "core:log"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
@@ -504,6 +505,10 @@ main :: proc() {
 			mem.tracking_allocator_destroy(&track)
 		}
 	}
+	when ODIN_DEBUG {
+		context.logger = log.create_console_logger()
+		defer log.destroy_console_logger(context.logger)
+	}
 
 	init()
 	for step() {}
@@ -537,7 +542,7 @@ init :: proc() {
 		#load("shaders/default.vs"),
 		#load("shaders/scanlines.fs"),
 	)
-	SCANLINE_RES_LOC := SCANLINE_SHADER.constant_lookup["u_resolution"]
+	SCANLINE_RES_LOC = SCANLINE_SHADER.constant_lookup["u_resolution"]
 	k2.set_shader_constant(SCANLINE_SHADER, SCANLINE_RES_LOC, state.resolution)
 	fmt.println("scanline shader loaded")
 }
