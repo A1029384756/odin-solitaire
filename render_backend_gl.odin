@@ -28,6 +28,7 @@ RENDER_BACKEND_GL :: Render_Backend_Interface {
 
 	default_shader_vertex_source = gl_default_shader_vertex_source,
 	default_shader_fragment_source = gl_default_shader_fragment_source,
+	get_depth_clip_range = gl_get_depth_clip_range,
 }
 
 import "base:runtime"
@@ -48,6 +49,7 @@ GL_State :: struct {
 	vertex_buffer_gpu: u32,
 	textures: hm.Dynamic_Handle_Map(GL_Texture, Texture_Handle),
 	render_targets: hm.Dynamic_Handle_Map(GL_Render_Target, Render_Target_Handle),
+	depth_test: bool,
 }
 
 GL_Shader_Constant_Buffer :: struct {
@@ -95,6 +97,9 @@ GL_Render_Target :: struct {
 	framebuffer: u32,
 	width: int,
 	height: int,
+
+	// Only set up when depth testing is enabled, see GL_State.depth_test.
+	depth_renderbuffer: u32,
 }
 
 GL_Shader :: struct {
@@ -129,6 +134,7 @@ gl_init :: proc(
 	s.width = swapchain_width
 	s.height = swapchain_height
 	s.allocator = allocator
+	s.depth_test = options.depth_test
 
 	hm.dynamic_init(&s.shaders, allocator)
 	hm.dynamic_init(&s.textures, allocator)
@@ -155,6 +161,15 @@ gl_init :: proc(
 	} else {
 		gl.Disable(gl.MULTISAMPLE)
 	}
+
+	if s.depth_test {
+		gl.Enable(gl.DEPTH_TEST)
+
+		// Higher z ends up in front. GEQUAL instead of GREATER so that things drawn at the same z
+		// fall back to drawing order, like when depth testing is off.
+		gl.DepthFunc(gl.GEQUAL)
+		gl.ClearDepth(0)
+	}
 }
 
 gl_shutdown :: proc() {
@@ -176,40 +191,119 @@ gl_clear :: proc(render_target: Render_Target_Handle, color: Color) {
 
 	c := f32_color_from_color(color)
 	gl.ClearColor(c.r, c.g, c.b, c.a)
-	gl.Clear(gl.COLOR_BUFFER_BIT)
+
+	clear_mask := u32(gl.COLOR_BUFFER_BIT)
+
+	if s.depth_test {
+		// glClear of the depth buffer is gated by the depth mask, so it must be on for this to
+		// have any effect. draw() doesn't touch the mask, so this only needs setting once here.
+		gl.DepthMask(true)
+		clear_mask |= gl.DEPTH_BUFFER_BIT
+	}
+
+	gl.Clear(clear_mask)
 }
 
 gl_present :: proc() {
 	s.glue->present()
 }
 
-gl_draw :: proc(
-	shd: Shader,
-	render_target: Render_Target_Handle,
-	bound_textures: []Texture_Handle,
-	scissor: Maybe(Rect),
-	blend_mode: Blend_Mode,
-	vertex_buffer: []u8,
-) {
-	gl_shd := hm.get(&s.shaders, shd.handle)
-
-	if gl_shd == nil {
+gl_draw :: proc(vertex_buffer: []u8, draw_calls: []Draw_Call) {
+	if len(vertex_buffer) == 0 || len(draw_calls) == 0 {
 		return
 	}
 
-	switch blend_mode {
-	case .Alpha: gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
-	case .Premultiplied_Alpha: gl.BlendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+	// All the draw calls read from this one buffer. It only needs uploading once. Orphaning it
+	// first lets the driver hand us fresh memory instead of waiting for the previous frame.
+	gl.BindBuffer(gl.ARRAY_BUFFER, s.vertex_buffer_gpu)
+	gl.BufferData(gl.ARRAY_BUFFER, len(vertex_buffer), nil, gl.DYNAMIC_DRAW)
+	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(vertex_buffer), raw_data(vertex_buffer))
+	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+
+	// Changes that belong to draw calls we could not draw. They never reached GL. The next draw
+	// call we do run has to make them.
+	missed: bit_set[Draw_Call_Change]
+
+	for &call in draw_calls {
+		changed := call.changed + missed
+		gl_shd := hm.get(&s.shaders, call.shader)
+
+		if gl_shd == nil {
+			log.errorf("Trying to draw with invalid shader %v", call.shader)
+			missed = changed
+			continue
+		}
+
+		missed = {}
+
+		if .Shader in changed {
+			gl.BindVertexArray(gl_shd.vao)
+			gl.UseProgram(gl_shd.program)
+		}
+
+		if .Constants in changed {
+			gl_set_constants(call.constants, call.constants_data, gl_shd^)
+		}
+
+		if .Textures in changed {
+			gl_bind_textures(call.textures, gl_shd^)
+		}
+
+		// Only the render target and scissor setup need the render target. Skipping the lookup
+		// otherwise keeps it out of the common case, where only the texture changed.
+		rt: ^GL_Render_Target
+
+		if .Render_Target in changed || .Scissor in changed {
+			rt = hm.get(&s.render_targets, call.render_target)
+		}
+
+		if .Render_Target in changed {
+			if rt != nil {
+				gl.BindFramebuffer(gl.FRAMEBUFFER, rt.framebuffer)
+				gl.Viewport(0, 0, i32(rt.width), i32(rt.height))
+			} else {
+				gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
+				gl.Viewport(0, 0, i32(s.width), i32(s.height))
+			}
+		}
+
+		if .Blend_Mode in changed {
+			switch call.blend_mode {
+			case .Alpha: gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+			case .Premultiplied_Alpha: gl.BlendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+			case .Additive: gl.BlendFunc(gl.SRC_ALPHA, gl.ONE)
+			}
+		}
+
+		// Karl2D measures the scissor rect from the top. GL measures it from the bottom. It
+		// therefore depends on the height of the render target as well.
+		if .Scissor in changed {
+			if scissor, has_scissor := call.scissor.(Rect); has_scissor {
+				height := rt != nil ? rt.height : s.height
+				flipped_y := f32(height) - scissor.h - scissor.y
+
+				gl.Enable(gl.SCISSOR_TEST)
+				gl.Scissor(i32(scissor.x), i32(flipped_y), i32(scissor.w), i32(scissor.h))
+			} else {
+				gl.Disable(gl.SCISSOR_TEST)
+			}
+		}
+
+		gl.DrawArrays(gl.TRIANGLES, i32(call.vertex_offset/call.vertex_size), i32(call.vertex_count))
 	}
 
-	gl.BindVertexArray(gl_shd.vao)
+	gl.Disable(gl.SCISSOR_TEST)
+}
 
-	gl.UseProgram(gl_shd.program)
-	assert(len(shd.constants) == len(gl_shd.constants))
+gl_set_constants :: proc(
+	constants: []Shader_Constant_Location,
+	constants_data: []u8,
+	gl_shd: GL_Shader,
+) {
+	assert(len(constants) == len(gl_shd.constants))
 
-	cpu_data := shd.constants_data
 	for cidx in 0..<len(gl_shd.constants) {
-		cpu_loc := shd.constants[cidx]
+		cpu_loc := constants[cidx]
 
 		if cpu_loc.size == 0 {
 			continue
@@ -222,13 +316,13 @@ gl_draw :: proc(
 			gpu_buffer_info := gl_shd.constant_buffers[gpu_loc.loc]
 			gpu_data := gpu_buffer_info.buffer
 			gl.BindBuffer(gl.UNIFORM_BUFFER, gpu_data)
-			src := cpu_data[cpu_loc.offset:cpu_loc.offset+cpu_loc.size]
+			src := constants_data[cpu_loc.offset:cpu_loc.offset+cpu_loc.size]
 			gl.BufferData(gl.UNIFORM_BUFFER, len(src), raw_data(src), gl.DYNAMIC_DRAW)
 			gl.BindBufferBase(gl.UNIFORM_BUFFER, gpu_loc.loc, gpu_data)	
 
 		case .Uniform:
 			loc := i32(gpu_loc.loc)
-			ptr := (rawptr)(&cpu_data[cpu_loc.offset])
+			ptr := (rawptr)(&constants_data[cpu_loc.offset])
 			uptr := (^u32)(ptr)
 			iptr := (^i32)(ptr)
 			fptr := (^f32)(ptr)
@@ -314,56 +408,28 @@ gl_draw :: proc(
 
 			case: log.errorf("Unknown type: %x", gpu_loc.uniform_type)
 			}
-			
+
 		}
 	}
-	
-	gl.BindBuffer(gl.ARRAY_BUFFER, s.vertex_buffer_gpu)
-	gl.BufferData(gl.ARRAY_BUFFER, VERTEX_BUFFER_MAX, nil, gl.DYNAMIC_DRAW)
-	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(vertex_buffer), raw_data(vertex_buffer))
-	gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+}
 
-	if len(bound_textures) == len(gl_shd.texture_bindings) {
-		for t, t_idx in bound_textures {
-			gl_t := gl_shd.texture_bindings[t_idx]
-
-			if t := hm.get(&s.textures, t); t != nil {
-				gl.ActiveTexture(gl.TEXTURE0 + u32(t_idx))
-				gl.BindTexture(gl.TEXTURE_2D, t.id)
-				gl.Uniform1i(gl_t.loc, i32(t_idx))
-			} else {
-				gl.ActiveTexture(gl.TEXTURE0 + u32(t_idx))
-				gl.BindTexture(gl.TEXTURE_2D, 0)
-				gl.Uniform1i(gl_t.loc, i32(t_idx))
-			}
-		}
+gl_bind_textures :: proc(textures: []Texture_Handle, gl_shd: GL_Shader) {
+	if len(textures) != len(gl_shd.texture_bindings) {
+		return
 	}
 
-	rt := hm.get(&s.render_targets, render_target)
+	for t, t_idx in textures {
+		gl_t := gl_shd.texture_bindings[t_idx]
+		gl.ActiveTexture(gl.TEXTURE0 + u32(t_idx))
 
-	if rt != nil {
-		gl.BindFramebuffer(gl.FRAMEBUFFER, rt.framebuffer)
-		gl.Viewport(0, 0, i32(rt.width), i32(rt.height))
-	} else {
-		gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
-		gl.Viewport(0, 0, i32(s.width), i32(s.height))
-	}
-
-	if scissor, has_scissor := scissor.(Rect); has_scissor {
-		height: int
-		if rt != nil {
-			height = rt.height
+		if t := hm.get(&s.textures, t); t != nil {
+			gl.BindTexture(gl.TEXTURE_2D, t.id)
 		} else {
-			height = s.height
+			gl.BindTexture(gl.TEXTURE_2D, 0)
 		}
-		flipped_y := f32(height) - scissor.h - scissor.y
 
-		gl.Enable(gl.SCISSOR_TEST)
-		gl.Scissor(i32(scissor.x), i32(flipped_y), i32(scissor.w), i32(scissor.h))
+		gl.Uniform1i(gl_t.loc, i32(t_idx))
 	}
-
-	gl.DrawArrays(gl.TRIANGLES, 0, i32(len(vertex_buffer)/shd.vertex_size))
-	gl.Disable(gl.SCISSOR_TEST)
 }
 
 gl_resize_swapchain :: proc(w, h: int) {
@@ -385,7 +451,25 @@ gl_set_internal_state :: proc(state: rawptr) {
 	s = (^GL_State)(state)
 }
 
-create_texture :: proc(width: int, height: int, format: Pixel_Format, data: rawptr) -> GL_Texture {
+// GL hands out errors through a queue instead of return values, and nothing else in this backend
+// reads it, so it can hold something an earlier call left behind. Empty it, so that a check right
+// after a call only sees what that call did. The bound stops a lost context spinning here forever.
+GL_ERROR_QUEUE_DRAIN_LIMIT :: 32
+
+drain_gl_errors :: proc() {
+	for _ in 0..<GL_ERROR_QUEUE_DRAIN_LIMIT {
+		if gl.GetError() == gl.NO_ERROR {
+			return
+		}
+	}
+}
+
+create_texture :: proc(
+	width: int,
+	height: int,
+	format: Pixel_Format,
+	data: rawptr,
+) -> (GL_Texture, bool) {
 	id: u32
 	gl.GenTextures(1, &id)
 	gl.BindTexture(gl.TEXTURE_2D, id)
@@ -395,35 +479,68 @@ create_texture :: proc(width: int, height: int, format: Pixel_Format, data: rawp
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
 
+	drain_gl_errors()
+
 	pf := gl_translate_pixel_format(format)
 	gl.TexImage2D(gl.TEXTURE_2D, 0, pf, i32(width), i32(height), 0, gl.RGBA, gl.UNSIGNED_BYTE, data)
+
+	// This is where a texture that is too big for the GPU, or one the GPU has no memory left for,
+	// gets caught. Without the check it would become a texture that silently draws nothing.
+	if err := gl.GetError(); err != gl.NO_ERROR {
+		log.errorf("Failed creating %v x %v texture. GL error: 0x%x", width, height, err)
+		gl.DeleteTextures(1, &id)
+		return {}, false
+	}
 
 	return {
 		id = id,
 		format = format,
-	}
+	}, true
 }
 
-gl_create_texture :: proc(width: int, height: int, format: Pixel_Format) -> Texture_Handle {
-	tex, tex_add_err := hm.add(&s.textures, create_texture(width, height, format, nil))
+gl_create_texture :: proc(
+	width: int,
+	height: int,
+	format: Pixel_Format,
+) -> (Texture_Handle, bool) {
+	gl_tex, gl_tex_ok := create_texture(width, height, format, nil)
+
+	if !gl_tex_ok {
+		return {}, false
+	}
+
+	tex, tex_add_err := hm.add(&s.textures, gl_tex)
 
 	if tex_add_err != nil {
 		log.errorf("Failed to create texture. Error: %v", tex_add_err)
-		return {}
+		gl.DeleteTextures(1, &gl_tex.id)
+		return {}, false
 	}
 
-	return tex
+	return tex, true
 }
 
-gl_load_texture :: proc(data: []u8, width: int, height: int, format: Pixel_Format) -> Texture_Handle {
-	tex, tex_add_err := hm.add(&s.textures, create_texture(width, height, format, raw_data(data)))
+gl_load_texture :: proc(
+	data: []u8,
+	width: int,
+	height: int,
+	format: Pixel_Format,
+) -> (Texture_Handle, bool) {
+	gl_tex, gl_tex_ok := create_texture(width, height, format, raw_data(data))
+
+	if !gl_tex_ok {
+		return {}, false
+	}
+
+	tex, tex_add_err := hm.add(&s.textures, gl_tex)
 
 	if tex_add_err != nil {
 		log.errorf("Failed to load texture. Error: %v", tex_add_err)
-		return {}
+		gl.DeleteTextures(1, &gl_tex.id)
+		return {}, false
 	}
 
-	return tex
+	return tex, true
 }
 
 gl_update_texture :: proc(th: Texture_Handle, data: []u8, rect: Rect) -> bool {
@@ -459,8 +576,16 @@ gl_texture_needs_vertical_flip :: proc(th: Texture_Handle) -> bool {
 	return tex.needs_vertical_flip
 }
 
-gl_create_render_texture :: proc(width: int, height: int) -> (Texture_Handle, Render_Target_Handle) {
-	texture := create_texture(width, height, .RGBA_32_Float, nil)
+gl_create_render_texture :: proc(
+	width: int,
+	height: int,
+) -> (Texture_Handle, Render_Target_Handle, bool) {
+	texture, texture_ok := create_texture(width, height, .RGBA_32_Float, nil)
+
+	if !texture_ok {
+		return {}, {}, false
+	}
+
 	texture.needs_vertical_flip = true
 	
 	framebuffer: u32
@@ -471,9 +596,30 @@ gl_create_render_texture :: proc(width: int, height: int) -> (Texture_Handle, Re
 	draw_buffers := u32(gl.COLOR_ATTACHMENT0)
 	gl.DrawBuffers(1, &draw_buffers)
 
+	depth_renderbuffer: u32
+
+	if s.depth_test {
+		gl.GenRenderbuffers(1, &depth_renderbuffer)
+		gl.BindRenderbuffer(gl.RENDERBUFFER, depth_renderbuffer)
+		gl.RenderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, i32(width), i32(height))
+
+		gl.FramebufferRenderbuffer(
+			gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth_renderbuffer,
+		)
+	}
+
 	if gl.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
 		log.errorf("Failed creating frame buffer of size %v x %v", width, height)
-		return {}, {}
+		gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
+		gl.BindRenderbuffer(gl.RENDERBUFFER, 0)
+		gl.DeleteTextures(1, &texture.id)
+		gl.DeleteFramebuffers(1, &framebuffer)
+
+		if s.depth_test {
+			gl.DeleteRenderbuffers(1, &depth_renderbuffer)
+		}
+
+		return {}, {}, false
 	}
 
 	gl.BindFramebuffer(gl.FRAMEBUFFER, 0)
@@ -483,27 +629,47 @@ gl_create_render_texture :: proc(width: int, height: int) -> (Texture_Handle, Re
 		framebuffer = framebuffer,
 		width = width,
 		height = height,
+		depth_renderbuffer = depth_renderbuffer,
 	}
 
 	tex_handle, tex_add_err := hm.add(&s.textures, texture)
 
 	if tex_add_err != nil {
 		log.errorf("Failed to create texture. Error: %v", tex_add_err)
-		return {}, {}
+		gl.DeleteTextures(1, &texture.id)
+		gl.DeleteFramebuffers(1, &framebuffer)
+
+		if s.depth_test {
+			gl.DeleteRenderbuffers(1, &depth_renderbuffer)
+		}
+
+		return {}, {}, false
 	}
 
 	rt_handle, rt_add_err := hm.add(&s.render_targets, rt)
 	if rt_add_err != nil {
 		log.errorf("Failed to create render target. Error: %v", rt_add_err)
-		return {}, {}
+		hm.remove(&s.textures, tex_handle)
+		gl.DeleteTextures(1, &texture.id)
+		gl.DeleteFramebuffers(1, &framebuffer)
+
+		if s.depth_test {
+			gl.DeleteRenderbuffers(1, &depth_renderbuffer)
+		}
+
+		return {}, {}, false
 	}
 
-	return tex_handle, rt_handle
+	return tex_handle, rt_handle, true
 }
 
 gl_destroy_render_target :: proc(render_target: Render_Target_Handle) {
 	if rt := hm.get(&s.render_targets, render_target); rt != nil {
 		gl.DeleteFramebuffers(1, &rt.framebuffer)
+
+		if rt.depth_renderbuffer != 0 {
+			gl.DeleteRenderbuffers(1, &rt.depth_renderbuffer)
+		}
 	}
 }
 
@@ -579,28 +745,42 @@ link_shader :: proc(vs_shader: u32, fs_shader: u32, err_buf: []u8, err_msg: ^str
 	return program_id, true
 }
 
-gl_load_shader :: proc(vs_source: []byte, fs_source: []byte, desc_allocator := frame_allocator, layout_formats: []Pixel_Format = {}) -> (handle: Shader_Handle, desc: Shader_Desc) {
+gl_load_shader :: proc(
+	vs_source: []byte,
+	fs_source: []byte,
+	desc_allocator := frame_allocator,
+	layout_formats: []Pixel_Format = {},
+) -> (
+	_handle: Shader_Handle,
+	_desc: Shader_Desc,
+	_ok: bool,
+) {
+	// Built up as the shaders are reflected over, and only handed back once everything worked.
+	// Filling in a named return value instead would mean the naked returns below hand out a
+	// half-built description alongside their `false`.
+	desc: Shader_Desc
+
 	@static err: [1024]u8
 	err_msg: string
 	vs_shader, vs_shader_ok := compile_shader_from_source(vs_source, gl.Shader_Type.VERTEX_SHADER, err[:], &err_msg)
 
 	if !vs_shader_ok  {
 		log.error(err_msg)
-		return {}, {}
+		return
 	}
 	
 	fs_shader, fs_shader_ok := compile_shader_from_source(fs_source, gl.Shader_Type.FRAGMENT_SHADER, err[:], &err_msg)
 
 	if !fs_shader_ok {
 		log.error(err_msg)
-		return {}, {}
+		return
 	}
 
 	program, program_ok := link_shader(vs_shader, fs_shader, err[:], &err_msg)
 
 	if !program_ok {
 		log.error(err_msg)
-		return {}, {}
+		return
 	}
 
 	stride: int
@@ -815,10 +995,10 @@ gl_load_shader :: proc(vs_source: []byte, fs_source: []byte, desc_allocator := f
 	shader_handle, shader_add_err := hm.add(&s.shaders, gl_shd)
 	if shader_add_err != nil {
 		log.errorf("Failed to add shader. Error: %v", shader_add_err)
-		return SHADER_NONE, {}
+		return
 	}
 
-	return shader_handle, desc
+	return shader_handle, desc, true
 }
 
 // I might have missed something. But it doesn't seem like GL gives you this information.
@@ -942,3 +1122,6 @@ gl_default_shader_fragment_source :: proc() -> []byte {
 	return fragment_source
 }
 
+gl_get_depth_clip_range :: proc() -> (min: f32, max: f32) {
+	return -1, 1
+}

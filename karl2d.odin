@@ -11,9 +11,10 @@ import "core:slice"
 import "core:strings"
 import "core:reflect"
 import "core:time"
+import "core:sync"
 import "core:encoding/endian"
 
-import fs "vendor:fontstash"
+import fc "font_cache"
 import stbv "vendor:stb/vorbis"
 import stbtt "vendor:stb/truetype"
 import stbrp "vendor:stb/rect_pack"
@@ -30,48 +31,46 @@ import hm "core:container/handle_map"
 // SETUP, WINDOW MANAGEMENT AND FRAME MANAGEMENT //
 //-----------------------------------------------//
 
-// Opens a window and initializes some internal state. The internal state will use `allocator` for
-// all dynamically allocated memory.
+// Opens a window, initializes the renderer and starts up the audio systems.
 //
 // `screen_width` and `screen_height` refer to the resolution of the drawable area of the window.
 // The window might be slightly larger due to borders and headers. The true width and height will be
 // scaled up by the scaling setting in the operating system.
 //
+// Karl2D will use `allocator` for all dynamically allocated memory that is needed more than one
+// frame. For single frame allocations the library uses an internal "frame allocator".
+// The frame allocator is cleared when `update()` runs.
+//
+// Call `init` before using Karl2D procedures that depend on runtime state, such as window,
+// drawing, input, audio, texture, font and shader procedures. Pure helper procedures, types and
+// constants can be used before `init`.
+//
 // The return value is a pointer to Karl2D's internal state. You can restore this state later using
-// `set_internal_state()`. This is useful for example when doing game code reload, as the state may
-// get reset when the library is reloaded. You can safely ignore the return value if you have no
-// such needs.
+// `set_internal_state()`. This is useful when doing hot reload, as the internal state pointer gets
+// reset when the library is reloaded. You can safely ignore the return value if you have no such
+// needs.
+//
+// THREAD INFO: The value of `audio_thread_logger` will be stored for later use by the audio thread.
+// Make sure your logger is thread safe (the file/console loggers in Odin are).
 init :: proc(
 	screen_width: int,
 	screen_height: int,
 	window_title: string,
 	options := Init_Options {},
 	allocator := context.allocator,
-	loc := #caller_location
+	loc := #caller_location,
+	audio_thread_logger := context.logger,
 ) -> ^State {
 	assert(s == nil, "Don't call 'init' twice.")
 	s = new(State, allocator, loc)
 	s.allocator = allocator
+	s.audio_thread_logger = audio_thread_logger
 
 	// This is the same type of arena as the default temp allocator. This arena is for allocations
 	// that have a lifetime of "one frame". They are valid until you call `present()`, at which
 	// point the frame allocator is cleared.
 	s.frame_allocator = runtime.arena_allocator(&s.frame_arena)
 	frame_allocator = s.frame_allocator
-
-	when ODIN_OS == .Windows {
-		s.platform = PLATFORM_WINDOWS
-	} else when ODIN_OS == .JS {
-		s.platform = PLATFORM_WEB
-	} else when ODIN_OS == .Linux {
-		s.platform = PLATFORM_LINUX
-	} else when ODIN_OS == .Darwin {
-		s.platform = PLATFORM_MAC
-	} else {
-		#panic("Unsupported platform")
-	}
-
-	pf = s.platform
 
 	// We allocate memory for the windowing backend and pass the blob of memory to it.
 	platform_state_alloc_error: runtime.Allocator_Error
@@ -89,6 +88,14 @@ init :: proc(
 
 	pf.init(s.platform_state, screen_width, screen_height, window_title, options, s.allocator)
 
+	// The window has an icon from the start this way. A game replaces it with its own by calling
+	// `set_window_icon`. 256 pixels covers every size an OS shows an icon at. The web favicon only
+	// ever shows small, and a smaller image there keeps the PNG data URI it turns into small too.
+	DEFAULT_ICON_SIZE :: 256 when ODIN_OS != .JS else 64
+	default_icon := make_karl2d_icon(DEFAULT_ICON_SIZE)
+	pf.set_window_icon(default_icon, false)
+	destroy_image(default_icon)
+
 	// This is an OS-independent handle that we can pass to any rendering backend.
 	window_render_glue := pf.get_window_render_glue()
 
@@ -99,8 +106,34 @@ init :: proc(
 	rb_alloc_error: runtime.Allocator_Error
 	s.render_backend_state, rb_alloc_error = mem.alloc(rb.state_size(), allocator = s.allocator)
 	log.assertf(rb_alloc_error == nil, "Failed allocating memory for rendering backend: %v", rb_alloc_error)
-	s.proj_matrix = make_default_projection(pf.get_screen_width(), pf.get_screen_height())
+
+	s.depth_test = options.depth_test
+	s.depth_range_min = options.depth_range_min
+	s.depth_range_max = options.depth_range_max
+
+	if !s.depth_test || (s.depth_range_min == 0 && s.depth_range_max == 0) {
+		// The range only means something when depth testing is on. When it is off, every vertex
+		// gets a z of 0, so we force the default range: a range that does not contain 0 would
+		// make the GPU discard everything, showing nothing at all.
+		s.depth_range_min = DEPTH_RANGE_DEFAULT_MIN
+		s.depth_range_max = DEPTH_RANGE_DEFAULT_MAX
+	} else if s.depth_range_min == s.depth_range_max {
+		log.errorf(
+			"depth_range_min and depth_range_max must differ, both were %v. Using the default range.",
+			s.depth_range_min,
+		)
+		s.depth_range_min = DEPTH_RANGE_DEFAULT_MIN
+		s.depth_range_max = DEPTH_RANGE_DEFAULT_MAX
+	}
+
+	s.proj_matrix = make_default_projection(
+		pf.get_screen_width(),
+		pf.get_screen_height(),
+		_camera_flip_y(),
+	)
+
 	s.view_matrix = 1
+	_update_view_projection()
 
 	// Boot up the render backend. It will render into our previously created window.
 	rb.init(
@@ -116,41 +149,88 @@ init :: proc(
 	// render backend each frame as part of `draw_current_batch()`.
 	s.vertex_buffer_cpu = make([]u8, VERTEX_BUFFER_MAX, s.allocator, loc)
 
+	// New draw calls are created when drawing settings change. One batch can have multiple draw
+	// calls. See `draw_current_batch` to see how the draw calls are sent off to the rendering
+	// backend.
+	//
+	// The arena is emptied when the draw calls array is emptied. It exists because draw calls cache
+	// some shader constant values etc, those are put into the arena.
+	s.batch_draw_calls = make([dynamic]Draw_Call, s.allocator, loc)
+	batch_arena_err := runtime.arena_init(&s.batch_arena, BATCH_ARENA_BLOCK_SIZE, s.allocator, loc)
+	log.assertf(batch_arena_err == nil, "Failed allocating batch arena: %v", batch_arena_err)
+	s.batch_allocator = runtime.arena_allocator(&s.batch_arena)
+
 	// The shapes drawing texture is sampled when any shape is drawn. This way we can use the same
 	// shader for textured drawing and shape drawing. It's just a white box.
 	white_rect: [16*16*4]u8
 	slice.fill(white_rect[:], 255)
-	s.shape_drawing_texture = rb.load_texture(white_rect[:], 16, 16, .RGBA_8_Norm)
+	shape_drawing_texture, shape_drawing_texture_ok := rb.load_texture(
+		white_rect[:],
+		16,
+		16,
+		.RGBA_8_Norm,
+	)
+	log.assertf(shape_drawing_texture_ok, "Failed loading shape drawing texture")
+	s.shape_drawing_texture = shape_drawing_texture
 
 	// The default shader will arrive in a different format depending on backend. GLSL for GL,
 	// HLSL for d3d etc.
-	s.default_shader = load_shader_from_bytes(rb.default_shader_vertex_source(), rb.default_shader_fragment_source())
-	s.batch_shader = s.default_shader
-
-	// FontStash enables us to bake fonts from TTF files on-the-fly.
-	fs.Init(&s.fs, FONT_DEFAULT_ATLAS_SIZE, FONT_DEFAULT_ATLAS_SIZE, .TOPLEFT)
-	fs.SetAlignVertical(&s.fs, .TOP)
+	s.default_shader = load_shader_from_bytes(
+		rb.default_shader_vertex_source(),
+		rb.default_shader_fragment_source(),
+	)
+	s.current_shader = s.default_shader
 
 	// Dummy element so font with index 0 means 'no font'.
+	s.fonts = make([dynamic]Font_Data, s.allocator)
 	append_nothing(&s.fonts)
-
 	default_font := load_dynamic_font_from_bytes(DEFAULT_FONT_DATA)
 	log.assertf(default_font == FONT_DEFAULT, "Default font must be at index %i", FONT_DEFAULT)
-	_set_font(FONT_DEFAULT)
+
+	s.events = make([dynamic]Event, s.allocator)
+	s.typed_runes = make([dynamic]rune, s.allocator)
+	s.mouse_touch_emulation = .Touch_To_Mouse
+	s.touch_to_mouse_id = TOUCH_TO_MOUSE_ID_NONE
 
 	// Audio
 	{
 		s.audio_backend = AUDIO_BACKEND
 		ab = s.audio_backend
 
+		mem.arena_init(
+			&s.audio_thread_temp_allocator_arena,
+			s.audio_thread_temp_allocator_buffer[:],
+		)
+
 		audio_alloc_error: runtime.Allocator_Error
 		s.audio_backend_state, audio_alloc_error = mem.alloc(ab.state_size(), allocator = s.allocator)
 		log.assertf(audio_alloc_error == nil, "Failed allocating memory for audio backend: %v", audio_alloc_error)
-		ab.init(s.audio_backend_state, s.allocator)
-		hm.dynamic_init(&s.playing_audio_buffers, s.allocator)
-		hm.dynamic_init(&s.audio_buffers, s.allocator)
+
 		hm.dynamic_init(&s.sounds, s.allocator)
+		hm.dynamic_init(&s.audio_buffers, s.allocator)
 		hm.dynamic_init(&s.audio_streams, s.allocator)
+		hm.dynamic_init(&s.audio_buses, s.allocator)
+		s.master_bus.target_settings = DEFAULT_AUDIO_BUS_SETTINGS
+		s.master_bus.current_settings = DEFAULT_AUDIO_BUS_SETTINGS
+
+		audio_init_ok := ab.init(s.audio_backend_state)
+
+		if !audio_init_ok {
+			log.error("Failed initializing audio backend. Sounds will play silently through the 'nil audio backend'")
+			free(s.audio_backend_state, s.allocator)
+			s.audio_backend = AUDIO_BACKEND_NIL
+			ab = s.audio_backend
+			s.audio_backend_state, audio_alloc_error = mem.alloc(
+				ab.state_size(),
+				allocator = s.allocator,
+			)
+			log.assertf(
+				audio_alloc_error == nil,
+				"Failed allocating memory for audio backend: %v",
+				audio_alloc_error,
+			)
+			ab.init(s.audio_backend_state)
+		}
 	}
 
 	return s
@@ -171,8 +251,8 @@ init :: proc(
 //// for {
 ////     k2.reset_frame_allocator()
 ////     k2.calculate_frame_time()
+////     k2.update_audio()
 ////     k2.process_events()
-////     k2.update_audio_mixer()
 ////     
 ////     k2.clear(k2.BLUE)
 ////     k2.present()
@@ -182,19 +262,21 @@ init :: proc(
 ////     }
 //// }
 update :: proc() -> bool {
+	assert_initialized()
 	reset_frame_allocator()
 	calculate_frame_time()
-	update_audio_mixer()
+	update_audio()
 	process_events()
 	return !close_window_requested()
 }
 
-// Returns true the user has pressed the close button on the window, or used a key stroke such as
-// ALT+F4 on Windows. The application can decide if it wants to shut down or if it wants to show
+// Returns `true` if the user has pressed the close button on the window, or used a key stroke such
+// as ALT+F4 on Windows. The application can decide if it wants to shut down or if it wants to show
 // some kind of confirmation dialogue.
 //
 // Called by `update`, but can be called manually if you need more control.
 close_window_requested :: proc() -> bool {
+	assert_initialized()
 	return s.close_window_requested
 }
 
@@ -204,11 +286,11 @@ shutdown :: proc() {
 
 	// Audio
 	{
-		hm.dynamic_destroy(&s.audio_streams)
 		ab.shutdown()
-		hm.dynamic_destroy(&s.playing_audio_buffers)
+		hm.dynamic_destroy(&s.audio_streams)
 		hm.dynamic_destroy(&s.sounds)
 		hm.dynamic_destroy(&s.audio_buffers)
+		hm.dynamic_destroy(&s.audio_buses)
 		free(s.audio_backend_state, s.allocator)
 	}
 
@@ -218,11 +300,14 @@ shutdown :: proc() {
 	destroy_shader(s.default_shader)
 	rb.shutdown()
 	delete(s.vertex_buffer_cpu, s.allocator)
+	delete(s.batch_draw_calls)
+	runtime.arena_destroy(&s.batch_arena)
 
 	pf.shutdown()
 
-	fs.Destroy(&s.fs)
 	delete(s.fonts)
+
+	delete(s.typed_runes)
 
 	a := s.allocator
 	free(s.platform_state, a)
@@ -235,8 +320,9 @@ shutdown :: proc() {
 // have set a Render Texture using the `set_render_texture` procedure, then that Render Texture will
 // be cleared instead.
 clear :: proc(color: Color) {
+	assert_initialized()
 	draw_current_batch()
-	rb.clear(s.batch_render_target, color)
+	rb.clear(s.current_render_target, color)
 }
 
 // The library may do some internal allocations that have the lifetime of a single frame. This
@@ -244,14 +330,16 @@ clear :: proc(color: Color) {
 //
 // Called as part of `update`, but can be called manually if you need more control.
 reset_frame_allocator :: proc() {
+	assert_initialized()
 	free_all(s.frame_allocator)
 }
 
-// Calculates how long the previous frame took and how it has been since the application started.
-// You can fetch the calculated values using `get_frame_time` and `get_time`.
+// Calculates how long the previous frame took and how long it has been since the application
+// started. You can fetch the calculated values using `get_frame_time` and `get_time`.
 //
 // Called as part of `update`, but can be called manually if you need more control.
 calculate_frame_time :: proc() {
+	assert_initialized()
 	now := time.now()
 
 	if s.prev_frame_time != {} {
@@ -268,8 +356,8 @@ calculate_frame_time :: proc() {
 	s.time = time.duration_seconds(time.since(s.start_time))
 }
 
-// Present the drawn stuff to the player. Also known as "flipping the backbuffer": Call at end of
-// frame to make everything you've drawn appear on the screen.
+// Present the graphics drawn on the screen to the player. Also known as "flipping the backbuffer":
+// Call at end of frame to make everything you've drawn appear on the screen.
 //
 // When you draw using for example `draw_texture`, then that stuff is drawn to an invisible texture
 // called a "backbuffer". This makes sure that we don't see half-drawn frames. So when you are happy
@@ -278,6 +366,7 @@ calculate_frame_time :: proc() {
 // WebGL note: WebGL does the backbuffer flipping automatically. But you should still call this to
 // make sure that all rendering has been sent off to the GPU (as it calls `draw_current_batch()`).
 present :: proc() {
+	assert_initialized()
 	draw_current_batch()
 	rb.present()
 }
@@ -288,17 +377,117 @@ present :: proc() {
 //
 // Called by `update`, but can be called manually if you need more control.
 process_events :: proc() {
+	assert_initialized()
 	s.key_went_up = {}
 	s.key_went_down = {}
+	s.key_repeat = {}
 	s.mouse_button_went_up = {}
 	s.mouse_button_went_down = {}
 	s.gamepad_button_went_up = {}
 	s.gamepad_button_went_down = {}
 	s.mouse_delta = {}
 	s.mouse_wheel_delta = 0
+	s.mouse_wheel_delta_horizontal = 0
+
+	// Drop touches that ended last frame, clear the per-frame flags on the rest.
+	#reverse for &t, i in s.touches {
+		if t.went_up {
+			unordered_remove(&s.touches, i)
+			continue
+		}
+
+		t.went_down = false
+		t.delta = {}
+	}
 
 	runtime.clear(&s.events)
+	runtime.clear(&s.typed_runes)
 	pf.get_events(&s.events)
+
+	switch s.mouse_touch_emulation {
+	case .None:
+
+	case .Touch_To_Mouse:
+		num_platform_events := len(s.events)
+		touches_down := len(s.touches)
+
+		for i in 0..<num_platform_events {
+			#partial switch e in s.events[i] {
+			case Event_Touch_Went_Down:
+				if touches_down == 0 {
+					s.touch_to_mouse_id = e.id
+					append(&s.events, Event_Mouse_Teleported { position = e.position })
+					append(&s.events, Event_Mouse_Button_Went_Down { button = .Left })
+				}
+
+				touches_down += 1
+
+			case Event_Touch_Moved:
+				if e.id == s.touch_to_mouse_id {
+					append(&s.events, Event_Mouse_Move { position = e.position })
+				}
+
+			case Event_Touch_Went_Up:
+				touches_down = max(touches_down - 1, 0)
+
+				if e.id == s.touch_to_mouse_id {
+					s.touch_to_mouse_id = TOUCH_TO_MOUSE_ID_NONE
+					append(&s.events, Event_Mouse_Move { position = e.position })
+					append(&s.events, Event_Mouse_Button_Went_Up { button = .Left })
+				}
+
+			case Event_Touch_Cancelled:
+				touches_down = max(touches_down - 1, 0)
+
+				if e.id == s.touch_to_mouse_id {
+					s.touch_to_mouse_id = TOUCH_TO_MOUSE_ID_NONE
+					append(&s.events, Event_Mouse_Button_Went_Up { button = .Left })
+				}
+			}
+		}
+
+	case .Mouse_To_Touch:
+		num_platform_events := len(s.events)
+		mouse_position := s.mouse_position
+		touch_is_down := _find_touch(EMULATED_TOUCH_ID) != nil
+		touch_ended_this_frame := false
+
+		for i in 0..<num_platform_events {
+			#partial switch e in s.events[i] {
+			case Event_Mouse_Move:
+				mouse_position = e.position
+
+				if touch_is_down {
+					append(&s.events, Event_Touch_Moved {
+						id = EMULATED_TOUCH_ID,
+						position = e.position,
+					})
+				}
+
+			case Event_Mouse_Teleported:
+				mouse_position = e.position
+
+			case Event_Mouse_Button_Went_Down:
+				if e.button == .Left && !touch_is_down && !touch_ended_this_frame {
+					touch_is_down = true
+					append(&s.events, Event_Touch_Went_Down {
+						id = EMULATED_TOUCH_ID,
+						position = mouse_position,
+					})
+				}
+
+			case Event_Mouse_Button_Went_Up:
+				if e.button == .Left && touch_is_down {
+					touch_is_down = false
+					touch_ended_this_frame = true
+					append(&s.events, Event_Touch_Went_Up {
+						id = EMULATED_TOUCH_ID,
+						position = mouse_position,
+					})
+				}
+			}
+		}
+	}
 
 	for &event in s.events {
 		switch &e in event {
@@ -313,6 +502,9 @@ process_events :: proc() {
 			s.key_went_up[e.key] = true
 			s.key_is_held[e.key] = false
 
+		case Event_Key_Repeat:
+			s.key_repeat[e.key] = true
+
 		case Event_Mouse_Button_Went_Down:
 			s.mouse_button_went_down[e.button] = true
 			s.mouse_button_is_held[e.button] = true
@@ -321,13 +513,15 @@ process_events :: proc() {
 			s.mouse_button_went_up[e.button] = true
 			s.mouse_button_is_held[e.button] = false
 
+		case Event_Typed_Rune:
+			append(&s.typed_runes, e.typed)
+
 		case Event_Mouse_Move:
 			prev_pos := s.mouse_position
-
 			s.mouse_position.x = e.position.x
 			s.mouse_position.y = e.position.y
 
-			s.mouse_delta = s.mouse_position - prev_pos
+			s.mouse_delta += s.mouse_position - prev_pos
 
 		case Event_Mouse_Teleported:
 			s.mouse_position.x = e.position.x
@@ -335,6 +529,40 @@ process_events :: proc() {
 
 		case Event_Mouse_Wheel:
 			s.mouse_wheel_delta = e.delta
+
+		case Event_Mouse_Wheel_Horizontal:
+			s.mouse_wheel_delta_horizontal = e.delta
+
+		case Event_Touch_Went_Down:
+			appended := append(&s.touches, Touch {
+				id = e.id,
+				position = e.position,
+				went_down = true,
+			})
+
+			if appended == 0 {
+				log.debugf("Dropped a touch, already tracking the maximum of %v touches", MAX_TOUCHES)
+			}
+
+		case Event_Touch_Moved:
+			if t := _find_touch(e.id); t != nil {
+				t.delta += e.position - t.position
+				t.position = e.position
+			}
+
+		case Event_Touch_Went_Up:
+			if t := _find_touch(e.id); t != nil {
+				t.delta += e.position - t.position
+				t.position = e.position
+				t.went_up = true
+			}
+
+		case Event_Touch_Cancelled:
+			if t := _find_touch(e.id); t != nil {
+				// Position and delta are left as they are, see `Event_Touch_Cancelled`.
+				t.went_up = true
+				t.cancelled = true
+			}
 
 		case Event_Gamepad_Button_Went_Down:
 			if e.gamepad < MAX_GAMEPADS {
@@ -349,8 +577,11 @@ process_events :: proc() {
 			}
 
 		case Event_Screen_Resize:
+			// Recorded draw calls were meant for the old swapchain size.
+			draw_current_batch()
 			rb.resize_swapchain(e.width, e.height)
-			s.proj_matrix = make_default_projection(e.width, e.height)
+			s.proj_matrix = make_default_projection(e.width, e.height, _camera_flip_y())
+			_update_view_projection()
 
 		case Event_Window_Focused:			
 
@@ -378,7 +609,17 @@ process_events :: proc() {
 				}
 			}
 
+			for &t in s.touches {
+				if !t.went_up {
+					t.went_up = true
+					t.cancelled = true
+				}
+			}
+
+			s.touch_to_mouse_id = TOUCH_TO_MOUSE_ID_NONE
+
 		case Event_Window_Scale_Changed:
+			draw_current_batch()
 			rb.resize_swapchain(e.screen_width, e.screen_height)
 		}
 	}
@@ -395,6 +636,7 @@ process_events :: proc() {
 // Warning: The returned slice is only valid during the current frame! You can make a clone of it
 // using the `slice.clone` procedure (import `core:slice`).
 get_events :: proc() -> []Event {
+	assert_initialized()
 	return s.events[:]
 }
 
@@ -402,6 +644,7 @@ get_events :: proc() -> []Event {
 //
 // This value is updated when `calculate_frame_time()` runs (which is also called by `update()`).
 get_frame_time :: proc() -> f32 {
+	assert_initialized()
 	return s.frame_time
 }
 
@@ -410,33 +653,42 @@ get_frame_time :: proc() -> f32 {
 //
 // This value is updated when `calculate_frame_time()` runs (which is also called by `update()`).
 get_time :: proc() -> f64 {
+	assert_initialized()
 	return s.time
 }
 
 // Resize the drawing area of the window (the screen) to a new size. While the user cannot resize
 // windows with `window_mode == .Windowed_Resizable`, this procedure is able to resize such windows.
 set_screen_size :: proc(width: int, height: int) {
+	assert_initialized()
+
+	// Recorded draw calls were meant for the old screen size.
+	draw_current_batch()
 	pf.set_screen_size(width, height)
-	rb.resize_swapchain(width, height)
+	rb.resize_swapchain(pf.get_screen_width(), pf.get_screen_height())
 }
 
 // Gets the width of the drawing area within the window.
 get_screen_width :: proc() -> int {
+	assert_initialized()
 	return pf.get_screen_width()
 }
 
 // Gets the height of the drawing area within the window.
 get_screen_height :: proc() -> int  {
+	assert_initialized()
 	return pf.get_screen_height()
 }
 
 // Gets the screen width and height as a 2D vector.
 get_screen_size :: proc() -> Vec2 {
+	assert_initialized()
 	return { f32(pf.get_screen_width()), f32(pf.get_screen_height()) }
 }
 
 // Change the window title.
 set_window_title :: proc(title: string) {
+	assert_initialized()
 	pf.set_window_title(title)
 }
 
@@ -444,7 +696,16 @@ set_window_title :: proc(title: string) {
 //
 // This does nothing for web builds.
 set_window_position :: proc(x: int, y: int) {
+	assert_initialized()
 	pf.set_window_position(x, y)
+}
+
+// Gets the window position in the same coordinate system used by `set_window_position`.
+//
+// This returns {} for web and Wayland builds.
+get_window_position :: proc() -> Vec2 {
+	assert_initialized()
+	return pf.get_window_position()
 }
 
 // Fetch the scale of the window. This usually comes from some DPI scaling setting in the OS.
@@ -454,81 +715,63 @@ set_window_position :: proc(x: int, y: int) {
 // wanted resolution by the scale and send it into `set_screen_size`. You can use a camera and set
 // the zoom to the window scale in order to make things the same percieved size.
 get_window_scale :: proc() -> f32 {
+	assert_initialized()
 	return pf.get_window_scale()
 }
 
 // Use to change between windowed mode, resizable windowed mode and fullscreen
 set_window_mode :: proc(window_mode: Window_Mode) {
+	assert_initialized()
 	pf.set_window_mode(window_mode)
 }
 
-// Flushes the current batch. This sends off everything to the GPU that has been queued in the
-// current batch. Normally, you do not need to do this manually. It is done automatically when these
-// procedures run:
-// 
-// - present
-// - set_camera
-// - set_shader
-// - set_shader_constant
-// - set_scissor_rect
-// - set_blend_mode
-// - set_render_texture
-// - clear
-// - draw_texture_* IF previous draw did not use the same texture (1)
-// - draw_rect_*, draw_circle_*, draw_line IF previous draw did not use the shapes drawing texture (2)
-// 
-// (1) When drawing textures, the current texture is fed into the active shader. Everything within
-//     the same batch must use the same texture. So drawing with a new texture forces the current to
-//     be drawn. You can combine several textures into an atlas to get bigger batches.
+// Sets the icon shown in the titlebar and the OS's program switcher bar. Load the image using for
+// example `k2.load_image_from_file`.
 //
-// (2) In order to use the same shader for shapes drawing and textured drawing, the shapes drawing
-//     uses a blank, white texture. For the same reasons as (1), drawing something else than shapes
-//     before drawing a shape will break up the batches. In a future update I'll add so that you can
-//     set your own shapes drawing texture, making it possible to combine it with a bigger atlas.
+// The data of `image` is copied, so you can destroy it after running this.
 //
-// The batch has maximum size of VERTEX_BUFFER_MAX bytes. The shader dictates how big a vertex is
-// so the maximum number of vertices that can be drawn in each batch is
-// VERTEX_BUFFER_MAX / shader.vertex_size
+// On web this modifies the icon shown on the tab.
+//
+// Returns `true` if the icon was set.
+set_window_icon :: proc(image: Image) -> bool {
+	assert_initialized()
+
+	if image.width <= 0 || image.height <= 0 {
+		log.error("Invalid icon image: height or width is zero or negative")
+		return false
+	}
+
+	if len(image.pixels) != image.width*image.height {
+		log.error("Invalid icon image: the pixels array is not of size image.width*image.height")
+		return false
+	}
+
+	return pf.set_window_icon(image, true)
+}
+
+// Flushes the current batch. A batch consists of a number of draw calls and a vertex buffer. This
+// procedure sends all that off to the rendering backend for drawing. Normally, you do not need to
+// call this procedure manually. It is done automatically when `present` or `clear` run. It can also
+// happen when you destroy a resource such as a texture or shader that is used in the current
+// batch.
+//
+// All the draw calls of a batch share a vertex buffer of VERTEX_BUFFER_MAX bytes. The shader
+// dictates how big a vertex is. The maximum number of vertices in a batch is therefore
+// `VERTEX_BUFFER_MAX / shader.vertex_size`. Running out of room flushes the batch automatically.
 draw_current_batch :: proc() {
-	if s.vertex_buffer_cpu_used == 0 {
-		return
+	_finish_draw_call()
+
+	if len(s.batch_draw_calls) > 0 {
+		_update_font_atlases()
+		rb.draw(s.vertex_buffer_cpu[:s.vertex_buffer_cpu_used], s.batch_draw_calls[:])
+		runtime.clear(&s.batch_draw_calls)
 	}
 
-	_update_font(s.batch_font)
-
-	shader := s.batch_shader
-
-	view_projection := s.proj_matrix * s.view_matrix
-	for mloc, builtin in shader.constant_builtin_locations {
-		constant, constant_ok := mloc.?
-
-		if !constant_ok {
-			continue
-		}
-
-		switch builtin {
-		case .View_Projection_Matrix:
-			if constant.size == size_of(view_projection) {
-				dst := (^matrix[4,4]f32)(&shader.constants_data[constant.offset])
-				dst^ = view_projection
-			} 
-		}
-	}
-
-	if def_tex_idx, has_def_tex_idx := shader.default_texture_index.?; has_def_tex_idx {
-		shader.texture_bindpoints[def_tex_idx] = s.batch_texture
-	}
-
-	rb.draw(
-		shader,
-		s.batch_render_target,
-		shader.texture_bindpoints,
-		s.batch_scissor,
-		s.batch_blend_mode,
-		s.vertex_buffer_cpu[:s.vertex_buffer_cpu_used],
-	)
-	
+	// The draw calls have data that is allocated using the batch_allocator. It can now be cleared,
+	// since all draw calls have been dispatched.
+	s.current_draw_call = {}
 	s.vertex_buffer_cpu_used = 0
+	free_all(s.batch_allocator)
 }
 
 //-------//
@@ -537,8 +780,20 @@ draw_current_batch :: proc() {
 
 // Returns true if a keyboard key went down between the current and the previous frame. Set when
 // 'process_events' runs.
-key_went_down :: proc(key: Keyboard_Key) -> bool {
-	return s.key_went_down[key]
+//
+// If `allow_repeat` is true, then this also returns true for OS-generated key-repeat events (the
+// same behavior a text editor wants when you hold down Backspace). The repeat rate and initial
+// delay come from the operating system's keyboard settings.
+key_went_down :: proc(key: Keyboard_Key, allow_repeat := false) -> bool {
+	if s.key_went_down[key] {
+		return true
+	}
+
+	if allow_repeat && s.key_repeat[key] {
+		return true
+	}
+
+	return false
 }
 
 // Returns true if a keyboard key went up (was released) between the current and the previous frame.
@@ -552,13 +807,78 @@ key_is_held :: proc(key: Keyboard_Key) -> bool {
 	return s.key_is_held[key]
 }
 
+// Returns all the Unicode code points that were typed since the last frame, taking the current
+// keyboard layout into account. Commonly used for text input fields.
+//
+// Warning: The returned slice is only valid during the current frame! You can make a clone of it
+// using the `slice.clone` procedure (import `core:slice`).
+get_typed_runes :: proc() -> []rune {
+	return s.typed_runes[:]
+}
+
+// Returns all touches that were active during this frame. Touches that ended this frame are also
+// included: They have `went_up` set to `true`.
+//
+// Note: The order of touches may vary from frame to frame. Use the `id` of a touch to identify it
+// between frames.
+//
+// By default, touches cause left mouse button events to happen as well. This way, many mouse-
+// controlled desktop games work on touch as well. Control that behavior using
+// `set_mouse_touch_emulation`.
+//
+// Warning: The returned slice is only valid during the current frame!
+get_touches :: proc() -> []Touch {
+	assert_initialized()
+	return s.touches[:]
+}
+
+// Controls if touches should cause mouse events, or if mouse events should cause touche events. Or
+// if none of these things should happen. `k2.init` sets this to `.Touch_To_Mouse` by default so
+// that desktop games have rudimentary functionality on touch screens.
+//
+// If your handles both touch and mouse input, then you want this set to `.None`.
+set_mouse_touch_emulation :: proc(emulation: Mouse_Touch_Emulation) {
+	assert_initialized()
+
+	if emulation == s.mouse_touch_emulation {
+		return
+	}
+
+	switch s.mouse_touch_emulation {
+	case .None:
+
+	case .Touch_To_Mouse:
+		if s.touch_to_mouse_id != TOUCH_TO_MOUSE_ID_NONE {
+			s.touch_to_mouse_id = TOUCH_TO_MOUSE_ID_NONE
+
+			if s.mouse_button_is_held[.Left] {
+				s.mouse_button_is_held[.Left] = false
+				s.mouse_button_went_up[.Left] = true
+			}
+		}
+
+	case .Mouse_To_Touch:
+		if t := _find_touch(EMULATED_TOUCH_ID); t != nil && !t.went_up {
+			t.went_up = true
+			t.cancelled = true
+		}
+	}
+
+	s.mouse_touch_emulation = emulation
+}
+
+@(deprecated="Use set_mouse_touch_emulation instead.")
+set_touch_events_from_mouse :: proc(enabled: bool) {
+	set_mouse_touch_emulation(enabled ? .Mouse_To_Touch : .None)
+}
+
 // Returns which modifiers are held. The possible values are `Control`, `Alt`, `Shift` and `Super`.
 // You can check that an exact set of modifiers are held like so:
 //
 // `if k2.get_held_modifiers() == { .Control, Shift} {}`
 //
-// This will only be true if left/right control are held and left/right shift are held, but it also
-// makes sure that no alt or super (windows) key are held.
+// The above will only be true if left/right control are held and left/right shift are held. It will
+// return false if any of the alt or super keys are held.
 //
 // This is useful for checking for held modifiers for hotkeys in user interfaces. If you want to
 // associate an in-game action with a specific key such as Left Control, then it's better to just do
@@ -608,8 +928,17 @@ mouse_button_is_held :: proc(button: Mouse_Button) -> bool {
 }
 
 // Returns how many clicks the mouse wheel has scrolled between the previous and current frame.
+// Positive means scrolling up.
 get_mouse_wheel_delta :: proc() -> f32 {
 	return s.mouse_wheel_delta
+}
+
+// Returns how many clicks the horizontal mouse wheel has scrolled between the previous and current
+// frame. Positive means scrolling right.
+//
+// A tilt wheel or a two-finger sideways swipe on a trackpad drives this one.
+get_mouse_wheel_delta_horizontal :: proc() -> f32 {
+	return s.mouse_wheel_delta_horizontal
 }
 
 // Returns the mouse position, measured from the top-left corner of the window.
@@ -622,48 +951,36 @@ get_mouse_delta :: proc() -> Vec2 {
 	return s.mouse_delta
 }
 
-// Hide or show the mouse cursor. The cursor may get shown again if the window loses focus.
-// Therefore, it's often best to use `is_cursor_hidden` to check the current status and use this
-// procedure to hide the cursor as needed.
-//
-// This call does not lock the cursor within the window, do that using a separate call to
-// `set_cursor_locked`.
-set_cursor_hidden :: proc(hidden: bool) {
-	pf.set_cursor_hidden(hidden)
-}
-
-// Returns true if the cursor is hidden. The cursor may get re-shown by the OS, for example when the
-// window loses focus. Therefore, this procedure may return false even though you've hidden the
-// cursor previously. It should always reflect the true hide-state of the cursor.
-is_cursor_hidden :: proc() -> bool {
-	return pf.is_cursor_hidden()
-}
-
-@(deprecated="Use set_cursor_hidden")
-set_cursor_visible :: proc(visible: bool) {
-	pf.set_cursor_hidden(!visible)
-}
-
-// Locks the mouse cursor within the window. While the cursor is locked, you should no longer use
+// Locks the mouse within the window. While the mouse is locked, you should no longer use
 // get_mouse_position, as it may have weird/static values. Instead, use get_mouse_delta to fetch how
 // much the mouse have been moved.
 //
-// On some platforms the cursor is just stuck at a specific point. On other platforms it may be
+// On some platforms the mouse is just stuck at a specific point. On other platforms it may be
 // teleported back to the center of the window on each frame.
 //
-// This call does not hide the cursor, do that separately using `set_cursor_visible`.
+// This call does not hide the cursor, do that separately using `set_cursor_hidden`.
 //
-// If the window loses focus, then the cursor may get unlocked. You can query the current lock
-// status using `is_cursor_locked`, which should take into account if the OS has unlocked it for you
-set_cursor_locked :: proc(locked: bool) {
-	pf.set_cursor_locked(locked)
+// If the window loses focus, then the mouse may get unlocked. You can query the current lock
+// status using `is_mouse_locked`, which should take into account if the OS has unlocked it for you
+set_mouse_locked :: proc(locked: bool) {
+	pf.set_mouse_locked(locked)
 }
 
-// Returns true if the mouse cursor is currently locked. Note that the mouse can get unlocked by the
-// OS, even though you previously called `set_cursor_locked(true)`. Therefore, it's best to check
-// the current status using this procedure and then lock the mouse if needed.
+// Returns true if the mouse is currently locked. Note that the mouse can get unlocked by the OS,
+// even though you previously called `set_mouse_locked(true)`. Therefore, it's best to check the
+// current status using this procedure and then lock the mouse if needed.
+is_mouse_locked :: proc() -> bool {
+	return pf.is_mouse_locked()
+}
+
+@(deprecated="Use set_mouse_locked instead")
+set_cursor_locked :: proc(locked: bool) {
+	set_mouse_locked(locked)
+}
+
+@(deprecated="Use is_mouse_locked instead")
 is_cursor_locked :: proc() -> bool {
-	return pf.is_cursor_locked()
+	return is_mouse_locked()
 }
 
 // Returns true if a gamepad with the supplied index is connected. The parameter should be a value
@@ -729,15 +1046,7 @@ set_gamepad_vibration :: proc(gamepad: Gamepad_Index, left: f32, right: f32) {
 //   `(rect.w/2, rect.h/2)` then the rectangle rotates around its center.
 // - rotation: The rotation to apply, in radians
 draw_rect :: proc(rect: Rect, color: Color, origin: Vec2 = {}, rotation: f32 = 0) {
-	if s.vertex_buffer_cpu_used + s.batch_shader.vertex_size * 6 > len(s.vertex_buffer_cpu) {
-		draw_current_batch()
-	}
-
-	if s.batch_texture != s.shape_drawing_texture {
-		draw_current_batch()
-	}
-
-	s.batch_texture = s.shape_drawing_texture
+	_begin_vertices(s.shape_drawing_texture, 6)
 	tl, tr, bl, br: Vec2
 
 	// Rotation adapted from Raylib's "DrawTexturePro"
@@ -851,15 +1160,7 @@ draw_rect_outline :: proc(r: Rect, thickness: f32, color: Color) {
 // Draw a circle with a certain center and radius. Note the `segments` parameter: This circle is not
 // perfect! It is drawn using a number of "cake segments".
 draw_circle :: proc(center: Vec2, radius: f32, color: Color, segments := 16) {
-	if s.vertex_buffer_cpu_used + s.batch_shader.vertex_size * 3 * segments > len(s.vertex_buffer_cpu) {
-		draw_current_batch()
-	}
-
-	if s.batch_texture != s.shape_drawing_texture {
-		draw_current_batch()
-	}
-
-	s.batch_texture = s.shape_drawing_texture
+	_begin_vertices(s.shape_drawing_texture, 3*segments)
 
 	prev := center + {radius, 0}
 	for s in 1..=segments {
@@ -903,15 +1204,7 @@ draw_line :: proc(start: Vec2, end: Vec2, thickness: f32, color: Color) {
 // Draws a triangle using three vertices. The order of the vertices does not matter: Clockwise and
 // counter-clockwise triangles will give the same result.
 draw_triangle :: proc(vertices: [3]Vec2, c: Color) {
-	if s.vertex_buffer_cpu_used + s.batch_shader.vertex_size * 3 > len(s.vertex_buffer_cpu) {
-		draw_current_batch()
-	}
-
-	if s.batch_texture != s.shape_drawing_texture {
-		draw_current_batch()
-	}
-
-	s.batch_texture = s.shape_drawing_texture
+	_begin_vertices(s.shape_drawing_texture, 3)
 
 	batch_vertex(vertices[0], {0, 0}, c)
 	batch_vertex(vertices[1], {1, 1}, c)
@@ -926,9 +1219,13 @@ draw_triangle :: proc(vertices: [3]Vec2, c: Color) {
 // - tint: A color to apply to the texture, in a multiplicative way. WHITE means no tinting.
 //
 // If you want to rotate around the middle of the texture, then try this:
-// 
+//
 //// middle := k2.rect_middle(k2.get_texture_rect(tex))
 //// draw_texture(tex, pos + middle, middle, rot)
+//
+// The texture is fed into the active shader. Everything drawn in a single draw call must therefore
+// use the same texture. Drawing with a new texture starts a new draw call. Put several images into
+// one big texture, an atlas, to get fewer draw calls.
 draw_texture :: proc(
 	texture: Texture,
 	position: Vec2,
@@ -1008,17 +1305,14 @@ draw_texture_fit :: proc(
 		return
 	}
 
-	if s.vertex_buffer_cpu_used + s.batch_shader.vertex_size * 6 > len(s.vertex_buffer_cpu) {
-		draw_current_batch()
-	}
+	_begin_vertices(texture.handle, 6)
 
-	if s.batch_texture != texture.handle {
-		draw_current_batch()
-	}
-	
-	s.batch_texture = texture.handle
+	flip_x: bool
 
-	flip_x, flip_y: bool
+	// Texture pixels are stored top-down, but a flipped `dest` grows upwards, so the texture has to
+	// be sampled bottom-up to come out the right way round.
+	flip_y := _camera_flip_y()
+
 	source := source
 	dest := dest
 
@@ -1028,7 +1322,7 @@ draw_texture_fit :: proc(
 	}
 
 	if source.h < 0 {
-		flip_y = true
+		flip_y = !flip_y
 		source.h = -source.h
 	}
 
@@ -1236,59 +1530,26 @@ measure_text :: proc(text: string, font_size: f32, font: Font = FONT_DEFAULT) ->
 			return {}
 		}
 
-		font_object := s.fonts[font]
+		font_object := &s.fonts[font]
 
-		// Temporary until I rewrite the font caching system.
-		_set_font(font)
-
-		// TextBounds from fontstash, but fixed and simplified for my purposes.
-		// The version in there is broken.
-		TextBounds :: proc(
-			ctx:  ^fs.FontContext,
-			font_idx: int,
-			size: f32,
-			text: string,
-		) -> Vec2 {
-			font  := fs.__getFont(ctx, font_idx)
-			isize := i16(size * 10)
-
-			x, y: f32
-			max_x := x
-
-			scale := fs.__getPixelHeightScale(font, f32(isize) / 10)
-			previousGlyphIndex: fs.Glyph_Index = -1
-			quad: fs.Quad
-			lines := 1
-
-			for codepoint in text {
-				if codepoint == '\n' {
-					x = 0
-					lines += 1
-					continue
-				}
-
-				if glyph, ok := fs.__getGlyph(ctx, font, codepoint, isize); ok {
-					if glyph.xadvance > 0 {
-						x += f32(int(f32(glyph.xadvance) / 10 + 0.5))
-					} else {
-						// updates x
-						fs.__getQuad(ctx, font, previousGlyphIndex, glyph, scale, 0, &x, &y, &quad)
-					}
-
-					if x > max_x {
-						max_x = x
-					}
-
-					previousGlyphIndex = glyph.index
-				} else {
-					previousGlyphIndex = -1
-				}
-
-			}
-			return { max_x, f32(lines)*size }
+		if len(font_object.dynamic_font.pages) == 0 {
+			return {}
 		}
 
-		return TextBounds(&s.fs, font_object.dynamic_fontstash_handle, font_size, text)
+		render_size := _font_render_size(font_size)
+		size, size_ok := fc.measure(&font_object.dynamic_font, text, render_size, s.time)
+
+		for !size_ok {
+			draw_current_batch()
+
+			if !fc.make_room(&font_object.dynamic_font, s.time) {
+				break
+			}
+
+			size, size_ok = fc.measure(&font_object.dynamic_font, text, render_size, s.time)
+		}
+
+		return size * (font_size / f32(render_size))
 	}
 
 }
@@ -1304,7 +1565,7 @@ measure_text_ex :: proc(font_handle: Font, text: string, font_size: f32) -> Vec2
 //
 // Optional parameters:
 // - font: The font to use, uses a default font if none is specified.
-// - origin: The origin relative top the top-left position of the text. Used when rotating the text.
+// - origin: The origin relative to the top-left position of the text. Used when rotating the text.
 // - rotation: Rotating to apply to the text, measured in radians.
 draw_text :: proc(
 	text: string,
@@ -1363,8 +1624,21 @@ draw_text :: proc(
 		}
 
 		font_object := &s.fonts[font]
+
+		// Laid out top-down: `char_offset` walks right along a line and down between lines, matching
+		// the offsets stbtt baked into the glyphs.
 		char_offset: Vec2
 		scl := font_size / font_object.static_font_size
+
+		// Where the top of the text block is. The glyph offsets are measured down from it. With
+		// flipped Y `position` is the bottom-left corner of the block, so the top is a whole block
+		// higher. The height must agree with what `measure_text_static` reports.
+		y_up := _camera_flip_y()
+		block_top := position.y
+
+		if y_up {
+			block_top += f32(count_text_lines(text))*font_object.static_line_spacing*scl
+		}
 
 		for c in text {
 			if c == '\r' {
@@ -1393,16 +1667,25 @@ draw_text :: proc(
 
 			if g != nil {
 				src := g.rect
+				w := src.w * scl
+				h := src.h * scl
 
-				dst := Rect {
-					position.x, position.y,
-					src.w * scl, src.h * scl,
-				}
+				// `g.offset` is stbtt's top-down offset from the top of the line to the top of the
+				// glyph bitmap. It is what makes descenders hang below the baseline, so it counts
+				// down from the top of the block whichever way the Y axis points.
+				offset_from_top := char_offset.y + g.offset.y*scl
+				glyph_y := y_up ? block_top - offset_from_top - h : block_top + offset_from_top
 
-				char_origin := origin - (char_offset + g.offset*scl)
+				glyph_x := position.x + char_offset.x + g.offset.x*scl
+
+				// The destination stays at `position` for every glyph and the per-glyph offset is
+				// folded into the origin instead. That way `rotation` pivots the whole text block
+				// around `position` rather than each glyph around itself.
+				dst := Rect { position.x, position.y, w, h }
+				char_origin := origin + position - { glyph_x, glyph_y }
 
 				draw_texture_fit(
-					font_object.atlas,
+					font_object.static_atlas,
 					src,
 					dst,
 					tint = color,
@@ -1413,12 +1696,18 @@ draw_text :: proc(
 				char_offset.x += g.advance*scl
 			} else {
 				invalid_rect_size := Vec2 {font_size*0.5, font_size*0.5}
-				invalid_rect := rect_from_pos_size(position + char_offset + {0, invalid_rect_size.y/2}, invalid_rect_size)
-				
-				draw_rect(
-					invalid_rect,
-					RED,
-				)
+				offset_from_top := char_offset.y + invalid_rect_size.y/2
+
+				invalid_rect_y := y_up \
+					? block_top - offset_from_top - invalid_rect_size.y \
+					: block_top + offset_from_top
+
+				invalid_rect := Rect {
+					position.x + char_offset.x, invalid_rect_y,
+					invalid_rect_size.x, invalid_rect_size.y,
+				}
+
+				draw_rect(invalid_rect, RED)
 
 				char_offset.x += invalid_rect_size.x
 			}
@@ -1438,61 +1727,82 @@ draw_text :: proc(
 			return
 		}
 
-		_set_font(font)
 		font_object := &s.fonts[font]
 
-		camera_zoom: f32 = 1
-
-		if cam, cam_ok := s.batch_camera.?; cam_ok && cam.zoom > 0.001 {
-			camera_zoom = cam.zoom
+		if len(font_object.dynamic_font.pages) == 0 {
+			return
 		}
 
-		// Bake the glyph at font_size*camera_zoom pixels so it is sharp at the current zoom level.
-		// We then divide quad positions back by camera_zoom to recover world-space coordinates.
-		render_size := font_size * camera_zoom
-		scaled_pos  := position * camera_zoom
+		// `_font_render_size` will scale the font size by the camera zoom and round it to nearest
+		// pixel size. We'll use `inv_render_scale` further down to cancel out the scale, since the
+		// scaling happens in the camera.
+		render_size := _font_render_size(font_size)
+		inv_render_scale := font_size / f32(render_size)
+		_sync_font_pages(font_object)
 
-		fs.SetSize(&s.fs, render_size)
-		iter := fs.TextIterInit(&s.fs, scaled_pos.x, scaled_pos.y, text)
+		y_up := _camera_flip_y()
+		block_top := position.y
 
-		q: fs.Quad
-		for fs.TextIterNext(&s.fs, &iter, &q) {
-			if iter.codepoint == '\n' {
-				iter.nexty += render_size
-				iter.nextx = scaled_pos.x
+		// In Y up mode the top of the text block is offset by its total height.
+		if y_up {
+			block_top += f32(count_text_lines(text))*font_size
+		}
+
+		// The font_cache iterator will go through the text and lay the letters out.
+		it := fc.place_text_iterator_init(text, render_size, s.time)
+
+		for {
+			placed, place_res := fc.place_text_iterate(&font_object.dynamic_font, &it)
+
+			if place_res == .Done {
+				break
+			}
+
+			if place_res == .No_Room {
+				draw_current_batch()
+
+				if !fc.make_room(&font_object.dynamic_font, s.time) {
+					break
+				}
+
+				_sync_font_pages(font_object)
 				continue
 			}
 
-			if iter.codepoint == '\t' {
-				iter.nextx += 2*render_size
+			g := placed.glyph
+
+			if g.width == 0 {
 				continue
 			}
 
 			src := Rect {
-				q.s0, q.t0,
-				q.s1 - q.s0, q.t1 - q.t0,
+				f32(g.x), f32(g.y),
+				f32(g.width), f32(g.height),
 			}
 
-			w := f32(FONT_DEFAULT_ATLAS_SIZE)
-			h := f32(FONT_DEFAULT_ATLAS_SIZE)
-			src.x *= w
-			src.y *= h
-			src.w *= w
-			src.h *= h
+			// Unscale quad positions from render-size space back to text-local world units.
+			offset_from_left := placed.x * inv_render_scale
+			offset_from_top := placed.y * inv_render_scale
+			glyph_w := f32(g.width) * inv_render_scale
+			glyph_h := f32(g.height) * inv_render_scale
 
-			// Unscale quad positions from atlas-space back to world-space.
-			qx0 := q.x0 / camera_zoom
-			qy0 := q.y0 / camera_zoom
-			qx1 := q.x1 / camera_zoom
-			qy1 := q.y1 / camera_zoom
-			
-			dst := Rect {
-				position.x, position.y,
-				qx1 - qx0, qy1 - qy0,
-			}
+			glyph_y := y_up ? block_top - offset_from_top - glyph_h : block_top + offset_from_top
 
-			char_origin := origin + {position.x - qx0, position.y - qy0}
-			draw_texture_fit(font_object.atlas, src, dst, char_origin, rotation, color)
+			glyph_x := position.x + offset_from_left
+
+			// As in `draw_text_static`: keep the destination at `position` and fold the per-glyph
+			// offset into the origin, so that `rotation` pivots the block and not each glyph.
+			dst := Rect { position.x, position.y, glyph_w, glyph_h }
+			char_origin := origin + position - { glyph_x, glyph_y }
+
+			draw_texture_fit(
+				font_object.dynamic_pages[g.page],
+				src,
+				dst,
+				char_origin,
+				rotation,
+				color,
+			)
 		}
 	}
 
@@ -1508,26 +1818,52 @@ draw_text_ex :: proc(font_handle: Font, text: string, pos: Vec2, font_size: f32,
 //--------------------//
 
 // Create an empty texture.
-create_texture :: proc(width: int, height: int, format: Pixel_Format) -> Texture {
-	h := rb.create_texture(width, height, format)
+//
+// The second return value is `true` if the texture was created correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Texture` will still be
+// possible to use, but it won't draw anything.
+create_texture :: proc(
+	width: int,
+	height: int,
+	format: Pixel_Format,
+) -> (Texture, bool) #optional_ok {
+	h, h_ok := rb.create_texture(width, height, format)
+
+	if !h_ok {
+		log.errorf(
+			"Failed creating texture with dimensions %v x %v and pixel format %v",
+			width,
+			height,
+			format,
+		)
+
+		return {}, false
+	}
 
 	return {
 		handle = h,
 		width = width,
 		height = height,
-	}
+	}, true
 }
 
 // Load a texture from disk and upload it to the GPU so you can draw it to the screen.
 // Supports PNG, BMP, TGA and baseline PNG. Note that progressive PNG files are not supported!
 //
 // The `options` parameter can be used to specify things things such as premultiplication of alpha.
-load_texture_from_file :: proc(filename: string, options: Load_Texture_Options = {}) -> Texture {
+//
+// The second return value is `true` if the texture was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Texture` will still be
+// possible to use, but it won't draw anything.
+load_texture_from_file :: proc(
+	filename: string,
+	options: Load_Texture_Options = {},
+) -> (Texture, bool) #optional_ok {
 	data, data_ok := read_entire_file(filename, frame_allocator)
 
 	if !data_ok {
 		log.errorf("Failed loading texture %s", filename)
-		return {}
+		return {}, false
 	}
 
 	load_options := image.Options {
@@ -1542,7 +1878,7 @@ load_texture_from_file :: proc(filename: string, options: Load_Texture_Options =
 
 	if img_err != nil {
 		log.errorf("Error loading texture '%v': %v", filename, img_err)
-		return {}
+		return {}, false
 	}
 
 	return load_texture_from_bytes_raw(img.pixels.buf[:], img.width, img.height, .RGBA_8_Norm)
@@ -1552,7 +1888,14 @@ load_texture_from_file :: proc(filename: string, options: Load_Texture_Options =
 // Supports PNG, BMP, TGA and baseline PNG. Note that progressive PNG files are not supported!
 //
 // The `options` parameter can be used to specify things things such as premultiplication of alpha.
-load_texture_from_bytes :: proc(bytes: []u8, options: Load_Texture_Options = {}) -> Texture {
+//
+// The second return value is `true` if the texture was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Texture` will still be
+// possible to use, but it won't draw anything.
+load_texture_from_bytes :: proc(
+	bytes: []u8,
+	options: Load_Texture_Options = {},
+) -> (Texture, bool) #optional_ok {
 	load_options := image.Options {
 		.alpha_add_if_missing,
 	}
@@ -1565,7 +1908,7 @@ load_texture_from_bytes :: proc(bytes: []u8, options: Load_Texture_Options = {})
 
 	if img_err != nil {
 		log.errorf("Error loading texture: %v", img_err)
-		return {}
+		return {}, false
 	}
 
 	return load_texture_from_bytes_raw(img.pixels.buf[:], img.width, img.height, .RGBA_8_Norm)
@@ -1574,44 +1917,141 @@ load_texture_from_bytes :: proc(bytes: []u8, options: Load_Texture_Options = {})
 // Load raw texture data. You need to specify the data, size and format of the texture yourself.
 // This assumes that there is no header in the data. If your data has a header (you read the data
 // from a file on disk), then please use `load_texture_from_bytes` instead.
-load_texture_from_bytes_raw :: proc(bytes: []u8, width: int, height: int, format: Pixel_Format) -> Texture {
-	backend_tex := rb.load_texture(bytes[:], width, height, format)
+//
+// The second return value is `true` if the texture was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Texture` will still be
+// possible to use, but it won't draw anything.
+load_texture_from_bytes_raw :: proc(
+	bytes: []u8,
+	width: int,
+	height: int,
+	format: Pixel_Format,
+) -> (Texture, bool) #optional_ok {
+	backend_tex, backend_tex_ok := rb.load_texture(bytes[:], width, height, format)
 
-	if backend_tex == TEXTURE_NONE {
-		return {}
+	if !backend_tex_ok {
+		log.errorf(
+			"Failed loading texture with dimensions %v x %v and pixel format %v",
+			width,
+			height,
+			format,
+		)
+
+		return {}, false
 	}
 
 	return {
 		handle = backend_tex,
 		width = width,
 		height = height,
-	}
+	}, true
 }
 
 // Create a GPU texture from an image stored in RAM. There are currently no procedures to manipulate
 // the image. However, you can create an `Image` struct manually and fill out the data as needed.
-load_texture_from_image :: proc(image: Image) -> Texture {
+//
+// The second return value is `true` if the texture was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Texture` will still be
+// possible to use, but it won't draw anything.
+load_texture_from_image :: proc(image: Image) -> (Texture, bool) #optional_ok {
 	if image.width == 0 || image.height == 0 {
 		log.error("Invalid image: Height or width is zero")
-		return {}
+		return {}, false
 	}
 
 	if len(image.pixels) != (image.width*image.height) {
 		log.error("Invalid image: the pixels array is not of size image.width*image.height")
-		return {}
+		return {}, false
 	}
 
-	backend_tex := rb.load_texture(slice.reinterpret([]u8, image.pixels[:]), image.width, image.height, .RGBA_8_Norm)
+	backend_tex, backend_tex_ok := rb.load_texture(
+		slice.reinterpret([]u8, image.pixels[:]),
+		image.width,
+		image.height,
+		.RGBA_8_Norm,
+	)
 
-	if backend_tex == TEXTURE_NONE {
-		return {}
+	if !backend_tex_ok {
+		return {}, false
 	}
 
 	return {
 		handle = backend_tex,
 		width = image.width,
 		height = image.height,
+	}, true
+}
+
+// Load an image from disk into RAM. Supports the same formats as `load_texture_from_file`. The
+// image is always RGBA8 with straight (non-premultiplied) alpha.
+//
+// Use `destroy_image` when you are done with it.
+//
+// The second return value is `true` if the image was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Image` will be empty: it
+// has no pixels and a width and height of zero.
+load_image_from_file :: proc(filename: string) -> (Image, bool) #optional_ok {
+	data, data_ok := read_entire_file(filename, frame_allocator)
+
+	if !data_ok {
+		log.errorf("Failed loading image %s", filename)
+		return {}, false
 	}
+
+	return load_image_from_bytes(data)
+}
+
+// Load an image from a byte slice into RAM, for instance from `#load("my_image.png")`. Supports
+// the same formats as `load_texture_from_bytes`. The image is always RGBA8 with straight
+// (non-premultiplied) alpha.
+//
+// Use `destroy_image` when you are done with it.
+//
+// The second return value is `true` if the image was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Image` will be empty: it
+// has no pixels and a width and height of zero.
+load_image_from_bytes :: proc(bytes: []u8) -> (Image, bool) #optional_ok {
+	img, img_err := image.load_from_bytes(
+		bytes,
+		options = {.alpha_add_if_missing},
+		allocator = s.frame_allocator,
+	)
+
+	if img_err != nil {
+		log.errorf("Error loading image: %v", img_err)
+		return {}, false
+	}
+
+	if img.depth != 8 || img.channels != 4 {
+		log.errorf(
+			"Error loading image: expected 8-bit RGBA, got %v-bit with %v channels",
+			img.depth, img.channels,
+		)
+		image.destroy(img, s.frame_allocator)
+		return {}, false
+	}
+
+	pixels := make([]Color, img.width*img.height, s.allocator)
+	copy(pixels, slice.reinterpret([]Color, img.pixels.buf[:]))
+
+	res := Image {
+		pixels = pixels,
+		width = img.width,
+		height = img.height,
+	}
+
+	image.destroy(img, s.frame_allocator)
+	return res, true
+}
+
+@(deprecated="Use load_image_from_file instead")
+load_image :: proc(filename: string) -> (Image, bool) #optional_ok {
+	return load_image_from_file(filename)
+}
+
+// Destroy an image previously loaded using `load_image_from_file` or `load_image_from_bytes`.
+destroy_image :: proc(img: Image) {
+	delete(img.pixels, s.allocator)
 }
 
 // Get a rectangle that spans the whole texture. Coordinates will be (x, y) = (0, 0) and size
@@ -1626,11 +2066,14 @@ get_texture_rect :: proc(t: Texture) -> Rect {
 // Update a texture with new pixels. `bytes` is the new pixel data. `rect` is the rectangle in
 // `tex` where the new pixels should end up.
 update_texture :: proc(tex: Texture, bytes: []u8, rect: Rect) -> bool {
+	// Recorded draw calls may still be waiting to use the old pixels.
+	_flush_if_batch_uses_texture(tex.handle)
 	return rb.update_texture(tex.handle, bytes, rect)
 }
 
 // Destroy a texture, freeing up any memory it has used on the GPU.
 destroy_texture :: proc(tex: Texture) {
+	_flush_if_batch_uses_texture(tex.handle)
 	rb.destroy_texture(tex.handle)
 }
 
@@ -1652,6 +2095,8 @@ set_texture_filter_ex :: proc(
 	scale_up_filter: Texture_Filter,
 	mip_filter: Texture_Filter,
 ) {
+	// Recorded draw calls may still be waiting to sample this texture with the old filter.
+	_flush_if_batch_uses_texture(t.handle)
 	rb.set_texture_filter(t.handle, scale_down_filter, scale_up_filter, mip_filter)
 }
 
@@ -1659,443 +2104,706 @@ set_texture_filter_ex :: proc(
 // AUDIO //
 //-------//
 
-// Play a sound previous created using `load_sound_from_xxx` or `create_sound_from_audio_buffer`.
-// The sound will be mixed when `update_audio_mixer` runs, which happens as part of `update`.
-play_sound :: proc(sound: Sound) {
-	sound_object := hm.get(&s.sounds, sound)
+// Play an audio clip with the supplied initial settings. The return value is a `Sound`, which means
+// something that is currently playing in the audio mixer. You can use the returned `Sound` with
+// `set_sound_volume`, `stop_sound` etc in order to control the playback. Ignore the return value
+// if you just want to start the sound and never touch it again.
+//
+// Audio clips are loaded using `load_audio_clip_from_file`, `load_audio_clip_from_bytes` and
+// `load_audio_clip_from_bytes_raw`.
+//
+// Pass `bus` to play the sound on an audio bus. It plays on the master bus by default.
+//
+// Warning: If you pass `loop = true` and don't save the return value anywhere, then you've started
+// a sound you cannot stop.
+play_audio_clip :: proc(
+	clip: Audio_Clip,
+	volume: f32 = 1,
+	pan: f32 = 0,
+	pitch: f32 = 1,
+	loop := false,
+	bus: Audio_Bus = AUDIO_BUS_MASTER,
+) -> Sound {
+	sync.mutex_guard(&s.audio_mutex)
 
-	if sound_object == nil {
-		log.error("Cannot play sound, sound does not exist.")
-		return
+	audio_buffer_object := hm.get(&s.audio_buffers, Audio_Buffer(clip))
+
+	if audio_buffer_object == nil {
+		log.error("Cannot play audio clip, audio clip does not exist.")
+		return SOUND_NONE
 	}
 
-	if existing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); existing != nil {
-		hm.remove(&s.playing_audio_buffers, sound_object.playing_buffer_handle)
+	if bus != AUDIO_BUS_MASTER && hm.get(&s.audio_buses, bus) == nil {
+		log.error("Cannot play audio clip, audio bus does not exist.")
+		return SOUND_NONE
 	}
 
-	playing_audio_buffer := Playing_Audio_Buffer {
-		audio_buffer = sound_object.audio_buffer,
-		target_settings = sound_object.playback_settings,
-		current_settings = sound_object.playback_settings,
-		loop = sound_object.loop,
+	playback_settings := Sound_Settings {
+		volume = clamp(volume, 0, 1),
+		pan = clamp(pan, -1, 1),
+		pitch = max(pitch, 0.01),
 	}
 
-	add_err: runtime.Allocator_Error
-	sound_object.playing_buffer_handle, add_err = hm.add(&s.playing_audio_buffers, playing_audio_buffer)
+	sound_object := Sound_Object {
+		buffer = Audio_Buffer(clip),
+		source = clip,
+		target_settings = playback_settings,
+		current_settings = playback_settings,
+		loop = loop,
+		bus = bus,
+	}
+
+	sound, add_err := hm.add(&s.sounds, sound_object)
 
 	if add_err != nil {
-		log.errorf("Failed to play sound. Error: %v", add_err)
+		log.errorf("Failed playing audio clip. Error: %v", add_err)
+		return SOUND_NONE
 	}
+
+	return sound
 }
 
-// Stop a sound. Rewinds it to the start.
+// Stops the sound, which destroys its playback state in the mixer. For a `Sound` started using
+// `play_audio_stream`, this also rewinds the stream to the start. Use `set_sound_paused` to pause
+// the Sound instead, which won't lose the current playback position and settings.
 stop_sound :: proc(sound: Sound) {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
 
 	if sound_object == nil {
-		log.error("Cannot stop sound, sound does not exist.")
 		return
 	}
 
-	if existing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); existing != nil {
-		hm.remove(&s.playing_audio_buffers, sound_object.playing_buffer_handle)
-	}
-
-	sound_object.playing_buffer_handle = PLAYING_AUDIO_BUFFER_NONE
+	hm.remove(&s.sounds, sound)
 }
 
-// Returns true if the sound is currently playing.
+// Pause or unpause a sound. A paused sound keeps its position and stays valid until it is unpaused
+// or stopped.
+set_sound_paused :: proc(sound: Sound, paused: bool) {
+	sync.mutex_guard(&s.audio_mutex)
+	sound_object := hm.get(&s.sounds, sound)
+
+	if sound_object == nil {
+		return
+	}
+
+	sound_object.paused = paused
+}
+
+// Returns true if the sound exists and is not paused.
 sound_is_playing :: proc(sound: Sound) -> bool {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
-
-	if sound_object == nil {
-		return false
-	}
-
-	return hm.is_valid(&s.playing_audio_buffers, sound_object.playing_buffer_handle)
+	return sound_object != nil && !sound_object.remove && !sound_object.paused
 }
 
-// Set the volume of a sound. Range: 0 to 1, where 0 is silence and 1 is the original volume of the
-// sound. The volume change will only affect this instance of the sound. Use `create_sound_instance`
-// to create more instances without duplicating data.
-set_sound_volume :: proc(sound: Sound, volume: f32) {
+// Returns true if the sound still exists. Both playing and paused sounds are valid. A finished or
+// stopped sound is not.
+sound_is_valid :: proc(sound: Sound) -> bool {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
-	
+	return sound_object != nil && !sound_object.remove
+}
+
+// Set the volume of a sound. Range: 0 to 1.
+set_sound_volume :: proc(sound: Sound, volume: f32) {
+	sync.mutex_guard(&s.audio_mutex)
+	sound_object := hm.get(&s.sounds, sound)
+
 	if sound_object == nil {
-		log.error("Cannot set volume, sound does not exist.")
 		return
 	}
 
-	clamped_volume := clamp(volume, 0, 1)
-
-	if playing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); playing != nil {
-		playing.target_settings.volume = clamped_volume
-	}
-	
-	sound_object.playback_settings.volume = clamped_volume
+	sound_object.target_settings.volume = clamp(volume, 0, 1)
 }
 
 // Set the pan of a sound. Range: -1 to 1, where -1 is full left, 0 is center and 1 is full right.
-// The pan change will only affect this instance of the sound. Use `create_sound_instance` to create
-// more instances without duplicating data.
 set_sound_pan :: proc(sound: Sound, pan: f32) {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
-	
+
 	if sound_object == nil {
-		log.error("Cannot set pan, sound does not exist.")
 		return
 	}
 
-	clamped_pan := clamp(pan, -1, 1)
-
-	if playing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); playing != nil {
-		playing.target_settings.pan = clamped_pan
-	}
-
-	sound_object.playback_settings.pan = clamped_pan
+	sound_object.target_settings.pan = clamp(pan, -1, 1)
 }
 
-// Set the pitch of a sound. Range: 0.01 to infinity, where 0.01 is the lowest pitch and higher
-// values increase the pitch. The pitch change will only affect this instance of the sound. Use
-// `create_sound_instance` to create more instances without duplicating data.
+// Set the pitch of a sound. Range: 0.01 and up, where 1 is the default. Pitch 2 makes the sound
+// play twice as fast, which also makes it sound higher pitched.
 set_sound_pitch :: proc(sound: Sound, pitch: f32) {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
-	
+
 	if sound_object == nil {
-		log.error("Cannot set pitch, sound does not exist.")
 		return
 	}
 
-	capped_pitch := max(pitch, 0.01)
-
-	if playing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); playing != nil {
-		playing.target_settings.pitch = capped_pitch
-	}
-	
-	sound_object.playback_settings.pitch = capped_pitch
+	sound_object.target_settings.pitch = max(pitch, 0.01)
 }
 
-// Makes a sound loop when it reaches the end. You can set this before playing but also while
-// playing the sound.
+// Move the sound to another spot in its audio. `seconds` is measured from the start of the audio.
+// Use `get_sound_length` to find out how long the sound is.
+//
+// Note that calling this for an Audio_Clip-based sound is fast. But calling it for an Audio_Stream-
+// based Sound can be a bit slower. The stream has to seek, perhaps fetching data from disk.
+set_sound_time :: proc(sound: Sound, seconds: f32) {
+	sync.mutex_guard(&s.audio_mutex)
+	sound_object := hm.get(&s.sounds, sound)
+
+	if sound_object == nil {
+		return
+	}
+
+	wanted_seconds := max(seconds, 0)
+	length := _get_sound_length(sound)
+
+	if length > 0 {
+		wanted_seconds = min(wanted_seconds, length)
+	}
+
+	// Jumping to another spot in the audio makes the waveform jump, which is heard as a click. So
+	// we don't jump right away: The mixer fades the sound out first, then jumps, then fades it
+	// back in.
+
+	if sound_object.paused {
+		// A paused sound may have its volume at non-zero. We set it to zero here so that nothing
+		// has to wait for the volume to be ramped down.
+		sound_object.current_settings.volume = 0
+	}
+
+	// Note that we do this a bit differently for audio streams and clips. For clips we set the
+	// `clip_has_pending_seek` state. The mixer will ramp down the volume and then move it to the
+	// correct position in the buffer. It will then ramp it up again.
+	//
+	// For a stream the seeking happens in `update_audio_stream` using state that lives on the
+	// audio stream object.
+
+	switch src in sound_object.source {
+	case Audio_Clip:
+		sound_object.clip_has_pending_seek = true
+		sound_object.clip_pending_seek_seconds = wanted_seconds
+
+	case Audio_Stream:
+		sd := hm.get(&s.audio_streams, src)
+
+		if sd == nil {
+			return
+		}
+
+		sd.seek_seconds = wanted_seconds
+		sd.seek_state = sound_object.paused ? .Ready : .Fading_Out
+	}
+}
+
+// Get how far into its audio the sound currently is, in seconds. A looping sound goes back to 0
+// each time it starts over. Returns 0 if the sound doesn't exist.
+get_sound_time :: proc(sound: Sound) -> f32 {
+	sync.mutex_guard(&s.audio_mutex)
+	sound_object := hm.get(&s.sounds, sound)
+
+	if sound_object == nil {
+		return 0
+	}
+
+	ab := hm.get(&s.audio_buffers, sound_object.buffer)
+
+	if ab == nil {
+		return 0
+	}
+
+	channels := 1
+	if ab.channels == .Stereo {
+		channels = 2
+	}
+
+	switch src in sound_object.source {
+	case Audio_Clip:
+		// A seek that is still fading out hasn't moved the sound yet, but it is on its way there.
+		// Report where it is going, so that things like a seek bar don't jump backwards for a moment.
+		if sound_object.clip_has_pending_seek {
+			return sound_object.clip_pending_seek_seconds
+		}
+
+		return f32(sound_object.offset / channels) / f32(ab.sample_rate)
+
+	case Audio_Stream:
+		sd := hm.get(&s.audio_streams, src)
+
+		if sd == nil {
+			return 0
+		}
+
+		// A seek is pending, just return where it is going.
+		if sd.seek_state != .None {
+			return sd.seek_seconds
+		}
+
+		// How many decoded samples are still sitting unplayed in the circular staging buffer.
+		remaining := sd.cursor.buffer_write_pos - sound_object.offset
+
+		if remaining < 0 {
+			remaining = len(ab.samples) - sound_object.offset + sd.cursor.buffer_write_pos
+		}
+
+		position := sd.cursor.decode_cursor - remaining
+
+		// A looping stream starts decoding the beginning of the file again before the listener has
+		// heard the end of it, since the end is still sitting in the buffer. Count back into the
+		// previous time round, so that the last bit of the audio is reported instead of jumping to
+		// the start early.
+		for position < 0 && sd.total_samples > 0 {
+			position += sd.total_samples
+		}
+
+		return f32(max(position, 0) / channels) / f32(ab.sample_rate)
+	}
+
+	return 0
+}
+
+// Get the length of the sound's audio, in seconds. Use it together with `get_sound_time` to show
+// how far into a song you are. Returns 0 if the sound doesn't exist or if the length is unknown.
+get_sound_length :: proc(sound: Sound) -> f32 {
+	sync.mutex_guard(&s.audio_mutex)
+	return _get_sound_length(sound)
+}
+
+_get_sound_length :: proc(sound: Sound) -> f32 {
+	sound_object := hm.get(&s.sounds, sound)
+
+	if sound_object == nil {
+		return 0
+	}
+
+	ab := hm.get(&s.audio_buffers, sound_object.buffer)
+
+	if ab == nil {
+		return 0
+	}
+
+	channels := 1
+	if ab.channels == .Stereo {
+		channels = 2
+	}
+
+	switch src in sound_object.source {
+	case Audio_Clip:
+		return f32(len(ab.samples) / channels) / f32(ab.sample_rate)
+
+	case Audio_Stream:
+		sd := hm.get(&s.audio_streams, src)
+
+		if sd == nil {
+			return 0
+		}
+
+		return f32(sd.total_samples / channels) / f32(ab.sample_rate)
+	}
+
+	return 0
+}
+
+// Make a sound loop when it reaches the end.
+//
+// Technical note: This also works for sounds started using `play_audio_stream`, but then it
+// reaches into the streaming decoder and tells that one to loop. A `Sound` started from a stream
+// plays a short buffer that the decoder keeps filling, so that sound always loops.
 set_sound_loop :: proc(sound: Sound, loop: bool) {
+	sync.mutex_guard(&s.audio_mutex)
 	sound_object := hm.get(&s.sounds, sound)
-	
+
 	if sound_object == nil {
-		log.errorf("Cannot set loop = %v, sound does not exist.", loop)
 		return
 	}
 
-	if playing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); playing != nil {
-		playing.loop = loop
+	switch src in sound_object.source {
+	case Audio_Clip:
+		sound_object.loop = loop
+
+	case Audio_Stream:
+		// The Sound the stream uses always loops. It's just a short buffer that it feeds its data
+		// into. The real looping flag is on the audio stream object itself. That's what is used
+		// when the stream ends.
+		if sd := hm.get(&s.audio_streams, src); sd != nil {
+			sd.loop = loop
+		}
 	}
-	
-	sound_object.loop = loop
 }
 
-// Load a WAV file from disk. Returns a `Sound` which can be used with `play_sound`. If you need to
-// play a sound multiple times simultaneously, then use `load_audio_buffer_from_file` followed by
-// one or more calls to `create_sound_from_audio_buffer`.
+// Route a sound into an audio bus. Pass `AUDIO_BUS_MASTER` for the master bus.
+set_sound_bus :: proc(sound: Sound, bus: Audio_Bus) {
+	sync.mutex_guard(&s.audio_mutex)
+	sound_object := hm.get(&s.sounds, sound)
+
+	if sound_object == nil {
+		return
+	}
+
+	if bus != AUDIO_BUS_MASTER && hm.get(&s.audio_buses, bus) == nil {
+		log.error("Cannot set bus, audio bus does not exist.")
+		return
+	}
+
+	sound_object.bus = bus
+}
+
+// How many sounds currently play this clip. Useful for limiting how many overlapping sounds you
+// start from the same clip.
+get_num_sounds_playing_clip :: proc(clip: Audio_Clip) -> int {
+	sync.mutex_guard(&s.audio_mutex)
+	count: int
+
+	for it := hm.dynamic_iterator_make(&s.sounds); sound_object, _ in hm.dynamic_iterate(&it) {
+		if sound_object.source == clip && !sound_object.remove {
+			count += 1
+		}
+	}
+
+	return count
+}
+
+// Load a audio file from disk. Returns an `Audio_Clip` which can be played using `play_audio_clip`.
 //
-// Sounds created using this procedure owns their internal audio buffer: Calling `destroy_sound`
-// will also destroy the audio buffer. 
+// Supports WAV and OGG files.
 //
-// Currently only supports 16 bit WAV files.
-load_sound_from_file :: proc(filename: string) -> Sound {
+// The second return value is `true` if the audio clip was loaded correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Audio_Clip` will
+// still be possible to use, but it won't play anything.
+load_audio_clip_from_file :: proc(filename: string) -> (Audio_Clip, bool) #optional_ok {
 	data, data_ok := read_entire_file(filename, frame_allocator)
 
 	if !data_ok {
-		log.errorf("Failed to load sound from file '%v'", filename)
-		return SOUND_NONE
+		log.errorf("Failed to load audio clip from file '%v'", filename)
+		return AUDIO_CLIP_NONE, false
 	}
 
-	return load_sound_from_bytes(data)
+	return load_audio_clip_from_bytes(data)
 }
 
-// Load a sound some pre-loaded memory (for example using `#load("sound.wav")`). Returns a `Sound`
-// which can be used with `play_sound`. If you need to play a sound multiple times simultaneously,
-// then use `load_audio_buffer_from_bytes` followed by one or more calls to
-// `create_sound_from_audio_buffer`.
+// Load an audio file from some pre-loaded memory (can be loaded using `#load("sound.wav")`).
+// Returns an `Audio_Clip` which can be played using `play_audio_clip`.
 //
-// Sounds created using this procedure owns their internal audio buffer: Calling `destroy_sound`
-// will also destroy the audio buffer.
+// Supports WAV and OGG format. Note that `bytes` need to contain the FULL FILE, including any
+// headers. If you rather load raw audio data directly som samples, then please use
+// `load_audio_clip_from_bytes_raw`.
 //
-// Currently only supports 16 bit WAV data. Note that the data should be the entire WAV file,
-// including the header. If your data does not include the header, then please use
-// `load_audio_buffer_from_bytes_raw` combined with `create_sound_from_audio_buffer`.
-load_sound_from_bytes :: proc(bytes: []byte) -> Sound {
-	audio_buffer := load_audio_buffer_from_bytes(bytes)
+// The second return value is `true` if the audio clip was loaded correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Audio_Clip` will
+// still be possible to use, but it won't play anything.
+load_audio_clip_from_bytes :: proc(bytes: []u8) -> (_clip: Audio_Clip, _ok: bool) #optional_ok {
+	audio_buffer_object: Audio_Buffer_Object
+	audio_buffer_object_ok: bool
 
-	if audio_buffer == AUDIO_BUFFER_NONE {
-		return SOUND_NONE
+	if len(bytes) >= 4 && string(bytes[:4]) == "OggS" {
+		audio_buffer_object, audio_buffer_object_ok = _load_audio_buffer_from_ogg(bytes)
+	} else {
+		audio_buffer_object, audio_buffer_object_ok = _load_audio_buffer_from_wav(bytes)
 	}
 
-	sound_object := Sound_Object {
-		playback_settings = DEFAULT_AUDIO_BUFFER_PLAYBACK_SETTINGS,
-		audio_buffer = audio_buffer,
-		owns_audio_buffer = true,
+	if !audio_buffer_object_ok {
+		return
 	}
 
-	sound, sound_add_error := hm.add(&s.sounds, sound_object)
+	sync.mutex_guard(&s.audio_mutex)
+	audio_buffer, audio_buffer_add_error := hm.add(&s.audio_buffers, audio_buffer_object)
 
-	if sound_add_error != nil {
-		log.errorf("Failed adding sound. Error: %v", sound_add_error)
-		return SOUND_NONE
+	if audio_buffer_add_error != nil {
+		log.errorf("Failed to load audio clip. Error: %v", audio_buffer_add_error)
+		delete(audio_buffer_object.samples, s.allocator)
+		return
 	}
 
-	return sound
+	return Audio_Clip(audio_buffer), true
 }
 
-// Load a sound from some raw audio data. You need to specify the data, format and sample rate of
-// the audio data yourself. This assumes that there is no header in the data. If your data has a
-// header (you read the data from a file on disk), then please use `load_sound_from_bytes` instead.
-//
-// The returned Sound owns its internal Audio_Buffer: Calling `destroy_sound` with it will destroy
-// the audio buffer.
-load_sound_from_bytes_raw :: proc(
+_load_audio_buffer_from_ogg :: proc(
 	bytes: []u8,
-	format: Raw_Sound_Format,
-	sample_rate: int,
-	channels: Audio_Channels,
-) -> Sound {
-	audio_buffer := load_audio_buffer_from_bytes_raw(bytes, format, sample_rate, channels)
-
-	if audio_buffer == AUDIO_BUFFER_NONE {
-		return SOUND_NONE
+) -> (
+	_audio_buffer_object: Audio_Buffer_Object,
+	_ok: bool,
+) {
+	vorbis_buffer := stbv.vorbis_alloc {
+		alloc_buffer = make([^]u8, VORBIS_STATE_SIZE, frame_allocator),
+		alloc_buffer_length_in_bytes = VORBIS_STATE_SIZE,
 	}
 
-	sound_object := Sound_Object {
-		playback_settings = DEFAULT_AUDIO_BUFFER_PLAYBACK_SETTINGS,
-		audio_buffer = audio_buffer,
-		owns_audio_buffer = true,
+	vorbis_err: stbv.Error
+	vorbis := stbv.open_memory(
+		raw_data(bytes),
+		i32(len(bytes)),
+		&vorbis_err,
+		&vorbis_buffer,
+	)
+
+	if vorbis_err != nil {
+		log.errorf("Failed loading audio clip from ogg data. Error: %v", vorbis_err)
+		return
 	}
 
-	sound, sound_add_error := hm.add(&s.sounds, sound_object)
-
-	if sound_add_error != nil {
-		log.errorf("Failed adding sound. Error: %v", sound_add_error)
-		return SOUND_NONE
-	}
-
-	return sound
-}
-
-// Load a WAV file from disk. Returns an `Audio_Buffer` which can be used with
-// `create_sound_from_audio_buffer` in order to play the audio buffer multiple times simultaneously.
-//
-// Currently only supports 16 bit WAV data.
-load_audio_buffer_from_file :: proc(filename: string) -> Audio_Buffer {
-	data, data_ok := read_entire_file(filename, frame_allocator)
-
-	if !data_ok {
-		log.errorf("Failed to load audio buffer from file '%v'", filename)
-		return AUDIO_BUFFER_NONE
-	}
-
-	return load_audio_buffer_from_bytes(data)
-}
-
-// Load a WAV file from some pre-loaded memory (can be loaded using `#load("sound.wav")`). Returns
-// an `Audio_Buffer` which can be used with `create_sound_from_audio_buffer` in order to play the
-// audio buffer multiple times simultaneously.
-//
-// Currently only supports 16 bit WAV data. Note that the data should be the entire WAV file,
-// including the header. If your data does not include the header, then please use
-// `load_audio_buffer_from_bytes_raw`.
-load_audio_buffer_from_bytes :: proc(bytes: []u8) -> Audio_Buffer {
-	d := bytes
-
-	if len(d) < 8 {
-		log.error("Invalid WAV")
-		return AUDIO_BUFFER_NONE
-	}
-
-	if string(d[:4]) != "RIFF" {
-		log.error("Invalid wav file: No RIFF identifier")
-		return AUDIO_BUFFER_NONE
-	}
-
-	d = d[4:]
-
-	file_size, file_size_ok := endian.get_u32(d, .Little)
-
-	if !file_size_ok {
-		log.error("Invalid wav file: No size")
-		return AUDIO_BUFFER_NONE
-	}
-
-	if int(file_size) != len(bytes) - 8 {
-		log.error("File size mismiatch")
-		return AUDIO_BUFFER_NONE
-	}
-
-	d = d[4:]
-
-	if string(d[:4]) != "WAVE" {
-		log.error("Invalid wav file: Not WAVE format")
-		return AUDIO_BUFFER_NONE
-	}
-
-	d = d[4:]
-
-	sample_rate: u32
-	samples: []u8
+	info := stbv.get_info(vorbis)
 	channels: Audio_Channels
 
-	format: Raw_Sound_Format
+	if info.channels == 1 {
+		channels = .Mono
+	} else if info.channels == 2 {
+		channels = .Stereo
+	} else {
+		log.errorf("Unsupported number of channels in ogg data: %v", info.channels)
+		stbv.close(vorbis)
+		return
+	}
 
-	for len(d) > 3 {
-		blk_id := string(d[:4])
+	num_samples := int(stbv.stream_length_in_samples(vorbis)) * int(info.channels)
 
-		d = d[4:]	
+	if num_samples == 0 {
+		log.error("Failed loading audio clip from ogg data. It contains no samples.")
+		stbv.close(vorbis)
+		return
+	}
 
-		if blk_id == "fmt " {
-			blk_size, blk_size_ok := endian.get_u32(d, .Little)
+	samples := make([]Audio_Sample, num_samples, s.allocator)
 
-			if !blk_size_ok {
-				log.error("Invalid wav fmt block size")
-				continue
+	num_decoded := int(stbv.get_samples_float_interleaved(
+		vorbis,
+		info.channels,
+		raw_data(samples),
+		i32(num_samples),
+	)) * int(info.channels)
+
+	stbv.close(vorbis)
+
+	if num_decoded != num_samples {
+		log.warnf(
+			"Decoded %v of the %v samples the ogg data says it has. The end of the audio " +
+			"clip will be silent.",
+			num_decoded,
+			num_samples,
+		)
+	}
+
+	audio_buffer_object := Audio_Buffer_Object {
+		sample_rate = int(info.sample_rate),
+		samples = samples,
+		channels = channels,
+	}
+
+	return audio_buffer_object, true
+}
+
+_load_audio_buffer_from_wav :: proc(
+	bytes: []u8,
+) -> (
+	_audio_buffer_object: Audio_Buffer_Object,
+	_ok: bool,
+) {
+	// A WAV file is a RIFF file: A 12 byte header followed by any number of chunks.
+	if len(bytes) < 12 {
+		log.error("Invalid audio file: Too small to contain a RIFF header")
+		return
+	}
+
+	if string(bytes[:4]) != "RIFF" {
+		log.error("Unsupported audio file format. Only wav and ogg are supported.")
+		return
+	}
+
+	// This size can only fail to read if there are less than four bytes left, which the check above
+	// rules out. Same thing for the reads of the chunk headers further down.
+	riff_size, _ := endian.get_u32(bytes[4:8], .Little)
+
+	if string(bytes[8:12]) != "WAVE" {
+		log.error("Invalid wav file: Not WAVE format")
+		return
+	}
+
+	// `riff_size` counts everything after itself. Some programs write a size that doesn't match the
+	// file, so use it to cut away trailing junk but never trust it over the size of the buffer.
+	chunks_end := len(bytes)
+
+	if riff_end := int(riff_size) + 8; riff_end >= 12 && riff_end < chunks_end {
+		chunks_end = riff_end
+	}
+
+	chunks := bytes[12:chunks_end]
+
+	sample_rate: int
+	samples: []u8
+	channels: Audio_Channels
+	format: Raw_Audio_Format
+	has_fmt: bool
+	has_data: bool
+
+	// Each chunk is a four character id, the size of its content as a u32, and then the content
+	// itself. We only look at "fmt " and "data". The others carry things such as metadata and loop
+	// points, which we don't use.
+	for len(chunks) >= 8 {
+		chunk_id := string(chunks[:4])
+		chunk_size, _ := endian.get_u32(chunks[4:8], .Little)
+		content := chunks[8:]
+
+		// Truncated file, or a program that wrote a too big size: Use what is actually there.
+		if u64(chunk_size) < u64(len(content)) {
+			content = content[:chunk_size]
+		}
+
+		switch chunk_id {
+		case "fmt ":
+			// The values the `audio_format` field below can have. Extensible means that the real
+			// format is in a GUID at the end of the chunk. Recording programs tend to use it for
+			// anything with more than 16 bits per sample.
+			WAV_FORMAT_PCM :: 1
+			WAV_FORMAT_FLOAT :: 3
+			WAV_FORMAT_EXTENSIBLE :: 0xfffe
+
+			// The fmt chunk is at least 16 bytes:
+			//
+			//	audio_format:    u16
+			//	num_channels:    u16
+			//	sample_rate:     u32
+			//	byte_per_sec:    u32 // sample_rate * byte_per_bloc
+			//	byte_per_bloc:   u16 // (num_channels * bits_per_sample) / 8
+			//	bits_per_sample: u16
+			if len(content) < 16 {
+				log.errorf("Invalid wav fmt chunk: Size is %v, expected at least 16", len(content))
+				return
 			}
 
-			d = d[4:]
+			audio_format, _ := endian.get_u16(content[0:2], .Little)
+			num_channels, _ := endian.get_u16(content[2:4], .Little)
+			fmt_sample_rate, _ := endian.get_u32(content[4:8], .Little)
+			bits_per_sample, _ := endian.get_u16(content[14:16], .Little)
 
-			if int(blk_size) != 16 || len(d) < 16 {
-				log.error("Invalid wav fmt block size")
-				continue
-			}
-
-			sample_rate_ok: bool
-			sample_rate, sample_rate_ok = endian.get_u32(d[4:8], .Little)
-
-			if !sample_rate_ok {
-				log.error("Failed reading sample rate from wav fmt block")
-				sample_rate = 0
-				continue
-			}
-
-			num_channels, num_channels_ok := endian.get_u16(d[2:4], .Little)
-
-			if num_channels_ok {
-				if num_channels == 1 {
-					channels = .Mono
-				} else if num_channels == 2 {
-					channels = .Stereo
-				} else {
-					log.errorf("Unsupported number of channels in wav fmt block: %v", num_channels)
-					continue
+			// Those 16 bytes can be followed by an extension: A u16 with the size of the
+			// extension, and for the extensible format also 6 bytes of extra channel information
+			// and a 16 byte sub format GUID. The first two bytes of that GUID are the real
+			// `audio_format`. We skip the rest: The channel mask in it only matters for more
+			// channels than we support.
+			if audio_format == WAV_FORMAT_EXTENSIBLE {
+				if len(content) < 26 {
+					log.errorf("Invalid wav fmt chunk: Size is %v, too small for an extensible " +
+						"sub format", len(content))
+					return
 				}
-			} else {
-				log.error("Failed reading number of channels from wav fmt block")
-				continue
+
+				audio_format, _ = endian.get_u16(content[24:26], .Little)
 			}
 
-			audio_format, audio_format_ok := endian.get_u16(d[0:2], .Little)
-
-			if !audio_format_ok {
-				log.error("Failed reading format from wav fmt block")
-				continue
+			if fmt_sample_rate == 0 {
+				log.error("Invalid wav fmt chunk: Sample rate is zero")
+				return
 			}
 
-			if audio_format == 1 {
-				bits_per_sample, bits_per_sample_ok := endian.get_u16(d[14:16], .Little)
+			switch num_channels {
+			case 1:
+				channels = .Mono
+			case 2:
+				channels = .Stereo
+			case:
+				log.errorf("Unsupported number of channels in wav fmt chunk: %v", num_channels)
+				return
+			}
 
-				if !bits_per_sample_ok {
-					log.error("Failed reading bits per sample from wav fmt block")
-					continue
-				}
-
+			switch audio_format {
+			case WAV_FORMAT_PCM:
 				switch bits_per_sample {
 				case 8:
 					format = .Integer8
 				case 16:
 					format = .Integer16
+				case 24:
+					format = .Integer24
 				case 32:
 					format = .Integer32
 				case:
-					log.errorf("Unsupported bits per sample in wav fmt block: %v", bits_per_sample)
-					continue
+					log.errorf("Unsupported bits per sample in wav fmt chunk: %v", bits_per_sample)
+					return
 				}
-			} else if audio_format == 3 {
-				format = .Float
-			} else {
-				log.error("Invalid format in wav fmt block")
-				continue
+
+			case WAV_FORMAT_FLOAT:
+				switch bits_per_sample {
+				case 32:
+					format = .Float32
+				case 64:
+					format = .Float64
+				case:
+					log.errorf(
+						"Unsupported bits per sample in float wav fmt chunk: %v",
+						bits_per_sample,
+					)
+					return
+				}
+
+			case:
+				log.errorf("Unsupported format in wav fmt chunk: %v", audio_format)
+				return
 			}
 
+			sample_rate = int(fmt_sample_rate)
+			has_fmt = true
 
-			// Just need sample rate for now, so I disabled the rest...
-
-			/*
-			Wav_Fmt :: struct {
-				audio_format:    u16,
-				num_channels:    u16,
-				sample_rate:     u32,
-				byte_per_sec:    u32, // sample_rate * byte_per_bloc
-				byte_per_bloc:   u16, // (num_channels * bits_per_sample) / 8
-				bits_per_sample: u16,
-			}
-
-			audio_format, audio_format_ok := endian.get_u16(d[0:2], .Little)
-			num_channels, num_channels_ok := endian.get_u16(d[2:4], .Little)
-			sample_rate, sample_rate_ok := endian.get_u32(d[4:8], .Little)
-			byte_per_sec, byte_per_sec_ok := endian.get_u32(d[8:12], .Little)
-			byte_per_bloc, byte_per_bloc_ok := endian.get_u16(d[12:14], .Little)
-			bits_per_sample, bits_per_sample_ok := endian.get_u16(d[14:16], .Little)
-
-			if (
-				!audio_format_ok ||
-				!num_channels_ok ||
-				!sample_rate_ok ||
-				!byte_per_sec_ok ||
-				!byte_per_bloc_ok ||
-				!bits_per_sample_ok
-			) {
-				log.error("Failed reading wav fmt block")
-				continue
-			}
-
-			fmt := Wav_Fmt {
-				audio_format = audio_format,
-				num_channels = num_channels,
-				sample_rate = sample_rate,
-				byte_per_sec = byte_per_sec,
-				byte_per_bloc = byte_per_bloc,
-				bits_per_sample = bits_per_sample,
-			}
-
-			sample_rate = int(fmt.sample_rate)
-			*/
-		} else if blk_id == "data" {
-			data_size, data_size_ok := endian.get_u32(d, .Little)
-
-			if !data_size_ok {
-				log.error("Failed getting wav data size")
-				continue
-			}
-
-			d = d[4:]
-
-			if len(d) < int(data_size) {
-				log.error("Data size larger than remaining wave buffer")
-				continue
-			}
-
-			samples = d[:data_size]
+		case "data":
+			samples = content
+			has_data = true
 		}
+
+		// Content is padded to an even number of bytes. The pad byte isn't part of the size.
+		next := 8 + len(content) + (len(content) & 1)
+
+		if next >= len(chunks) {
+			break
+		}
+
+		chunks = chunks[next:]
 	}
-	
-	return load_audio_buffer_from_bytes_raw(samples, format, int(sample_rate), channels)
+
+	if !has_fmt {
+		log.error("Invalid wav file: No fmt chunk")
+		return
+	}
+
+	if !has_data {
+		log.error("Invalid wav file: No data chunk")
+		return
+	}
+
+	return _load_audio_buffer_from_raw_samples(samples, format, sample_rate, channels), true
 }
 
-// Load an audio buffer from some raw audio data. You need to specify the data, format and sample
+// Load an audio clip from some raw audio data. You need to specify the data, format and sample
 // rate of the sound yourself. This assumes that there is no header in the data. If your data has a
-// header (you read the data from a file on disk), then please use `load_audio_buffer_from_bytes`
-// instead.
-load_audio_buffer_from_bytes_raw :: proc(
+// header (for example, you read a whole WAV file from disk), then please use
+// `load_audio_clip_from_bytes` instead.
+//
+// The second return value is `true` if the audio clip was loaded correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Audio_Clip` will
+// still be possible to use, but it won't play anything.
+load_audio_clip_from_bytes_raw :: proc(
 	bytes: []u8,
-	format: Raw_Sound_Format,
+	format: Raw_Audio_Format,
 	sample_rate: int,
 	channels: Audio_Channels,
-) -> Audio_Buffer {
+) -> (Audio_Clip, bool) #optional_ok {
+	audio_buffer_object := _load_audio_buffer_from_raw_samples(bytes, format, sample_rate, channels)
+
+	sync.mutex_guard(&s.audio_mutex)
+	audio_buffer, audio_buffer_add_error := hm.add(&s.audio_buffers, audio_buffer_object)
+
+	if audio_buffer_add_error != nil {
+		log.errorf("Failed to load audio clip. Error: %v", audio_buffer_add_error)
+		delete(audio_buffer_object.samples, s.allocator)
+		return AUDIO_CLIP_NONE, false
+	}
+
+	return Audio_Clip(audio_buffer), true
+}
+
+_load_audio_buffer_from_raw_samples :: proc(
+	bytes: []u8,
+	format: Raw_Audio_Format,
+	sample_rate: int,
+	channels: Audio_Channels,
+) -> Audio_Buffer_Object {
 	samples: []Audio_Sample
 
 	switch format{
@@ -2115,6 +2823,18 @@ load_audio_buffer_from_bytes_raw :: proc(
 			samples[idx] = f32(samples_i16[idx]) / f32(max(i16))
 		}
 
+	case .Integer24:
+		// There is no 24 bit integer type, so shift each sample up into the top of an i32. That
+		// makes the same division as for 32 bit samples work.
+		num_samples := len(bytes)/3
+		samples = make([]Audio_Sample, num_samples, s.allocator)
+
+		for idx in 0..<num_samples {
+			b := bytes[idx*3:]
+			sample := i32(u32(b[0]) << 8 | u32(b[1]) << 16 | u32(b[2]) << 24)
+			samples[idx] = f32(sample) / f32(max(i32))
+		}
+
 	case .Integer32:
 		samples_i32 := slice.reinterpret([]i32, bytes)
 		samples = make([]Audio_Sample, len(samples_i32), s.allocator)
@@ -2123,111 +2843,72 @@ load_audio_buffer_from_bytes_raw :: proc(
 			samples[idx] = f32(samples_i32[idx]) / f32(max(i32))
 		}
 
-	case .Float:
+	case .Float32:
 		samples = slice.clone(slice.reinterpret([]Audio_Sample, bytes), s.allocator)
+
+	case .Float64:
+		samples_f64 := slice.reinterpret([]f64, bytes)
+		samples = make([]Audio_Sample, len(samples_f64), s.allocator)
+
+		for idx in 0..<len(samples) {
+			samples[idx] = Audio_Sample(samples_f64[idx])
+		}
 	}
 
-	buffer_object := Audio_Buffer_Object {
+	audio_buffer_object := Audio_Buffer_Object {
 		sample_rate = sample_rate,
 		samples = samples,
 		channels = channels,
 	}
 
-	buffer, buffer_add_error := hm.add(&s.audio_buffers, buffer_object)
-
-	if buffer_add_error != nil {
-		log.errorf("Failed to load sound. Error: %v", buffer_add_error)
-		return AUDIO_BUFFER_NONE
-	}
-
-	return buffer
+	return audio_buffer_object
 }
 
-// Creates a sound that can be used to play the contents of an `Audio_Buffer`. This can be used to
-// load an audio buffer once and have multiple sounds playing the contents of it, simultaneously.
-// This makes all those sounds share the same audio data.
-//
-// Sounds created using this procedure do not own the buffer. This means that calling
-// `destroy_sound` on the Sound will only remove the Sound from Karl2D's internal state, but it
-// won't destroy the Audio_Buffer. Such auto-destroying of the `Audio_Buffer` only happen with
-// sounds created using `load_sound_from_file` and `load_sound_from_bytes`.
-create_sound_from_audio_buffer :: proc(buffer: Audio_Buffer) -> Sound {
-	buffer_object := hm.get(&s.audio_buffers, buffer)
-
-	if buffer_object == nil {
-		log.error("Trying to create sound from invalid audio buffer")
-		return SOUND_NONE
-	}
-
-	sound_object := Sound_Object {
-		playback_settings = DEFAULT_AUDIO_BUFFER_PLAYBACK_SETTINGS,
-		audio_buffer = buffer,
-		owns_audio_buffer = false,
-	}
-
-	sound, sound_add_error := hm.add(&s.sounds, sound_object)
-
-	if sound_add_error != nil {
-		log.errorf("Failed to create sound from audio buffer. Error: %v", sound_add_error)
-		return SOUND_NONE
-	}
-
-	return sound
-}
-
-// Destroy a sound, removing it from Karl2D's internal list of sounds.
-//
-// If the sound was created using `create_sound_from_audio_buffer`, then this procedure will not
-// destroy the audio buffer. If the sound was created using `load_sound_from_file` or
-// `load_sound_from_bytes`, then this procedure WILL destroy the audio buffer.
-destroy_sound :: proc(sound: Sound) {
-	sound_object := hm.get(&s.sounds, sound)
-
-	if sound_object == nil {
-		log.error("Trying to destroy invalid sound. It may already be destroyed, or the handle may be invalid.")
-		return
-	}
-
-	if playing := hm.get(&s.playing_audio_buffers, sound_object.playing_buffer_handle); playing != nil {
-		hm.remove(&s.playing_audio_buffers, sound_object.playing_buffer_handle)
-	}
-	
-	if sound_object.owns_audio_buffer {
-		destroy_audio_buffer(sound_object.audio_buffer)
-	}
-
-	hm.remove(&s.sounds, sound)
-}
-
-// Destroy an audio buffer previously loaded using `load_audio_buffer_from_xxx`. Before destroying
-// this audio buffer, make sure it is not in use by any playing sounds. Destroy the sounds that
-// reference it using `destroy_sound` first.
-destroy_audio_buffer :: proc(audio_buffer: Audio_Buffer)  {
-	audio_buffer_object := hm.get(&s.audio_buffers, audio_buffer)
+// Destroy an audio clip previously loaded using `load_audio_clip_from_xxx`. Also stops sounds
+// playing this clip.
+destroy_audio_clip :: proc(clip: Audio_Clip)  {
+	sync.mutex_guard(&s.audio_mutex)
+	buffer := Audio_Buffer(clip)
+	audio_buffer_object := hm.get(&s.audio_buffers, buffer)
 
 	if audio_buffer_object == nil {
-		log.debug("Tried to destroy non-existing audio buffer")
+		log.debug("Tried to destroy non-existing audio clip")
 		return
+	}
+
+	for it := hm.dynamic_iterator_make(&s.sounds); snd, snd_handle in hm.dynamic_iterate(&it) {
+		if snd.source == clip {
+			hm.remove(&s.sounds, snd_handle)
+		}
 	}
 
 	delete(audio_buffer_object.samples, s.allocator)
-	hm.remove(&s.audio_buffers, audio_buffer)
+	hm.remove(&s.audio_buffers, buffer)
 }
 
 // Load an audio stream from a file on disk. This is often used for playing music. An audio stream
 // only loads a small part of the file at a time. As the file is played, new parts are streamed into
-// memory.
+// memory. Start playing the stream using `play_audio_stream`.
 //
 // Supported file formats: ogg
 //
 // Audio streams do not stream in data automatically from the disk. You need to call
 // `update_audio_stream` every frame to stream in the new data.
-load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
+//
+// The second return value is `true` if the audio stream was loaded correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Audio_Stream` will
+// still be possible to use, but it won't play anything.
+load_audio_stream_from_file :: proc(
+	filename: string,
+) -> (
+	_stream: Audio_Stream,
+	_ok: bool,
+) #optional_ok {
 	f, f_err := file_open(filename)
 
 	if f_err != nil {
 		log.errorf("Failed opening file %v. Error: %v", filename, f_err)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
 	buf := make([dynamic]u8, frame_allocator)
@@ -2241,7 +2922,7 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 			log.errorf("Failed closing file. Error: %v", close_err)
 		}
 		
-		return AUDIO_STREAM_NONE
+		return
 	}
 
 	vorbis_buffer := stbv.vorbis_alloc {
@@ -2275,7 +2956,7 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 				log.errorf("Failed seeking in audio stream file %v. Error: %v", filename, seek_err)
 				file_close(f)
 				free(vorbis_buffer.alloc_buffer, s.allocator)
-				return AUDIO_STREAM_NONE
+				return
 			}
 
 			break
@@ -2288,14 +2969,14 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 				log.errorf("Failed reading from audio stream file %v. Error: %v", filename, read_err)
 				file_close(f)
 				free(vorbis_buffer.alloc_buffer, s.allocator)
-				return AUDIO_STREAM_NONE
+				return
 			}
 
 			if nbytes_read == 0 {
 				log.errorf("Failed to load audio stream. Reached end of file before stream could be loaded.")
 				file_close(f)
 				free(vorbis_buffer.alloc_buffer, s.allocator)
-				return AUDIO_STREAM_NONE
+				return
 			}
 
 			append(&buf, ..read_buf[:nbytes_read])
@@ -2303,7 +2984,7 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 			log.errorf("Failed to load audio stream. Error: %v", vorbis_err)
 			file_close(f)
 			free(vorbis_buffer.alloc_buffer, s.allocator)
-			return AUDIO_STREAM_NONE
+			return
 		}
 	}
 
@@ -2322,27 +3003,29 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 		}
 				
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
-	buffer := Audio_Buffer_Object {
+	audio_buffer := Audio_Buffer_Object {
 		sample_rate = int(info.sample_rate),
 		samples = make([]Audio_Sample, AUDIO_STREAM_BUFFER_SIZE, s.allocator),
 		channels = channels,
 	}
 
-	buffer_handle, buffer_handle_add_err := hm.add(&s.audio_buffers, buffer)
+	sync.mutex_guard(&s.audio_mutex)
 
-	if buffer_handle_add_err != nil {
-		log.errorf("Failed to load audio stream. Error: %v", buffer_handle_add_err)
+	audio_buffer_handle, audio_buffer_handle_add_err := hm.add(&s.audio_buffers, audio_buffer)
+
+	if audio_buffer_handle_add_err != nil {
+		log.errorf("Failed to load audio stream. Error: %v", audio_buffer_handle_add_err)
 		
 		if close_err := file_close(f); close_err != nil {
 			log.errorf("Failed closing file. Error: %v", close_err)
 		}
 
-		delete(buffer.samples, s.allocator)
+		delete(audio_buffer.samples, s.allocator)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
 	asd := Audio_Stream_Data {
@@ -2350,13 +3033,9 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 		file = f,
 		vorbis = vorbis_res,
 		vorbis_buffer = vorbis_buffer,
-		buffer = buffer_handle,
-		playback_settings = {
-			pan = 0,
-			volume = 1,
-			pitch = 1,
-		},
-		file_read_buf = make([dynamic]u8, s.allocator),
+		buffer = audio_buffer_handle,
+		total_samples = _ogg_file_total_frames(f) * int(info.channels),
+		file_read_buf = make([]u8, AUDIO_STREAM_READ_BUF_SIZE, s.allocator),
 	}
 
 	stream, stream_add_err := hm.add(&s.audio_streams, asd)
@@ -2364,14 +3043,14 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 	if stream_add_err != nil {
 		log.errorf("Failed to create audio stream from file. Error: %v", stream_add_err)
 		file_close(asd.file)
-		delete(asd.file_read_buf)
-		delete(buffer.samples, s.allocator)
-		hm.remove(&s.audio_buffers, buffer_handle)
+		delete(asd.file_read_buf, s.allocator)
+		delete(audio_buffer.samples, s.allocator)
+		hm.remove(&s.audio_buffers, audio_buffer_handle)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
-	return stream
+	return stream, true
 }
 
 // Load an audio stream from a byte slice that is completely in memory. This makes it possible to
@@ -2390,14 +3069,23 @@ load_audio_stream_from_file :: proc(filename: string) -> Audio_Stream {
 // `.wasm` file.
 //
 // Another use case is if you're making a desktop game and you want to embed all the assets in the
-// executable (so the game is a single file). In that case you'd could also use `#load` to fetch the
+// executable (so the game is a single file). In that case you could also use `#load` to fetch the
 // file and then send it into this procedure.
 //
 // Note that this procedure wants the encoded file, for example an ogg file just like it was on
-// disk. For normal sounds there is a `load_sound_from_bytes_raw` procedure where you just send in
-// the samples. There is no such procedure for audio streams since the whole idea is to stream an
-// encoded file into memory without having to decode the whole thing first.  
-load_audio_stream_from_bytes :: proc(bytes: []u8) -> Audio_Stream {
+// disk. For normal sounds there is a `load_audio_clip_from_bytes_raw` procedure where you just send
+// in the samples. There is no such procedure for audio streams since the whole idea is to stream an
+// encoded file into memory without having to decode the whole thing first.
+//
+// The second return value is `true` if the audio stream was loaded correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Audio_Stream` will
+// still be possible to use, but it won't play anything.
+load_audio_stream_from_bytes :: proc(
+	bytes: []u8,
+) -> (
+	_stream: Audio_Stream,
+	_ok: bool,
+) #optional_ok {
 	vorbis_err: stbv.Error
 
 	vorbis_buffer := stbv.vorbis_alloc {
@@ -2417,7 +3105,7 @@ load_audio_stream_from_bytes :: proc(bytes: []u8) -> Audio_Stream {
 	if vorbis_err != nil {
 		log.errorf("Failed opening audio stream from bytes. Error: %v", vorbis_err)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
 	info := stbv.get_info(vorbis_res)
@@ -2430,48 +3118,46 @@ load_audio_stream_from_bytes :: proc(bytes: []u8) -> Audio_Stream {
 	} else{
 		log.errorf("Unsupported number of channels: %v", info.channels)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
-	buffer := Audio_Buffer_Object {
+	audio_buffer := Audio_Buffer_Object {
 		sample_rate = int(info.sample_rate),
 		samples = make([]Audio_Sample, AUDIO_STREAM_BUFFER_SIZE, s.allocator),
 		channels = channels,
 	}
 
-	buffer_handle, buffer_handle_add_err := hm.add(&s.audio_buffers, buffer)
+	sync.mutex_guard(&s.audio_mutex)
 
-	if buffer_handle_add_err != nil {
-		log.errorf("Failed to load audio stream. Error: %v", buffer_handle_add_err)
-		delete(buffer.samples, s.allocator)
+	audio_buffer_handle, audio_buffer_handle_add_err := hm.add(&s.audio_buffers, audio_buffer)
+
+	if audio_buffer_handle_add_err != nil {
+		log.errorf("Failed to load audio stream. Error: %v", audio_buffer_handle_add_err)
+		delete(audio_buffer.samples, s.allocator)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
 	asd := Audio_Stream_Data {
 		mode = .From_Bytes,
 		bytes = bytes,
 		vorbis = vorbis_res,
-		buffer = buffer_handle,
+		buffer = audio_buffer_handle,
 		vorbis_buffer = vorbis_buffer,
-		playback_settings = {
-			pan = 0,
-			volume = 1,
-			pitch = 1,
-		},
+		total_samples = int(stbv.stream_length_in_samples(vorbis_res)) * int(info.channels),
 	}
 
 	stream, stream_add_err := hm.add(&s.audio_streams, asd)
 
 	if stream_add_err != nil {
 		log.errorf("Failed to create audio stream from bytes. Error: %v", stream_add_err)
-		delete(buffer.samples, s.allocator)
-		hm.remove(&s.audio_buffers, buffer_handle)
+		delete(audio_buffer.samples, s.allocator)
+		hm.remove(&s.audio_buffers, audio_buffer_handle)
 		free(vorbis_buffer.alloc_buffer, s.allocator)
-		return AUDIO_STREAM_NONE
+		return
 	}
 
-	return stream
+	return stream, true
 }
 
 // Destroy an audio stream previously loaded using `load_audio_stream_from_file` or
@@ -2480,6 +3166,8 @@ load_audio_stream_from_bytes :: proc(bytes: []u8) -> Audio_Stream {
 // If you created the stream using `load_audio_stream_from_bytes`, then this procedure will NOT
 // deallocate the bytes that you sent into that procedure.
 destroy_audio_stream :: proc(stream: Audio_Stream) {
+	sync.mutex_guard(&s.audio_mutex)
+
 	sd := hm.get(&s.audio_streams, stream)
 
 	if sd == nil {
@@ -2487,8 +3175,10 @@ destroy_audio_stream :: proc(stream: Audio_Stream) {
 		return
 	}
 
-	if playing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); playing != nil {
-		hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
+	sync.mutex_lock(&sd.decode_mutex)
+
+	if playing := hm.get(&s.sounds, sd.sound); playing != nil {
+		hm.remove(&s.sounds, sd.sound)
 	}
 
 	if ab := hm.get(&s.audio_buffers, sd.buffer); ab != nil {
@@ -2499,46 +3189,114 @@ destroy_audio_stream :: proc(stream: Audio_Stream) {
 	switch sd.mode {
 	case .From_File:
 		file_close(sd.file)
-		delete(sd.file_read_buf)
+		delete(sd.file_read_buf, s.allocator)
 	case .From_Bytes:
 		// don't free the bytes, they are owned by the game
 	}
 
 	free(sd.vorbis_buffer.alloc_buffer, s.allocator)
+	sync.mutex_unlock(&sd.decode_mutex)
 	hm.remove(&s.audio_streams, stream)
 }
 
-// Streams in new audio data from the audio stream. You need to call this once per frame in order
-// for the streaming to actually happen. 
+// Streams in new audio data from the audio stream. You need to call this regularly for the stream
+// to not run out of data.
+//
+// THREAD SAFE: One thread per stream may call this. That way you can create a "music thread" that
+// is immune to both in-game stalls and external stalls, such as the window being moved.
 update_audio_stream :: proc(stream: Audio_Stream) {
+	sync.mutex_lock(&s.audio_mutex)
 	sd := hm.get(&s.audio_streams, stream)
 
 	if sd == nil {
+		sync.mutex_unlock(&s.audio_mutex)
 		log.error("Trying to update destroyed audio stream")
 		return
 	}
 
-	pab := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle)
+	sound := sd.sound
+	so := hm.get(&s.sounds, sound)
 
-	if pab == nil {
-		// Don't log an error here: Not playing the stream is a valid state. It just doesn't need
-		// any updating.
+	if so == nil {
+		sync.mutex_unlock(&s.audio_mutex)
 		return
 	}
 
-	ab := hm.get(&s.audio_buffers, pab.audio_buffer)
+	abo := hm.get(&s.audio_buffers, sd.buffer)
 
-	if ab == nil {
-		hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
+	if abo == nil {
+		hm.remove(&s.sounds, sound)
+		sync.mutex_unlock(&s.audio_mutex)
 		log.error("Trying to update audio stream with destroyed buffer")
 		return
 	}
 
-	audio_stream_remaining :: proc(as: ^Audio_Stream_Data, pab: ^Playing_Audio_Buffer, ab: ^Audio_Buffer_Object) -> int {
-		remaining := as.buffer_write_pos - pab.offset 
+	// We fetch this while guarded by audio_mutex, we'll use them during the seeking & decode.
+	play_offset := so.offset
+	loop := sd.loop
+	seek := sd.seek_state == .Ready
+	seek_seconds := sd.seek_seconds
+	cursor := sd.cursor
+
+	if seek {
+		sd.seek_state = .Seeking
+	}
+
+	sync.mutex_lock(&sd.decode_mutex)
+	sync.mutex_unlock(&s.audio_mutex)
+
+	if seek {
+		post_seek_cursor, seek_ok := _seek_audio_stream(sd, abo^, cursor, seek_seconds)
+
+		if seek_ok {
+			cursor = post_seek_cursor
+			slice.zero(abo.samples)
+			cursor.buffer_write_pos = play_offset
+		}
+	}
+
+	post_decode_cursor, decode_ok := _decode_audio_stream(sd, abo, cursor, play_offset, loop)
+	sync.mutex_unlock(&sd.decode_mutex)
+	sync.mutex_lock(&s.audio_mutex)
+
+	if !decode_ok {
+		hm.remove(&s.sounds, sound)
+		sync.mutex_unlock(&s.audio_mutex)
+		return
+	}
+
+	if sd = hm.get(&s.audio_streams, stream); sd != nil {
+		sd.cursor = post_decode_cursor
+
+		if sd.seek_state == .Seeking {
+			sd.seek_state = .None
+		}
+	}
+
+	sync.mutex_unlock(&s.audio_mutex)
+}
+
+_decode_audio_stream :: proc(
+	sd: ^Audio_Stream_Data,
+	ab: ^Audio_Buffer_Object,
+	cursor: Audio_Stream_Cursor,
+	play_offset: int,
+	loop: bool,
+) -> (
+	_post_decode_cursor: Audio_Stream_Cursor,
+	_ok: bool,
+) {
+	cursor := cursor
+
+	audio_stream_remaining :: proc(
+		cursor: Audio_Stream_Cursor,
+		ab: ^Audio_Buffer_Object,
+		play_offset: int,
+	) -> int {
+		remaining := cursor.buffer_write_pos - play_offset
 
 		if remaining < 0 {
-			remaining = len(ab.samples) - pab.offset + as.buffer_write_pos 
+			remaining = len(ab.samples) - play_offset + cursor.buffer_write_pos
 		}
 
 		return remaining
@@ -2546,7 +3304,7 @@ update_audio_stream :: proc(stream: Audio_Stream) {
 
 	switch sd.mode {
 	case .From_File:
-		for audio_stream_remaining(sd, pab, ab) < AUDIO_STREAM_BUFFER_SIZE / 2 {
+		for audio_stream_remaining(cursor, ab, play_offset) < AUDIO_STREAM_BUFFER_SIZE / 2 {
 			channels: i32
 			samples: i32
 			output: [^]^f32
@@ -2554,100 +3312,130 @@ update_audio_stream :: proc(stream: Audio_Stream) {
 			bytes_used := stbv.decode_frame_pushdata(
 				sd.vorbis,
 				raw_data(sd.file_read_buf[sd.file_read_buf_offset:]),
-				i32(len(sd.file_read_buf) - sd.file_read_buf_offset),
+				i32(sd.file_read_buf_len - sd.file_read_buf_offset),
 				&channels,
-				&output, 
+				&output,
 				&samples,
 			)
 
 			if bytes_used == 0 && samples == 0 {
-				read_buf_size := len(sd.file_read_buf)
-				non_zero_resize(&sd.file_read_buf, read_buf_size + 256)
-				read, read_err := file_read(sd.file, sd.file_read_buf[read_buf_size:read_buf_size+256])
+				// ^ 0 bytes used, 0 samples output (need more data)
 
-				if read > 0 {
-					shrink(&sd.file_read_buf, read_buf_size + read)
+				copy(
+					sd.file_read_buf[:],
+					sd.file_read_buf[sd.file_read_buf_offset:sd.file_read_buf_len],
+				)
+				sd.file_read_buf_len -= sd.file_read_buf_offset
+				sd.file_read_buf_offset = 0
+				space := len(sd.file_read_buf) - sd.file_read_buf_len
+
+				if space == 0 {
+					log.error("Cannot decode audio stream, an ogg page is too big. Stopping it.")
+					return
 				}
+
+				to_read := min(space, AUDIO_STREAM_READ_SIZE)
+				read, read_err := file_read(
+					sd.file,
+					sd.file_read_buf[sd.file_read_buf_len:sd.file_read_buf_len + to_read],
+				)
+				sd.file_read_buf_len += read
 
 				if read_err != nil {
 					if read_err == .EOF {
-						if sd.loop {
+						if loop {
 							_, seek_err := file_seek(sd.file, 0, .Start)
 
 							if seek_err != nil {
 								log.errorf("Failed seeking in audio stream file. Stopping it. Error: %v", seek_err)
-								stop_audio_stream(stream)
-								break
+								return
 							}
 
+							sd.file_read_buf_len = 0
+							sd.file_read_buf_offset = 0
+
 							stbv.flush_pushdata(sd.vorbis)
+							cursor.decode_cursor = 0
+
+							// A discard larger than the file would otherwise spin forever.
+							cursor.seek_discard = 0
+
 							continue
 						} else {
-							stop_audio_stream(stream)
-							break
+							return
 						}
 					} else {
-						hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
 						log.errorf("Failed reading from audio stream file. Error: %v", read_err)
-						break
+						return
 					}
 				}
 			} else if bytes_used > 0 && samples == 0 {
+				// ^ N bytes used, 0 samples output (resynching the stream, keep going)
 				sd.file_read_buf_offset += int(bytes_used)
 			} else if bytes_used > 0 && samples > 0 {
+				// ^ N bytes used, M samples output (one frame of data)
+
 				if channels == 1 {
 					mono: [^]f32 = output[0]
 
 					for samp_idx in 0..<samples {
-						ab.samples[sd.buffer_write_pos] = mono[samp_idx]
-						sd.buffer_write_pos = (sd.buffer_write_pos + 1) % len(ab.samples)
+						// A pending seek throws away decoded samples instead of writing them,
+						// until the decoder has caught up to the target position.
+						if cursor.seek_discard > 0 {
+							cursor.seek_discard -= 1
+						} else {
+							ab.samples[cursor.buffer_write_pos] = mono[samp_idx]
+							cursor.buffer_write_pos = (cursor.buffer_write_pos + 1) % len(ab.samples)
+						}
+
+						cursor.decode_cursor += 1
 					}
 				} else if channels == 2 {
 					left: [^]f32 = output[0]
 					right: [^]f32 = output[1]
 
 					for samp_idx in 0..<samples {
-						ab.samples[sd.buffer_write_pos] = left[samp_idx]
-						ab.samples[sd.buffer_write_pos + 1] = right[samp_idx]
-						sd.buffer_write_pos = (sd.buffer_write_pos + 2) % len(ab.samples)
+						if cursor.seek_discard > 0 {
+							cursor.seek_discard -= 2
+						} else {
+							ab.samples[cursor.buffer_write_pos] = left[samp_idx]
+							ab.samples[cursor.buffer_write_pos + 1] = right[samp_idx]
+							cursor.buffer_write_pos = (cursor.buffer_write_pos + 2) % len(ab.samples)
+						}
+
+						cursor.decode_cursor += 2
 					}
 				} else {
-					hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
 					log.error("Invalid num channels")
-					break
+					return
 				}
 				sd.file_read_buf_offset += int(bytes_used)
 			} else {
-				hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
 				log.error("Invalid vorbis")
-				break
+				return
 			}
-		}
-
-		if len(sd.file_read_buf) > 0 {
-			// We didn't consume all the data in the read buffer. Move the remaining data to the start
-			// of the buffer so that it can be consumed in the next update.
-			copy(sd.file_read_buf[:], sd.file_read_buf[sd.file_read_buf_offset:])
-			shrink(&sd.file_read_buf, len(sd.file_read_buf) - sd.file_read_buf_offset)
-			sd.file_read_buf_offset = 0
 		}
 	case .From_Bytes:
 		channels: i32
 		output: [^]^f32
 
-		for audio_stream_remaining(sd, pab, ab) < AUDIO_STREAM_BUFFER_SIZE / 2 {
+		for audio_stream_remaining(cursor, ab, play_offset) < AUDIO_STREAM_BUFFER_SIZE / 2 {
 			samples := stbv.get_frame_float(sd.vorbis, &channels, &output)
 
 			if samples == 0 {
-				if sd.loop {
+				if loop {
 					stbv.seek_start(sd.vorbis)
+					cursor.decode_cursor = 0
+
+					// A discard larger than the file would otherwise spin forever.
+					cursor.seek_discard = 0
+
 					continue
 				} else {
-					// TODO: Stopping here is bad as the samples haven't been mixed in yet. Remove the
-					// stream but push the final samples into the audio buffer and destroy that one
-					// when it finishes playing (in the mixer).
-					stop_audio_stream(stream)
-					break
+					// TODO: Stopping here is bad as the samples haven't been mixed in yet. Perhaps
+					// we should remove the stream but push the final samples into the buffer and
+					// destroy that one when it finishes playing in the mixer.
+					return
 				}
 			}
 
@@ -2655,48 +3443,121 @@ update_audio_stream :: proc(stream: Audio_Stream) {
 				mono: [^]f32 = output[0]
 
 				for samp_idx in 0..<samples {
-					ab.samples[sd.buffer_write_pos] = mono[samp_idx]
-					sd.buffer_write_pos = (sd.buffer_write_pos + 1) % len(ab.samples)
+					ab.samples[cursor.buffer_write_pos] = mono[samp_idx]
+					cursor.buffer_write_pos = (cursor.buffer_write_pos + 1) % len(ab.samples)
+					cursor.decode_cursor += 1
 				}
 			} else if channels == 2 {
 				left: [^]f32 = output[0]
 				right: [^]f32 = output[1]
 
 				for samp_idx in 0..<samples {
-					ab.samples[sd.buffer_write_pos] = left[samp_idx]
-					ab.samples[sd.buffer_write_pos + 1] = right[samp_idx]
-					sd.buffer_write_pos = (sd.buffer_write_pos + 2) % len(ab.samples)
+					ab.samples[cursor.buffer_write_pos] = left[samp_idx]
+					ab.samples[cursor.buffer_write_pos + 1] = right[samp_idx]
+					cursor.buffer_write_pos = (cursor.buffer_write_pos + 2) % len(ab.samples)
+					cursor.decode_cursor += 2
 				}
 			} else {
-				hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
 				log.error("Invalid num channels")
-				break
+				return
 			}
 		}
 	}
+
+	return cursor, true
 }
 
-// Start playing an audio stream. Don't forget to call `update_audio_stream` every frame in order to
-// stream in new data.
+// Start playing an audio stream. Returns a `Sound`, which you can control using
+// `set_sound_volume`, `stop_sound` etc. The playback starts from wherever the stream last was,
+// which is the beginning if the stream was just loaded, was stopped using `stop_sound` or has
+// finished playing.
 //
-// Running this this while the stream is already playing will restart it from the beginning. Use
-// `pause_audio_stream` if you just want to pause it.
-play_audio_stream :: proc(stream: Audio_Stream) {
+// A stream can only play one sound at a time. If it is already playing, then this hands back the
+// sound that is already playing and ignores the settings you pass in. Use the `set_sound_xxx`
+// procedures to change how it plays. Use `stop_sound` first if you want to start over from the
+// beginning. A paused sound starts playing again.
+//
+// Don't forget to call `update_audio_stream` every frame in order to stream in new data.
+play_audio_stream :: proc(
+	stream: Audio_Stream,
+	volume: f32 = 1,
+	pan: f32 = 0,
+	pitch: f32 = 1,
+	loop := false,
+	bus: Audio_Bus = AUDIO_BUS_MASTER,
+) -> Sound {
+	sync.mutex_lock(&s.audio_mutex)
+
 	sd := hm.get(&s.audio_streams, stream)
 
 	if sd == nil {
+		sync.mutex_unlock(&s.audio_mutex)
 		log.error("Cannot play audio stream, stream does not exist.")
-		return
+		return SOUND_NONE
 	}
 
-	if existing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); existing != nil {
-		stop_audio_stream(stream)
+	if bus != AUDIO_BUS_MASTER && hm.get(&s.audio_buses, bus) == nil {
+		sync.mutex_unlock(&s.audio_mutex)
+		log.error("Cannot play audio stream, audio bus does not exist.")
+		return SOUND_NONE
 	}
 
-	playing_audio_buffer := Playing_Audio_Buffer {
-		audio_buffer = sd.buffer,
-		target_settings = sd.playback_settings,
-		current_settings = sd.playback_settings,
+	// A stream can only feed one sound, and that sound is already playing, so there is nothing to
+	// start. Hand back the sound that is already going. Unpause it though: This procedure is how
+	// you play a stream, so it should be playing when we are done.
+	if existing := hm.get(&s.sounds, sd.sound); existing != nil && !existing.remove {
+		existing.paused = false
+		sync.mutex_unlock(&s.audio_mutex)
+		return sd.sound
+	}
+
+	ab := hm.get(&s.audio_buffers, sd.buffer)
+
+	if ab == nil {
+		sync.mutex_unlock(&s.audio_mutex)
+		log.error("Cannot play audio stream, its buffer does not exist.")
+		return SOUND_NONE
+	}
+
+	sd.loop = loop
+	sd.seek_state = .None
+	sync.mutex_lock(&sd.decode_mutex)
+	sync.mutex_unlock(&s.audio_mutex)
+
+	switch sd.mode {
+	case .From_File:
+		file_seek(sd.file, 0, .Start)
+		sd.file_read_buf_len = 0
+		sd.file_read_buf_offset = 0
+		stbv.flush_pushdata(sd.vorbis)
+
+	case .From_Bytes:
+		stbv.seek_start(sd.vorbis)
+	}
+
+	// Decode into the buffer before returning, so that there is something to play right away.
+	post_decode_cursor, decode_ok := _decode_audio_stream(sd, ab, {}, 0, loop)
+	sync.mutex_unlock(&sd.decode_mutex)
+
+	if !decode_ok {
+		return SOUND_NONE
+	}
+
+	sync.mutex_guard(&s.audio_mutex)
+	sd.cursor = post_decode_cursor
+
+	playback_settings := Sound_Settings {
+		volume = clamp(volume, 0, 1),
+		pan = clamp(pan, -1, 1),
+		pitch = max(pitch, 0.01),
+	}
+
+	sound_object := Sound_Object {
+		buffer = sd.buffer,
+		target_settings = playback_settings,
+		current_settings = playback_settings,
+		bus = bus,
+		source = stream,
 
 		// This means that we are looping the buffer itself. We will use this buffer as a circular
 		// buffer, filling it with samples as we stream in more. Thus it needs to be looped to not
@@ -2705,171 +3566,206 @@ play_audio_stream :: proc(stream: Audio_Stream) {
 	}
 
 	add_err: runtime.Allocator_Error
-	sd.playing_buffer_handle, add_err = hm.add(&s.playing_audio_buffers, playing_audio_buffer)
+	sd.sound, add_err = hm.add(&s.sounds, sound_object)
 
 	if add_err != nil {
-		log.errorf("Failed playing the audio stream because the audio buffer could not be set up for playing. Error: %v", add_err)
+		log.errorf("Failed playing audio stream. Error: %v", add_err)
+		return SOUND_NONE
 	}
+
+	return sd.sound
 }
 
-// Pause an audio stream. Run `play_audio_stream` to unpause it.
-pause_audio_stream :: proc(stream: Audio_Stream) {
-	sd := hm.get(&s.audio_streams, stream)
-
-	if sd == nil {
-		log.error("Cannot pause audio stream, stream does not exist.")
-		return
-	}
-
-	if existing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); existing != nil {
-		hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
-	}
-
-	sd.playing_buffer_handle = PLAYING_AUDIO_BUFFER_NONE
-}
-
-// Stop an audio stream. If `play_audio_stream` is called again, the stream will start over from the
-// beginning.
-stop_audio_stream :: proc(stream: Audio_Stream) {
-	sd := hm.get(&s.audio_streams, stream)
-
-	if sd == nil {
-		log.error("Cannot stop audio stream, stream does not exist.")
-		return
-	}
-
-	if existing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); existing != nil {
-		hm.remove(&s.playing_audio_buffers, sd.playing_buffer_handle)
-	}
-
-	sd.playing_buffer_handle = PLAYING_AUDIO_BUFFER_NONE
-	sd.buffer_write_pos = 0
-
-	switch sd.mode {
-	case .From_File:
-		file_seek(sd.file, 0, .Start)
-		runtime.clear(&sd.file_read_buf)
-		sd.file_read_buf_offset = 0
-		stbv.flush_pushdata(sd.vorbis)
-
-	case .From_Bytes:
-		stbv.seek_start(sd.vorbis)
-	}
-}
-
-// Set the volume of the audio stream. Range: 0 to 1.
+// Create an audio bus: A group of sounds that are mixed together before they reach the master bus.
+// Route sounds into it using `set_sound_bus`, or the `bus` parameter of `play_audio_clip` or
+// `play_audio_stream`.
 //
-// You can use this both with a playing and non-playing stream. If its already playing, then this
-// will affect the playing stream.
-set_audio_stream_volume :: proc(stream: Audio_Stream, volume: f32) {
-	sd := hm.get(&s.audio_streams, stream)
-	
-	if sd == nil {
-		log.error("Cannot set audio stream volume, stream does not exist.")
+// A new bus has volume 1, pan 0 and no effect. That makes it a passthrough: Playing a sound on a
+// fresh bus sounds exactly like playing it on the master bus, until you change something.
+create_audio_bus :: proc() -> Audio_Bus {
+	sync.mutex_guard(&s.audio_mutex)
+	bus_object := Audio_Bus_Object {
+		target_settings = DEFAULT_AUDIO_BUS_SETTINGS,
+		current_settings = DEFAULT_AUDIO_BUS_SETTINGS,
+	}
+
+	bus, add_err := hm.add(&s.audio_buses, bus_object)
+
+	if add_err != nil {
+		log.errorf("Failed creating audio bus. Error: %v", add_err)
+
+		// The master bus always exists, so anything routed to this handle still plays.
+		return AUDIO_BUS_MASTER
+	}
+
+	return bus
+}
+
+// Destroy an audio bus. Everything routed to it goes back to the master bus, including sounds that
+// are playing right now.
+destroy_audio_bus :: proc(bus: Audio_Bus) {
+	sync.mutex_guard(&s.audio_mutex)
+	if bus == AUDIO_BUS_MASTER {
+		log.error("Cannot destroy audio bus, the master bus cannot be destroyed.")
 		return
 	}
 
-	clamped_volume := clamp(volume, 0, 1)
-
-	if playing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); playing != nil {
-		playing.target_settings.volume = clamped_volume
-	}
-	
-	sd.playback_settings.volume = clamped_volume
-}
-
-// Set the pan (balance between left and right) of the audio stream. Range: -1 to 1, where -1 is
-// full left, 0 is center and 1 is full right.
-//
-// You can use this both with a playing and non-playing stream. If its already playing, then this
-// will affect the playing stream.
-set_audio_stream_pan :: proc(stream: Audio_Stream, pan: f32) {
-	sd := hm.get(&s.audio_streams, stream)
-	
-	if sd == nil {
-		log.error("Cannot set audio stream pan, stream does not exist.")
+	if hm.get(&s.audio_buses, bus) == nil {
+		log.error("Cannot destroy audio bus, audio bus does not exist.")
 		return
 	}
 
-	clamped_pan := clamp(pan, -1, 1)
+	// Move everything that points at this bus over to the master bus. We do it here, and not by
+	// letting the mixer notice that the bus is gone, so that the mixer never has to deal with a bus
+	// handle that doesn't resolve.
 
-	if playing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); playing != nil {
-		playing.target_settings.pan = clamped_pan
+	for it := hm.dynamic_iterator_make(&s.sounds); sound_object, _ in hm.dynamic_iterate(&it) {
+		if sound_object.bus == bus {
+			sound_object.bus = AUDIO_BUS_MASTER
+		}
 	}
 
-	sd.playback_settings.pan = clamped_pan
+	hm.remove(&s.audio_buses, bus)
 }
 
-// Set the pitch of the audio stream. Range: 0.01 to infinity. A higher value will make the audio
-// play faster.
+// Set the volume of an audio bus. Range: 0 to 1. Everything mixed into the bus is scaled by this.
 //
-// You can use this both with a playing and non-playing stream. If its already playing, then this
-// will affect the playing stream.
-set_audio_stream_pitch :: proc(stream: Audio_Stream, pitch: f32) {
-	sd := hm.get(&s.audio_streams, stream)
-	
-	if sd == nil {
-		log.error("Cannot set audio stream pitch, stream does not exist.")
+// This works on `AUDIO_BUS_MASTER` as well, which is how you set the master volume of your game.
+set_audio_bus_volume :: proc(bus: Audio_Bus, volume: f32) {
+	sync.mutex_guard(&s.audio_mutex)
+	bus_object := bus == AUDIO_BUS_MASTER ? &s.master_bus : hm.get(&s.audio_buses, bus)
+
+	if bus_object == nil {
+		log.error("Cannot set audio bus volume, audio bus does not exist.")
 		return
 	}
 
-	capped_pitch := max(pitch, 0.01)
-
-	if playing := hm.get(&s.playing_audio_buffers, sd.playing_buffer_handle); playing != nil {
-		playing.target_settings.pitch = capped_pitch
-	}
-	
-	sd.playback_settings.pitch = capped_pitch
+	bus_object.target_settings.volume = clamp(volume, 0, 1)
 }
 
-// Set the audio stream to loop when it reaches the end of the stream. You can set this before
-// playing the stream. You can also modify the loop state of an already playing stream.
-set_audio_stream_loop :: proc(stream: Audio_Stream, loop: bool) {
-	sd := hm.get(&s.audio_streams, stream)
-	
-	if sd == nil {
-		log.errorf("Cannot set audio stream loop = %v, stream does not exist.", loop)
+// Set the pan of an audio bus. Range: -1 to 1, where -1 is full left, 0 is center and 1 is full
+// right.
+//
+// This is a balance control: It turns the opposite side down. The pan of a sound works
+// differently: It moves the sound between the left and right speakers while keeping the overall
+// loudness the same. A bus is already a finished stereo mix, and a bus at pan 0 has to leave it
+// exactly as it is.
+set_audio_bus_pan :: proc(bus: Audio_Bus, pan: f32) {
+	sync.mutex_guard(&s.audio_mutex)
+	bus_object := bus == AUDIO_BUS_MASTER ? &s.master_bus : hm.get(&s.audio_buses, bus)
+
+	if bus_object == nil {
+		log.error("Cannot set audio bus pan, audio bus does not exist.")
 		return
 	}
 
-	// Note a difference from `set_sound_loop`: We don't set the looping state of the playing audio
-	// buffer. That one should always loop for an audio stream. The stream is continuously writing
-	// data into a small looping buffer. We just set the stream itself to not loop, so it will stop
-	// feeding in data when it reaches the end.
-	
-	sd.loop = loop
+	bus_object.target_settings.pan = clamp(pan, -1, 1)
 }
 
-// Update the audio mixer and feed more audio data into the audio backend. This is done
-// automatically when `update` runs, so you normally don't need to call this manually.
+// Set an effect to run on everything that is mixed into the bus. This is how you apply your own
+// audio processing, such as a filter, to a whole group of sounds at once.
 //
-// This procedure implements a custom software audio mixer. The audio backend is just fed the
-// resulting mix. Therefore, you can see everything regarding how audio is processed in this
-// procedure.
+// `user_data` is handed to the effect when it runs. Put whatever state your effect needs there:
+// The effect is called once per mixed chunk, so anything it wants to remember between the chunks
+// has to live in `user_data`. Pass `nil` as `effect` to remove the effect.
 //
-// Will only run if the audio backend is running low on audio data.
+// See `Audio_Effect_Proc` for what the effect is given and what it is allowed to do.
+set_audio_bus_effect :: proc(bus: Audio_Bus, effect: Audio_Effect_Proc, user_data: rawptr = nil) {
+	sync.mutex_guard(&s.audio_mutex)
+	bus_object := bus == AUDIO_BUS_MASTER ? &s.master_bus : hm.get(&s.audio_buses, bus)
+
+	if bus_object == nil {
+		log.error("Cannot set audio bus effect, audio bus does not exist.")
+		return
+	}
+
+	bus_object.effect = effect
+	bus_object.effect_user_data = user_data
+}
+
+@(deprecated="Use k2.update_audio() instead")
 update_audio_mixer :: proc() {
-	// If the sample rate of the backend is 44100 samples/second and AUDIO_MIX_CHUNK_SIZE is 1400
-	// samples, then this procedure will only run roughly 44100/1400 = 31 times per second. This
-	// gives a latency of up to (1.5 * (44100/1400)) = 47 milliseconds. Is it too big, or too small?
-	// Perhaps we can use more low latency backends to push it down. Perhaps the backend should
-	// control AUDIO_MIX_CHUNK_SIZE based on how low latency it can give us without stalling?
-	if ab.remaining_samples() > (3 * AUDIO_MIX_CHUNK_SIZE)/2 {
-		return
-	}
-	
-	// We are going to go past the end of the mix_buffer, so just hop to the start instead. It's
-	// 1 megabyte big, so hopping over a few bytes at the end is OK.
-	if (s.mix_buffer_offset + AUDIO_MIX_CHUNK_SIZE) > len(s.mix_buffer) {
-		s.mix_buffer_offset = 0
+	update_audio()
+}
+
+// This procedure runs the audio mixer and does some audio housekeeping. For platforms that have an
+// audio thread, the mixer does not run here, it is run from those threads instead.
+//
+// This procedure is run automatically by `update`. You normally don't have to call it.
+//
+// Note that you should always call this once a frame, be it through `update` or manually. It
+// removes sounds that have been declared dead by the audio thread. 
+update_audio :: proc() {
+	if sync.mutex_guard(&s.audio_mutex) {
+		ps_iter := hm.dynamic_iterator_make(&s.sounds)
+		for ps, ps_handle in hm.dynamic_iterate(&ps_iter) {
+			if ps.remove {
+				hm.remove(&s.sounds, ps_handle)
+			}
+		}
 	}
 
-	// A slice of the mixed samples we are going to output.
-	out := s.mix_buffer[s.mix_buffer_offset:s.mix_buffer_offset + AUDIO_MIX_CHUNK_SIZE]
-	
-	// Zero out old mixed data from buffer (the buffer is "circular", there may be old stuff in
-	// the `out` slice).
-	slice.zero(out)
+	// If the platform has mixer thread then `_mix_audio_into_buffer` will be called from that
+	// thread instead.
+	if !ab.has_mixer_thread {
+		assert(
+			ab.push_samples != nil && ab.pushed_samples_remaining != nil,
+			"Audio backend that does not mix itself must accept samples through `push_samples` and also implement `pushed_samples_remaining`",
+		)
+
+		// Sometimes the mixing will fall behind due to a big stall. It will therefore try to mix up
+		// to 8 chunks in one go. This is more of a fail-safe than normal operation.
+		MAX_CHUNKS_PER_UPDATE :: 8
+
+		master_bus_chunk := s.master_bus.chunk[:]
+
+		for _ in 0..<MAX_CHUNKS_PER_UPDATE {
+			// If the sample rate of the backend is 44100 samples/second and AUDIO_MIX_CHUNK_SIZE is
+			// 1400 samples, then this procedure will only run roughly 44100/1400 = 31 times per
+			// second. This gives a latency of up to (1.5 * (44100/1400)) = 47 milliseconds.
+			//
+			// Note that AUDIO_MIX_CHUNK_SIZE varies, it depends on the audio backend.
+			if ab.pushed_samples_remaining() > (3 * AUDIO_MIX_CHUNK_SIZE)/2 {
+				break
+			}
+
+			_mix_audio_into_buffer(master_bus_chunk[:])
+			ab.push_samples(master_bus_chunk[:])
+		}
+	}
+}
+
+// This procedure implements a custom software audio mixer. It will write the mixed samples into
+// `buffer`. You can see everything regarding how audio is mixed in this procedure.
+//
+// This procedure gets called in two different ways:
+// 1. If the platform has an audio thread, then the audio thread calls this procedure (see the
+//    `audio_backend_` files).
+// 2. If the platform has no audio thread, then this is called by `update_audio`. An example of such
+//    a platform is Web.
+//
+// This procedure never allocates using `context.allocator` and only uses `context.temp_allocator`
+// for non-crucial logging formatting. If called from an audio thread, then that thread must use
+// `context = _audio_thread_context()`.
+_mix_audio_into_buffer :: proc(buffer: [][2]Audio_Sample) {
+	if ab.has_mixer_thread {
+		assert(context.user_index == _AUDIO_THREAD_CONTEXT_MARKER)
+	}
+
+	assert(len(buffer) == AUDIO_MIX_CHUNK_SIZE)
+	sync.mutex_guard(&s.audio_mutex)
+
+	// `buffer` is where the final mix should go. The final mix is the master bus.
+	master_bus_chunk := buffer
+
+	// The chunk may contain old mixed data, so clear it.
+	slice.zero(master_bus_chunk)
+
+	// The buses have a chunk each, which the sounds routed to that bus are mixed into. Those hold
+	// the previous chunk's mix, so they need zeroing too.
+	for it := hm.dynamic_iterator_make(&s.audio_buses); bus, _ in hm.dynamic_iterate(&it) {
+		slice.zero(bus.chunk[:])
+	}
 
 	audio_mix :: proc(
 		dest: [][2]Audio_Sample,
@@ -2877,7 +3773,7 @@ update_audio_mixer :: proc() {
 		source_channels: Audio_Channels,
 		interpolate: bool,
 		dest_source_ratio: f32,
-		dest_to_write: int,
+		dest_num_to_write: int,
 		source_fractional_offset: f32,
 		volume_start: f32,
 		volume_end: f32,
@@ -2908,14 +3804,17 @@ update_audio_mixer :: proc() {
 
 		switch kind {
 		case .Mono:
-			n := dest_to_write
+			n := dest_num_to_write
 
 			if n > len(source) {
 				n = len(source)
 			}
 
 			for samp_idx in 0..<n {
-				t := f32(samp_idx) / f32(n)
+				// Note that this uses `dest_num_to_write` and not `n`: The ramps run across the whole
+				// chunk. If we run out of samples early then only part of the ramp is used here,
+				// and the caller carries it on from there.
+				t := f32(samp_idx) / f32(dest_num_to_write)
 				volume := math.lerp(volume_start, volume_end, t)
 				pan := linalg.lerp(pan_start, pan_end, t)
 
@@ -2926,14 +3825,17 @@ update_audio_mixer :: proc() {
 			return n
 		case .Stereo:
 			source_stereo := slice.reinterpret([][2]Audio_Sample, source)
-			n := dest_to_write
+			n := dest_num_to_write
 
 			if n > len(source_stereo) {
 				n = len(source_stereo)
 			}
 
 			for samp_idx in 0..<n {
-				t := f32(samp_idx) / f32(n)
+				// Note that this uses `dest_num_to_write` and not `n`: The ramps run across the whole
+				// chunk. If we run out of samples early then only part of the ramp is used here,
+				// and the caller carries it on from there.
+				t := f32(samp_idx) / f32(dest_num_to_write)
 				volume := math.lerp(volume_start, volume_end, t)
 				pan := linalg.lerp(pan_start, pan_end, t)
 
@@ -2945,7 +3847,7 @@ update_audio_mixer :: proc() {
 		case .Mono_Interpolate:
 			dest_idx: int
 
-			for ; dest_idx < dest_to_write; dest_idx += 1 {
+			for ; dest_idx < dest_num_to_write; dest_idx += 1 {
 				src_pos := source_fractional_offset + f32(dest_idx) * dest_source_ratio
 				src_idx := int(src_pos)
 				
@@ -2959,7 +3861,7 @@ update_audio_mixer :: proc() {
 				prev_val := source[src_idx]
 				cur_val := source[src_next]
 
-				t := f32(dest_idx) / f32(dest_to_write)
+				t := f32(dest_idx) / f32(dest_num_to_write)
 				volume := math.lerp(volume_start, volume_end, t)
 				pan := linalg.lerp(pan_start, pan_end, t)
 
@@ -2973,7 +3875,7 @@ update_audio_mixer :: proc() {
 			source_stereo := slice.reinterpret([][2]Audio_Sample, source)
 			dest_idx: int
 
-			for ; dest_idx < dest_to_write; dest_idx += 1 {
+			for ; dest_idx < dest_num_to_write; dest_idx += 1 {
 				src_pos := source_fractional_offset + f32(dest_idx) * dest_source_ratio
 				src_idx := int(src_pos)
 				
@@ -2987,7 +3889,7 @@ update_audio_mixer :: proc() {
 				prev_val := source_stereo[src_idx]
 				cur_val := source_stereo[src_next]
 
-				t := f32(dest_idx) / f32(dest_to_write)
+				t := f32(dest_idx) / f32(dest_num_to_write)
 				volume := math.lerp(volume_start, volume_end, t)
 				pan := linalg.lerp(pan_start, pan_end, t)
 
@@ -3000,14 +3902,49 @@ update_audio_mixer :: proc() {
 		return 0
 	}
 
+	// Used for the smooth adjustment of volume, pan and pitch, both for the playing sounds below
+	// and for the buses further down.
 
-	for ps_iter := hm.dynamic_iterator_make(&s.playing_audio_buffers); ps, ps_handle in hm.dynamic_iterate(&ps_iter) {
-		data := hm.get(&s.audio_buffers, ps.audio_buffer)
+	calc_adjust_parameter_delta :: proc(sample_rate: int, pitch: f32) -> f32 {
+		RAMP_TIME :: 0.03
+		ramp_samples := RAMP_TIME * f32(sample_rate) * pitch
+		return f32(AUDIO_MIX_CHUNK_SIZE) / ramp_samples
+	}
+
+	move_towards :: proc(current: f32, target: f32, delta: f32) -> f32 {
+		if abs(target - current) < delta {
+			return target
+		}
+
+		dir := math.sign(target - current)
+		return current + dir * delta
+	}
+
+	for ps_iter := hm.dynamic_iterator_make(&s.sounds); ps, _ in hm.dynamic_iterate(&ps_iter) {
+		if ps.remove {
+			continue
+		}
+
+		data := hm.get(&s.audio_buffers, ps.buffer)
 
 		if data == nil {
 			log.error("Trying to play sound with destroyed data")
-			hm.remove(&s.playing_audio_buffers, ps_handle)
+			ps.remove = true
 			continue
+		}
+
+		// A paused sound stays in the list but is not mixed.
+		if ps.paused {
+			continue
+		}
+
+		// The slice of samples to write into. `buffer` is used for the master bus.
+		dest := master_bus_chunk
+
+		if ps.bus != AUDIO_BUS_MASTER {
+			if bus := hm.get(&s.audio_buses, ps.bus); bus != nil {
+				dest = bus.chunk[:]
+			}
 		}
 
 		// Before we get to the mixing we smoothly adjust pitch, volume and pan. We do this to avoid
@@ -3015,21 +3952,6 @@ update_audio_mixer :: proc() {
 		// the audio waveform. Understand: Sound does not happen because the waveform has a high
 		// value, it happens because there is a sudden change in the waveform. Bigger change, bigger
 		// sound.
-
-		calc_adjust_parameter_delta :: proc(sample_rate: int, pitch: f32) -> f32 {
-			RAMP_TIME :: 0.03
-			ramp_samples := RAMP_TIME * f32(sample_rate) * pitch
-			return AUDIO_MIX_CHUNK_SIZE / ramp_samples
-		}
-
-		move_towards :: proc(current: f32, target: f32, delta: f32) -> f32 {
-			if abs(target - current) < delta {
-				return target
-			}
-
-			dir := math.sign(target - current)
-			return current + dir * delta
-		}
 
 		settings := &ps.current_settings
 		target_settings := &ps.target_settings
@@ -3040,6 +3962,51 @@ update_audio_mixer :: proc() {
 		pitch := settings.pitch
 		adjust_parameter_delta = calc_adjust_parameter_delta(data.sample_rate, pitch)
 
+		// `set_sound_time` doesn't seek the sound itself, it just says where the sound should go.
+		// For sounds based on audio clips we seek it here (after fading it out, so it doesn't
+		// click). For audio streams the seeking happens in update_audio_stream, but we still fade
+		// the sound here. When it has finished fading, then update_audio_stream will do the actual
+		// seeking.
+
+		volume_target := target_settings.volume
+
+		switch src in ps.source {
+		case Audio_Clip:
+			if ps.clip_has_pending_seek {
+				volume_target = 0
+
+				if settings.volume == 0 {
+					channels := 1
+					if data.channels == .Stereo {
+						channels = 2
+					}
+
+					total_frames := len(data.samples) / channels
+					target_frame := int(ps.clip_pending_seek_seconds * f32(data.sample_rate))
+					ps.offset = clamp(target_frame, 0, total_frames) * channels
+					ps.offset_fraction = 0
+					ps.clip_has_pending_seek = false
+					volume_target = target_settings.volume
+				}
+			}
+
+		case Audio_Stream:
+			if sd := hm.get(&s.audio_streams, src); sd != nil {
+				switch sd.seek_state {
+				case .None:
+				case .Fading_Out:
+					volume_target = 0
+
+					if settings.volume == 0 {
+						sd.seek_state = .Ready
+						continue
+					}
+				case .Ready, .Seeking:
+					continue
+				}
+			}
+		}
+
 		// We can't just use the `volume_end` value for the volume. We are going to mix in
 		// `AUDIO_MIX_CHUNK_SIZE` number of samples. We'd still get clicks in the sound if we hopped
 		// to the ending volume. Instead, we calculate what the first sample should use and what
@@ -3047,7 +4014,7 @@ update_audio_mixer :: proc() {
 		// It will lerp across the range as it is mixing in the samples.
 
 		volume_start := clamp(settings.volume, 0, 1)
-		volume_end := clamp(move_towards(settings.volume, target_settings.volume, adjust_parameter_delta), 0, 1)
+		volume_end := clamp(move_towards(settings.volume, volume_target, adjust_parameter_delta), 0, 1)
 		settings.volume = volume_end
 
 		if volume_start == volume_end && volume_end == 0 {
@@ -3083,7 +4050,7 @@ update_audio_mixer :: proc() {
 		}
 
 		num_mixed := audio_mix(
-			s.mix_buffer[s.mix_buffer_offset:],
+			dest,
 			data.samples[ps.offset:],
 			data.channels,
 			interpolate,
@@ -3103,7 +4070,7 @@ update_audio_mixer :: proc() {
 			// The fraction advance may become larger than 1, in which case the offset needs to eat
 			// the integer part.
 			ps.offset += int(fraction_advance) * source_channels
-			
+			ps.offset = min(ps.offset, len(data.samples))
 			ps.offset_fraction = linalg.fract(fraction_advance)
 		} else {
 			ps.offset += num_mixed * source_channels
@@ -3118,19 +4085,27 @@ update_audio_mixer :: proc() {
 
 				// The sound looped. Make sure to mix in the remaining samples from the start of the
 				// sound!
-				overflow := AUDIO_MIX_CHUNK_SIZE - num_mixed
+				mixed_before_loop := num_mixed
+				overflow := AUDIO_MIX_CHUNK_SIZE - mixed_before_loop
+
+				// Carry the volume and pan ramps on from where the first part of the chunk got to.
+				// Starting them over would jump the volume back up in the middle of the chunk,
+				// which is heard as a click.
+				split := f32(mixed_before_loop) / f32(AUDIO_MIX_CHUNK_SIZE)
+				volume_split := math.lerp(volume_start, volume_end, split)
+				pan_stereo_split := linalg.lerp(pan_stereo_start, pan_stereo_end, split)
 
 				num_mixed = audio_mix(
-					s.mix_buffer[s.mix_buffer_offset + num_mixed:],
+					dest[mixed_before_loop:],
 					data.samples[ps.offset:],
 					data.channels,
 					interpolate,
 					source_dest_ratio,
 					overflow,
 					ps.offset_fraction,
-					volume_start,
+					volume_split,
 					volume_end,
-					pan_stereo_start,
+					pan_stereo_split,
 					pan_stereo_end,
 				)
 				
@@ -3141,21 +4116,123 @@ update_audio_mixer :: proc() {
 					// The fraction advance may become larger than 1, in which case the offset needs to eat
 					// the integer part.
 					ps.offset += int(fraction_advance) * source_channels
-					
+					ps.offset = min(ps.offset, len(data.samples))
 					ps.offset_fraction = linalg.fract(fraction_advance)
 				} else {
 					ps.offset += num_mixed * source_channels
 					ps.offset_fraction = 0
 				}
 			} else {
-				hm.remove(&s.playing_audio_buffers, ps_handle)
+				ps.remove = true
 				continue
 			}
 		}
 	}
 
-	ab.feed(out)
-	s.mix_buffer_offset += AUDIO_MIX_CHUNK_SIZE
+	// BUSES
+	//
+	// The sounds routed to a bus have been mixed into that bus's chunk. Now run the effect of each
+	// bus on its chunk and mix the chunk into the master bus, which is the `out` slice.
+
+	// The buses run at the mixer's sample rate and are never pitched, so the ramp is the same for
+	// all of them.
+	bus_adjust_delta := calc_adjust_parameter_delta(AUDIO_MIX_SAMPLE_RATE, 1)
+
+	for it := hm.dynamic_iterator_make(&s.audio_buses); bus, _ in hm.dynamic_iterate(&it) {
+		// The effect runs even when the bus is silent. Effects tend to keep state, such as a filter
+		// or an echo. Skipping them while silent would leave that state behind, and it would jump
+		// once the bus is turned back up.
+		if bus.effect != nil {
+			bus.effect(bus.chunk[:], bus.effect_user_data)
+		}
+
+		volume_start := bus.current_settings.volume
+		volume_end := move_towards(volume_start, bus.target_settings.volume, bus_adjust_delta)
+		bus.current_settings.volume = volume_end
+
+		pan_start := bus.current_settings.pan
+		pan_end := move_towards(pan_start, bus.target_settings.pan, bus_adjust_delta)
+		bus.current_settings.pan = pan_end
+
+		if volume_start == 0 && volume_end == 0 {
+			continue
+		}
+
+		// The pan of a bus is a balance: It turns the opposite side down. The playing sounds use a
+		// constant-power curve instead, but that curve scales both channels by 0.707 in the middle.
+		// A bus that has not been touched has to leave the mix exactly as it is.
+		gain_start := [2]f32 {
+			volume_start * min(1, 1 - pan_start),
+			volume_start * min(1, 1 + pan_start),
+		}
+
+		gain_end := [2]f32 {
+			volume_end * min(1, 1 - pan_end),
+			volume_end * min(1, 1 + pan_end),
+		}
+
+		for samp_idx in 0..<AUDIO_MIX_CHUNK_SIZE {
+			t := f32(samp_idx) / f32(AUDIO_MIX_CHUNK_SIZE)
+			master_bus_chunk[samp_idx] += bus.chunk[samp_idx] * linalg.lerp(gain_start, gain_end, t)
+		}
+	}
+
+	// MASTER BUS
+	//
+	// Everything is in `master_bus_chunk` now. Apply any effects, volume and panning to the master.
+
+	master := &s.master_bus
+
+	if master.effect != nil {
+		master.effect(buffer, master.effect_user_data)
+	}
+
+	volume_start := master.current_settings.volume
+	volume_end := move_towards(volume_start, master.target_settings.volume, bus_adjust_delta)
+	master.current_settings.volume = volume_end
+
+	pan_start := master.current_settings.pan
+	pan_end := move_towards(pan_start, master.target_settings.pan, bus_adjust_delta)
+	master.current_settings.pan = pan_end
+
+	// A game that never touches the master bus shouldn't pay for it.
+	if volume_start != 1 || volume_end != 1 || pan_start != 0 || pan_end != 0 {
+		gain_start := [2]f32 {
+			volume_start * min(1, 1 - pan_start),
+			volume_start * min(1, 1 + pan_start),
+		}
+
+		gain_end := [2]f32 {
+			volume_end * min(1, 1 - pan_end),
+			volume_end * min(1, 1 + pan_end),
+		}
+
+		for samp_idx in 0..<AUDIO_MIX_CHUNK_SIZE {
+			t := f32(samp_idx) / f32(AUDIO_MIX_CHUNK_SIZE)
+			buffer[samp_idx] *= linalg.lerp(gain_start, gain_end, t)
+		}
+	}
+}
+
+_AUDIO_THREAD_CONTEXT_MARKER :: 421337
+
+// Any audio thread must use this context. Audio threads are not allowed to allocate memory. They
+// can use temp allocator, but only for non-crucial error message formatting. The temp allocator
+// uses a 4096 byte arena.
+//
+// The audio thread context should be assigned at the start of the audio thread proc. That proc
+// should `free_all(context.temp_allocator)` at the end of each "audio frame".
+//
+// Do not use `thread.init_context` to set this. That field has strange side-effects. Instead, just
+// do `context = _audio_thread_context()` as first line in the thread proc.
+@(private="package")
+_audio_thread_context :: proc() -> runtime.Context {
+	return {
+		allocator = mem.panic_allocator(),
+		temp_allocator = mem.arena_allocator(&s.audio_thread_temp_allocator_arena),
+		logger = s.audio_thread_logger,
+		user_index = _AUDIO_THREAD_CONTEXT_MARKER,
+	}
 }
 
 //-----------------//
@@ -3164,8 +4241,17 @@ update_audio_mixer :: proc() {
 
 // Create a texture that you can render into. Meaning that you can draw into it instead of drawing
 // onto the screen. Use `set_render_texture` to enable this Render Texture for drawing.
-create_render_texture :: proc(width: int, height: int) -> Render_Texture {
-	texture, render_target := rb.create_render_texture(width, height)
+//
+// The second return value is `true` if the render texture was created correctly. It's optional to
+// handle this error, it will also be logged. In case of failure, the returned `Render_Texture`
+// will still be possible to use, but setting it does nothing, so drawing stays where it was.
+create_render_texture :: proc(width: int, height: int) -> (Render_Texture, bool) #optional_ok {
+	texture, render_target, render_texture_ok := rb.create_render_texture(width, height)
+
+	if !render_texture_ok {
+		log.errorf("Failed creating render texture with dimensions %v x %v", width, height)
+		return {}, false
+	}
 
 	return {
 		texture = { 
@@ -3174,11 +4260,22 @@ create_render_texture :: proc(width: int, height: int) -> Render_Texture {
 			height = height,
 		},
 		render_target = render_target,
-	}
+	}, true
 }
 
 // Destroy a Render_Texture previously created using `create_render_texture`.
 destroy_render_texture :: proc(render_texture: Render_Texture) {
+	if s.current_draw_call.render_target == render_texture.render_target {
+		draw_current_batch()
+	} else {
+		for dc in s.batch_draw_calls {
+			if dc.render_target == render_texture.render_target {
+				draw_current_batch()
+			}
+		}
+	}
+
+	_flush_if_batch_uses_texture(render_texture.texture.handle)
 	rb.destroy_texture(render_texture.texture.handle)
 	rb.destroy_render_target(render_texture.render_target)
 }
@@ -3192,21 +4289,37 @@ set_render_texture :: proc(render_texture: Maybe(Render_Texture)) {
 			return
 		}
 
-		if s.batch_render_target == rt.render_target {
+		if s.current_render_target == rt.render_target {
 			return
 		}
 
-		draw_current_batch()
-		s.batch_render_target = rt.render_target
-		s.proj_matrix = make_default_projection(rt.texture.width, rt.texture.height)
+		s.current_render_target = rt.render_target
+		s.current_render_target_width = rt.texture.width
+		s.current_render_target_height = rt.texture.height
+
+		s.proj_matrix = make_default_projection(
+			rt.texture.width,
+			rt.texture.height,
+			_camera_flip_y(),
+		)
+
+		_update_view_projection()
 	} else {
-		if s.batch_render_target == RENDER_TARGET_NONE {
+		if s.current_render_target == RENDER_TARGET_NONE {
 			return
 		}
 
-		draw_current_batch()
-		s.batch_render_target = RENDER_TARGET_NONE
-		s.proj_matrix = make_default_projection(pf.get_screen_width(), pf.get_screen_height())
+		s.current_render_target = RENDER_TARGET_NONE
+		s.current_render_target_width = 0
+		s.current_render_target_height = 0
+
+		s.proj_matrix = make_default_projection(
+			pf.get_screen_width(),
+			pf.get_screen_height(),
+			_camera_flip_y(),
+		)
+
+		_update_view_projection()
 	}
 }
 
@@ -3365,6 +4478,27 @@ rect_cut_right :: proc(r: ^Rect, w: f32, m: f32) -> Rect {
 	return res
 }
 
+// TODO: Add _right, _top, _bottom variations
+//
+// Split `r` in half horizontally. Split at position `x`, offest by margin `m`. Returns the left and
+// right result of the split.
+rect_split_left :: proc(
+	r: Rect,
+	x: f32,
+	m: f32,
+) -> (
+	left: Rect,
+	right: Rect,
+) {
+	left = r
+	right = r
+	left.w = x
+	right.x += x + m
+	right.w -= x + m
+	return left, right
+}
+
+
 // Rotate 2D vector `v` by `angle_radians` radians around the origin (0, 0).
 //
 // If you need to rotate around a point that is not the origin, then you can first subtract the
@@ -3384,12 +4518,21 @@ rotate :: proc(v: Vec2, angle_radians: f32) -> Vec2 {
 //-------//
 
 // Like `load_static_font_from_bytes` but reads a file from disk using a specified name.
-load_static_font_from_file :: proc(filename: string, font_size: f32, codepoints: []rune = {}, options: Font_Options = {}) -> Font {
+//
+// The second return value is `true` if the font was loaded correctly. It's optional to handle this
+// error, it will also be logged. In case of failure, the returned `Font` will still be possible to
+// use, but text drawn with it uses the default font.
+load_static_font_from_file :: proc(
+	filename: string,
+	font_size: f32,
+	codepoints: []rune = {},
+	options: Font_Options = {},
+) -> (Font, bool) #optional_ok {
 	data, data_ok := read_entire_file(filename, s.frame_allocator)
 
 	if !data_ok {
 		log.errorf("Failed loading font %s", filename)
-		return FONT_NONE
+		return FONT_NONE, false
 	}
 
 	return load_static_font_from_bytes(data, font_size, codepoints, options)
@@ -3398,20 +4541,35 @@ load_static_font_from_file :: proc(filename: string, font_size: f32, codepoints:
 // Load the TTF font contained in `data` and bake it into a texture. The characters in the texture
 // will be of of the specified `font_size`. If you do not specify a list of `codepoints`, then this
 // procedure defaults to using all codepoints between 32 to 127 (ASCII).
+//
+// The second return value is `true` if the font was loaded correctly. It's optional to handle this
+// error, it will also be logged. In case of failure, the returned `Font` will still be possible to
+// use, but text drawn with it uses the default font.
 load_static_font_from_bytes :: proc(
 	data: []byte,
 	font_size: f32,
 	codepoints: []rune = {},
 	options: Font_Options = {},
-) -> Font {
+) -> (_font: Font, _ok: bool) #optional_ok {
 	codepoints := codepoints
+	num_fonts := int(stbtt.GetNumberOfFonts(raw_data(data)))
+
+	if num_fonts > 0 && (options.font_index < 0 || options.font_index >= num_fonts) {
+		log.errorf(
+			"Cannot load font index %v, the font data contains %v fonts",
+			options.font_index,
+			num_fonts,
+		)
+		return
+	}
+
 	font_info: stbtt.fontinfo
-	font_offset := stbtt.GetFontOffsetForIndex(raw_data(data), 0)
+	font_offset := stbtt.GetFontOffsetForIndex(raw_data(data), i32(options.font_index))
 	init_ok := stbtt.InitFont(&font_info, raw_data(data), font_offset)
 
 	if !init_ok {
 		log.error("Failed loading TTF/TTC font")
-		return FONT_NONE
+		return
 	}
 
 	scale_factor := stbtt.ScaleForPixelHeight(&font_info, font_size)
@@ -3549,7 +4707,7 @@ load_static_font_from_bytes :: proc(
 
 	if !atlas_packed {
 		log.error("Failed packing font atlas")
-		return {}
+		return
 	}
 
 	atlas := make([]Color, atlas_size*atlas_size, s.frame_allocator)
@@ -3639,9 +4797,9 @@ load_static_font_from_bytes :: proc(
 	set_texture_filter(tex, options.filter)
 
 	font := Font_Data {
-		atlas = tex,
 		type = .Static,
 		options = options,
+		static_atlas = tex,
 		static_glyphs = slice.clone(glyphs[:], s.allocator),
 		static_glyph_ranges = slice.clone(glyph_ranges[:], s.allocator),
 		static_font_size = font_size,
@@ -3652,16 +4810,23 @@ load_static_font_from_bytes :: proc(
 
 	font_handle := Font(len(s.fonts))
 	append(&s.fonts, font)
-	return font_handle
+	return font_handle, true
 }
 
 // Like `load_dynamic_font_from_bytes`, but reads a file from disk using a filename.
-load_dynamic_font_from_file :: proc(filename: string, options: Font_Options = {}) -> Font {
+//
+// The second return value is `true` if the font was loaded correctly. It's optional to handle this
+// error, it will also be logged. In case of failure, the returned `Font` will still be possible to
+// use, but text drawn with it uses the default font.
+load_dynamic_font_from_file :: proc(
+	filename: string,
+	options: Font_Options = {},
+) -> (Font, bool) #optional_ok {
 	data, data_ok := read_entire_file(filename, s.frame_allocator)
 
 	if !data_ok {
 		log.errorf("Failed loading font %s", filename)
-		return FONT_NONE
+		return FONT_NONE, false
 	}
 
 	return load_dynamic_font_from_bytes(data, options)
@@ -3669,33 +4834,53 @@ load_dynamic_font_from_file :: proc(filename: string, options: Font_Options = {}
 
 // Load a TTF font stored in `data` as a dynamic font. This means that an atlas will be dynamically
 // built as you draw characters using this font.
-load_dynamic_font_from_bytes :: proc(data: []u8, options: Font_Options = {}) -> Font {
-	fontstash_handle := fs.AddFontMem(&s.fs, "", slice.clone(data, s.allocator), false)
-	h := Font(len(s.fonts))
+//
+// The second return value is `true` if the font was loaded correctly. It's optional to handle this
+// error, it will also be logged. In case of failure, the returned `Font` will still be possible to
+// use, but text drawn with it uses the default font.
+load_dynamic_font_from_bytes :: proc(
+	data: []u8,
+	options: Font_Options = {},
+) -> (Font, bool) #optional_ok {
+	dynamic_font: fc.Font
+	init_err := fc.init(&dynamic_font, data, options.font_index, s.allocator)
 
-	data := Font_Data {
-		dynamic_fontstash_handle = fontstash_handle,
-		atlas = {
-			handle = rb.create_texture(FONT_DEFAULT_ATLAS_SIZE, FONT_DEFAULT_ATLAS_SIZE, .RGBA_8_Norm),
-			width = FONT_DEFAULT_ATLAS_SIZE,
-			height = FONT_DEFAULT_ATLAS_SIZE,
-		},
-		type = .Dynamic,
-		options = options,
+	switch init_err {
+	case .None:
+	case .Font_Index_Out_Of_Range:
+		log.errorf(
+			"Cannot load font index %v, the font data contains %v fonts",
+			options.font_index,
+			stbtt.GetNumberOfFonts(raw_data(data)),
+		)
+		return FONT_NONE, false
+	case .Invalid_Font_Data:
+		log.error("Failed loading TTF/TTC font")
+		return FONT_NONE, false
 	}
 
-	set_texture_filter(data.atlas, options.filter)
-	append(&s.fonts, data)
-	return h
+	h := Font(len(s.fonts))
+
+	append(&s.fonts, Font_Data {
+		type = .Dynamic,
+		options = options,
+		dynamic_font = dynamic_font,
+		dynamic_pages = make([dynamic]Texture, s.allocator),
+	})
+
+	return h, true
 }
 
 @(deprecated="Use load_dynamic_font_from_file or load_static_font_from_file.")
-load_font_from_file :: proc(filename: string, options: Font_Options = {}) -> Font {
+load_font_from_file :: proc(
+	filename: string,
+	options: Font_Options = {},
+) -> (Font, bool) #optional_ok {
 	return load_dynamic_font_from_file(filename, options)
 }
 
 @(deprecated="Use load_dynamic_font_from_bytes or load_static_font_from_bytes")
-load_font_from_bytes :: proc(data: []u8, options: Font_Options = {}) -> Font {
+load_font_from_bytes :: proc(data: []u8, options: Font_Options = {}) -> (Font, bool) #optional_ok {
 	return load_dynamic_font_from_bytes(data, options)
 }
 
@@ -3706,24 +4891,91 @@ destroy_font :: proc(font: Font) {
 	}
 
 	f := &s.fonts[font]
-	rb.destroy_texture(f.atlas.handle)
 
 	switch f.type {
 	case .Static:
+		// Recorded draw calls may still be waiting to sample this font's atlas.
+		_flush_if_batch_uses_texture(f.static_atlas.handle)
+		rb.destroy_texture(f.static_atlas.handle)
+		f.static_atlas = {}
 		delete(f.static_glyphs, s.allocator)
 		delete(f.static_glyph_ranges, s.allocator)
 	case .Dynamic:
-		// TODO fontstash has no "destroy font" proc... I should make my own version of fontstash
-		delete(s.fs.fonts[f.dynamic_fontstash_handle].glyphs)
-		delete(s.fs.fonts[f.dynamic_fontstash_handle].loadedData, s.allocator)
-		s.fs.fonts[f.dynamic_fontstash_handle].glyphs = {}
-	}
+		for page in f.dynamic_pages {
+			_flush_if_batch_uses_texture(page.handle)
+			rb.destroy_texture(page.handle)
+		}
 
+		delete(f.dynamic_pages)
+		f.dynamic_pages = {}
+		fc.destroy(&f.dynamic_font)
+	}
 }
 
 @(deprecated="Use FONT_DEFAULT constant instead")
 get_default_font :: proc() -> Font {
 	return FONT_DEFAULT
+}
+
+//---------//
+// CURSORS //
+//---------//
+
+// Sets the cursor, either to one the operating system provides or to one made with
+// `create_custom_cursor`. `set_cursor(.Default)` goes back to the normal OS cursor.
+set_cursor :: proc(cursor: Cursor) {
+	pf.set_cursor(cursor)
+}
+
+// Create a cursor from an image. `hotspot` is the position within the image that points at things,
+// in physical pixels.
+//
+// The cursor does not need `image` after it is created. You may destroy it.
+//
+// The second return value is `true` if the cursor was created correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Custom_Cursor` will still
+// be possible to use, but setting it leaves the cursor as it is.
+create_custom_cursor :: proc(image: Image, hotspot: [2]int) -> (Custom_Cursor, bool) #optional_ok {
+	if image.width == 0 || image.height == 0 {
+		log.error("Invalid cursor image: height or width is zero")
+		return CUSTOM_CURSOR_NONE, false
+	}
+
+	if len(image.pixels) != image.width*image.height {
+		log.error("Invalid cursor image: the pixels array is not of size image.width*image.height")
+		return CUSTOM_CURSOR_NONE, false
+	}
+
+	cursor, cursor_ok := pf.create_custom_cursor(image, hotspot)
+
+	if !cursor_ok {
+		return CUSTOM_CURSOR_NONE, false
+	}
+
+	return cursor, true
+}
+
+// Destroy a cursor previously created using `create_custom_cursor`. If it is the cursor currently
+// on screen then Karl2D will restore the default OS cursor.
+destroy_custom_cursor :: proc(custom_cursor: Custom_Cursor) {
+	pf.destroy_custom_cursor(custom_cursor)
+}
+
+// Hide or show the mouse cursor. The cursor may get shown again if the window loses focus.
+// Therefore, it's often best to use `is_cursor_hidden` to check the current status and use this
+// procedure to hide the cursor as needed.
+//
+// This call does not lock the mouse within the window, do that using a separate call to
+// `set_mouse_locked`.
+set_cursor_hidden :: proc(hidden: bool) {
+	pf.set_cursor_hidden(hidden)
+}
+
+// Returns true if the cursor is hidden. The cursor may get re-shown by the OS, for example when the
+// window loses focus. Therefore, this procedure may return false even though you've hidden the
+// cursor previously. It should always reflect the true hide-state of the cursor.
+is_cursor_hidden :: proc() -> bool {
+	return pf.is_cursor_hidden()
 }
 
 //---------//
@@ -3735,16 +4987,20 @@ get_default_font :: proc() -> Font {
 //
 // `layout_formats` can in many cases be left default initialized. It is used to specify the format
 // of the vertex shader inputs. By formats this means the format that you pass on the CPU side.
+//
+// The second return value is `true` if the shader was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Shader` will still be
+// possible to use, but setting it does nothing: drawing carries on with the shader already set.
 load_shader_from_file :: proc(
 	vertex_filename: string,
 	fragment_filename: string,
 	layout_formats: []Pixel_Format = {}
-) -> Shader {
+) -> (Shader, bool) #optional_ok {
 	vertex_source, vertex_source_ok := read_entire_file(vertex_filename, frame_allocator)
 
 	if !vertex_source_ok {
 		log.errorf("Failed loading shader %s", vertex_filename)
-		return {}
+		return {}, false
 	}
 
 	fragment_source: []byte
@@ -3757,7 +5013,7 @@ load_shader_from_file :: proc(
 
 		if !fragment_source_ok {
 			log.errorf("Failed loading shader %s", fragment_filename)
-			return {}
+			return {}, false
 		}
 	}
 
@@ -3766,21 +5022,24 @@ load_shader_from_file :: proc(
 
 // Load a vertex and fragment shader from a block of memory. See `load_shader_from_file` for what
 // `layout_formats` means.
+//
+// The second return value is `true` if the shader was loaded correctly. It's optional to handle
+// this error, it will also be logged. In case of failure, the returned `Shader` will still be
+// possible to use, but setting it does nothing: drawing carries on with the shader already set.
 load_shader_from_bytes :: proc(
 	vertex_shader_bytes: []byte,
 	fragment_shader_bytes: []byte,
 	layout_formats: []Pixel_Format = {},
-) -> Shader {
-	handle, desc := rb.load_shader(
+) -> (Shader, bool) #optional_ok {
+	handle, desc, shader_ok := rb.load_shader(
 		vertex_shader_bytes,
 		fragment_shader_bytes,
 		s.frame_allocator,
 		layout_formats,
 	)
 
-	if handle == SHADER_NONE {
-		log.error("Failed loading shader")
-		return {}
+	if !shader_ok {
+		return {}, false
 	}
 
 	constants_size: int
@@ -3847,16 +5106,26 @@ load_shader_from_bytes :: proc(
 		if default_format != .Unknown {
 			shd.default_input_offsets[default_format] = input_offset
 		}
-		
+
 		input_offset += pixel_format_size(input.format)
 	}
 
 	shd.vertex_size = input_offset
-	return shd
+	return shd, true
 }
 
 // Destroy a shader previously loaded using `load_shader_from_file` or `load_shader_from_bytes`
 destroy_shader :: proc(shader: Shader) {
+	if s.current_draw_call.shader == shader.handle {
+		draw_current_batch()
+	} else {
+		for dc in s.batch_draw_calls {
+			if dc.shader == shader.handle {
+				draw_current_batch()
+			}
+		}
+	}
+
 	rb.destroy_shader(shader.handle)
 
 	a := s.allocator
@@ -3892,17 +5161,21 @@ get_default_shader :: proc() -> Shader {
 // `set_shader(nil)`.
 set_shader :: proc(shader: Maybe(Shader)) {
 	if shd, shd_ok := shader.?; shd_ok {
-		if shd.handle == s.batch_shader.handle {
+		if shd.handle == SHADER_NONE {
+			log.error("Cannot set shader, shader does not exist.")
+			return
+		}
+
+		if shd.handle == s.current_shader.handle {
 			return
 		}
 	} else {
-		if s.batch_shader.handle == s.default_shader.handle {
+		if s.current_shader.handle == s.default_shader.handle {
 			return
 		}
 	}
 
-	draw_current_batch()
-	s.batch_shader = shader.? or_else s.default_shader
+	s.current_shader = shader.? or_else s.default_shader
 }
 
 // Set the value of a constant (also known as uniform in OpenGL). Look up shader constant locations
@@ -3918,8 +5191,6 @@ set_shader_constant :: proc(shd: Shader, loc: Shader_Constant_Location, val: any
 		return
 	}
 
-	draw_current_batch()
-
 	if loc.offset + loc.size > len(shd.constants_data) {
 		log.errorf("Constant with offset %v and size %v is out of bounds. Buffer ends at %v", loc.offset, loc.size, len(shd.constants_data))
 		return
@@ -3933,6 +5204,9 @@ set_shader_constant :: proc(shd: Shader, loc: Shader_Constant_Location, val: any
 	}
 
 	mem.copy(&shd.constants_data[loc.offset], val.data, sz)
+
+	// Draw calls recorded before this point keep the old value. The next one takes a fresh copy.
+	s.current_constants_dirty = true
 }
 
 // Sets the value of a shader input (also known as a shader attribute). There are three default
@@ -3990,34 +5264,88 @@ pixel_format_size :: proc(f: Pixel_Format) -> int {
 // Make Karl2D use a camera. Return to the "default camera" by passing `nil`. All drawing operations
 // will use this camera until you again change it.
 set_camera :: proc(camera: Maybe(Camera)) {
-	if camera == s.batch_camera {
+	if camera == s.current_camera {
 		return
 	}
 
-	draw_current_batch()
-	s.batch_camera = camera
-	s.proj_matrix = make_default_projection(pf.get_screen_width(), pf.get_screen_height())
+	s.current_camera = camera
 
 	if c, c_ok := camera.?; c_ok {
 		s.view_matrix = camera_view_matrix(c)
 	} else {
 		s.view_matrix = 1
 	}
+
+	// The Y axis picks which edge of the surface Y = 0 sits on. So the projection depends on the
+	// camera, not just on the surface size.
+	if s.current_render_target == RENDER_TARGET_NONE {
+		s.proj_matrix = make_default_projection(
+			pf.get_screen_width(),
+			pf.get_screen_height(),
+			_camera_flip_y(),
+		)
+	} else {
+		s.proj_matrix = make_default_projection(
+			s.current_render_target_width,
+			s.current_render_target_height,
+			_camera_flip_y(),
+		)
+	}
+
+	_update_view_projection()
 }
 
-// Transform a point `pos` that lives on the screen to a point in the world. This can be useful for
-// bringing (for example) mouse positions (k2.get_mouse_position()) into world-space.
+// Transform a point `pos` that lives on the screen into the camera's coordinates.
+//
+// Example: Bringing the mouse position into the coordinate space of a camera:
+//
+//// world_mouse_pos := k2.screen_to_camera(k2.get_mouse_position(), world_camera)
+screen_to_camera :: proc(pos: Vec2, camera: Camera) -> Vec2 {
+	pos := pos
+
+	// Screen Y counts down from the top. A flipped camera counts it from the bottom of the surface.
+	if camera.flip_y {
+		surface_height := s.current_render_target_height
+
+		if s.current_render_target == RENDER_TARGET_NONE {
+			surface_height = pf.get_screen_height()
+		}
+
+		pos.y = f32(surface_height) - pos.y
+	}
+
+	return (camera_inverse_view_matrix(camera) * Vec4 { pos.x, pos.y, 0, 1 }).xy
+}
+
+// Transform a point `pos` that lives in the camera's coordinates to a point on the screen. This can
+// be useful when you need to compare such a position to a screen-space point.
+camera_to_screen :: proc(pos: Vec2, camera: Camera) -> Vec2 {
+	res := (camera_view_matrix(camera) * Vec4 { pos.x, pos.y, 0, 1 }).xy
+
+	if camera.flip_y {
+		surface_height := s.current_render_target_height
+
+		if s.current_render_target == RENDER_TARGET_NONE {
+			surface_height = pf.get_screen_height()
+		}
+
+		res.y = f32(surface_height) - res.y
+	}
+
+	return res
+}
+
+@(deprecated="Use screen_to_camera instead")
 screen_to_world :: proc(pos: Vec2, camera: Camera) -> Vec2 {
-	return (camera_world_matrix(camera) * Vec4 { pos.x, pos.y, 0, 1 }).xy
+	return screen_to_camera(pos, camera)
 }
 
-// Transform a point `pos` that lives in the world to a point on the screen. This can be useful when
-// you need to take a position in the world and compare it to a screen-space point.
+@(deprecated="Use camera_to_screen instead")
 world_to_screen :: proc(pos: Vec2, camera: Camera) -> Vec2 {
-	return (camera_view_matrix(camera) * Vec4 { pos.x, pos.y, 0, 1 }).xy
+	return camera_to_screen(pos, camera)
 }
 
-// Calculate the matrix that `screen_to_world` and `world_to_screen` uses to do transformations.
+// Calculate the matrix that `screen_to_camera` and `camera_to_screen` uses to do transformations.
 //
 // A view matrix is essentially the world transform matrix of the camera, but inverted. In other
 // words, instead of bringing the camera in front of things in the world, we bring everything in the
@@ -4037,44 +5365,155 @@ world_to_screen :: proc(pos: Vec2, camera: Camera) -> Vec2 {
 // The view matrix is a Mat4 because its easier to upload a Mat4 to the GPU. But only the upper-left
 // 3x3 matrix is actually used.
 camera_view_matrix :: proc(c: Camera) -> Mat4 {
+	// A zoom of 0 is what a zero-initialized camera has. Treat it as 1 so such a camera draws at
+	// normal scale instead of collapsing everything to nothing.
+	zoom := c.zoom == 0 ? 1 : c.zoom
+
 	inv_target_translate := linalg.matrix4_translate(vec3_from_vec2(-c.target))
 	inv_rot := linalg.matrix4_rotate_f32(c.rotation, {0, 0, 1})
-	inv_scale := linalg.matrix4_scale(Vec3{c.zoom, c.zoom, 1})
+	inv_scale := linalg.matrix4_scale(Vec3{zoom, zoom, 1})
 	inv_offset_translate := linalg.matrix4_translate(vec3_from_vec2(c.offset))
 
 	return inv_offset_translate * inv_scale * inv_rot * inv_target_translate
 }
 
-// Calculate the matrix that brings something in front of the camera.
-camera_world_matrix :: proc(c: Camera) -> Mat4 {
+// The inverse of `camera_view_matrix`. It undoes the camera instead of applying it.
+camera_inverse_view_matrix :: proc(c: Camera) -> Mat4 {
+	// As in `camera_view_matrix`: a zoom of 0 is treated as 1. It also makes the division safe.
+	zoom := c.zoom == 0 ? 1 : c.zoom
+
 	offset_translate := linalg.matrix4_translate(vec3_from_vec2(-c.offset))
 	rot := linalg.matrix4_rotate_f32(-c.rotation, {0, 0, 1})
-	scale := linalg.matrix4_scale(Vec3{1/c.zoom, 1/c.zoom, 1})
+	scale := linalg.matrix4_scale(Vec3{1/zoom, 1/zoom, 1})
 	target_translate := linalg.matrix4_translate(vec3_from_vec2(c.target))
 
 	return target_translate * rot * scale * offset_translate
+}
+
+@(deprecated="Use camera_inverse_view_matrix instead")
+camera_world_matrix :: proc(c: Camera) -> Mat4 {
+	return camera_inverse_view_matrix(c)
 }
 
 //------//
 // MISC //
 //------//
 
-// Choose how the alpha channel is used when mixing half-transparent color with what is already
-// drawn. The default is the .Alpha mode, but you also have the option of using .Premultiply_Alpha.
+// Makes a Karl2D icon with K and the 2 from the logo. It will be `size*size` pixels. It's created
+// from pixel art that is 16x16, scaled up with nearest neighbor. So a size divisible by 16 is
+// recommended.
+//
+// `init` uses this procedure for the default window icon.
+//
+// Use `destroy_image` when you no longer need the image.
+make_karl2d_icon :: proc(size: int) -> Image {
+	art := [16][16]u8 {
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 2, 0, 0, 0, 0},
+		{0, 0, 0, 1, 0, 0, 1, 0, 0, 2, 1, 1, 2, 0, 0, 0},
+		{0, 0, 0, 1, 0, 2, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0},
+		{0, 0, 0, 1, 2, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0},
+		{0, 0, 0, 1, 1, 2, 0, 0, 0, 0, 2, 2, 1, 0, 0, 0},
+		{0, 0, 0, 1, 0, 1, 2, 0, 0, 2, 1, 1, 0, 0, 0, 0},
+		{0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 2, 2, 2, 0, 0, 0},
+		{0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	}
+
+	colors := [3]Color {
+		{33, 11, 11, 255},  // background
+		{255, 209, 0, 255}, // yellow
+		{127, 6, 34, 255},  // dark red
+	}
+
+	pixels := make([]Color, size*size, s.allocator)
+
+	for y in 0..<size {
+		for x in 0..<size {
+			pixels[y*size + x] = colors[art[y*16/size][x*16/size]]
+		}
+	}
+
+	return {
+		pixels = pixels,
+		width = size,
+		height = size,
+	}
+}
+
+// Makes a Karl2D logo that says KARL2D. It will be `width*width/3` pixels. It is created from pixel
+// art that is 30x10 pixels large. So a width that is divisible by 30 is recommended.
+//
+// Use `destroy_image` when you no longer need the image.
+make_karl2d_logo :: proc(width: int) -> Image {
+	art := [10][30]u8 {
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 2, 0, 0, 2, 0, 0, 2, 2, 0, 0, 2, 2, 2, 0, 0, 2, 0, 0, 0, 0, 2, 2, 0, 0, 2, 2, 2, 0, 0},
+		{0, 1, 0, 0, 1, 0, 2, 1, 1, 2, 0, 1, 1, 1, 2, 0, 1, 0, 0, 0, 2, 1, 1, 2, 0, 1, 1, 1, 2, 0},
+		{0, 1, 0, 2, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0},
+		{0, 1, 2, 1, 0, 0, 1, 2, 2, 1, 0, 1, 2, 2, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0},
+		{0, 1, 1, 2, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 2, 0, 1, 0, 0, 0, 0, 2, 2, 1, 0, 1, 0, 0, 1, 0},
+		{0, 1, 0, 1, 2, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 2, 1, 1, 0, 0, 1, 0, 0, 1, 0},
+		{0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 2, 2, 0, 1, 2, 2, 2, 0, 1, 2, 2, 1, 0},
+		{0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	}
+
+	height := width/3
+
+	colors := [3]Color {
+		{33, 11, 11, 255},  // background
+		{255, 209, 0, 255}, // yellow
+		{127, 6, 34, 255},  // dark red
+	}
+
+	pixels := make([]Color, width*height, s.allocator)
+
+	for y in 0..<height {
+		for x in 0..<width {
+			pixels[y*width + x] = colors[art[y*10/height][x*30/width]]
+		}
+	}
+
+	return {
+		pixels = pixels,
+		width = width,
+		height = height,
+	}
+}
+
+// Choose how drawn colors are mixed with what is already drawn. The default is .Alpha.
 set_blend_mode :: proc(mode: Blend_Mode) {
-	if s.batch_blend_mode == mode {
+	if s.current_blend_mode == mode {
 		return
 	}
 
-	draw_current_batch()
-	s.batch_blend_mode = mode
+	s.current_blend_mode = mode
 }
 
 // Make everything outside of the screen-space rectangle `scissor_rect` not render. Disable the
 // scissor rectangle by running `set_scissor_rect(nil)`.
 set_scissor_rect :: proc(scissor_rect: Maybe(Rect)) {
-	draw_current_batch()
-	s.batch_scissor = scissor_rect
+	s.current_scissor = scissor_rect
+}
+
+// Set the z used by draws that happen after this call. Only has an effect when `depth_test` was
+// enabled in `Init_Options`. Higher z ends up in front. Unlike `set_blend_mode` and
+// `set_scissor_rect`, this never starts a new draw call: the z is stored in each vertex rather
+// than being part of a draw call's settings, so it's fine to call this before every draw.
+set_z :: proc(z: f32) {
+	s.z = z
+}
+
+// Get the z previously set with `set_z`. Defaults to 0.
+get_z :: proc() -> f32 {
+	return s.z
 }
 
 // Restore the internal state using the pointer returned by `init`. Useful after reloading the
@@ -4082,7 +5521,6 @@ set_scissor_rect :: proc(scissor_rect: Maybe(Rect)) {
 set_internal_state :: proc(state: ^State) {
 	s = state
 	frame_allocator = s.frame_allocator
-	pf = s.platform
 	rb = s.render_backend
 	ab = s.audio_backend
 	pf.set_internal_state(s.platform_state)
@@ -4141,27 +5579,55 @@ ui_button_width :: proc(text: string, button_height: f32) -> f32 {
 	return measure_text(text, button_height).x
 }
 
-// Experimental UI button. Returns true if the button was pressed. Currently only works properly
-// when no camera is set.
+// Experimental UI button. Returns true if the button was pressed. `r` is in the space of whatever
+// camera is currently set (see `set_camera`), same as any other drawing call.
 //
-// Mainly used by the samples in order to create the "Source" button.
+// A left click presses it, and so does a tap, so it works on a touch screen with no mouse at all.
 //
-// Note that this does not support zoomed cameras right now, since it uses unscaled mouse positions.
-// As this is experimental, you are probably better off copying this procedure to your own code and
-// modifying it, rather than using it as-is.
+// Mainly used by the samples in order to create the "Source" button. As this is experimental, you
+// are probably better off copying this procedure to your own code and modifying it, rather than
+// using it as-is.
 ui_button :: proc(r: Rect, text: string) -> bool {
-	in_rect := point_in_rect(get_mouse_position(), r)
+	// Hit-testing runs in the space of the current camera, same as the drawing below.
+	cam, cam_ok := s.current_camera.?
+	use_cam := cam_ok && cam.zoom > 0.001
+
+	mouse_pos := get_mouse_position()
+
+	if use_cam {
+		mouse_pos = screen_to_camera(mouse_pos, cam)
+	}
+
+	in_rect := point_in_rect(mouse_pos, r)
+	res := in_rect && mouse_button_went_down(.Left)
+
+	for t in s.touches {
+		touch_pos := t.position
+
+		if use_cam {
+			touch_pos = screen_to_camera(touch_pos, cam)
+		}
+
+		if !point_in_rect(touch_pos, r) {
+			continue
+		}
+
+		in_rect = true
+
+		if t.went_down {
+			res = true
+		}
+	}
+
 	bg_color := DARK_GRAY
 	border_color := WHITE
 	text_color := WHITE
-	res := false
 
 	if in_rect {
 		bg_color = GRAY
 		text_color = WHITE
 
-		if mouse_button_went_down(.Left) {
-			res = true
+		if res {
 			bg_color = BLACK
 		}
 	}
@@ -4279,6 +5745,9 @@ Blend_Mode :: enum {
 	// Requires the alpha-channel to be multiplied into texture RGB channels. You can automatically
 	// do this using the `Premultiply_Alpha` option when loading a texture.
 	Premultiplied_Alpha,
+
+	// Adds the source color, multiplied by its alpha, to the color already drawn.
+	Additive,
 }
 
 // A render texture is a texture that you can draw into, instead of drawing to the screen. Create
@@ -4318,12 +5787,31 @@ Camera :: struct {
 	// Rotate the camera (unit: radians)
 	rotation: f32,
 
-	// Zoom the camera. A bigger value means "more zoom".
+	// Zoom the camera. A bigger value means "more zoom". A zoom of 0 is treated as 1, so a camera
+	// without a zoom set draws at normal scale.
 	//
 	// To make a certain amount of pixels always occupy the height of the camera, set the zoom to:
 	//
 	//     k2.get_screen_height()/wanted_pixel_height
 	zoom: f32,
+
+	// Flips the Y axis. The origin becomes the bottom-left of the screen, Y grows upwards and the
+	// direction of rotation is reversed. This is useful as a "world camera" when using libraries
+	// such as Box2D. That way, you don't have to make any extra conversions between you gameplay /
+	// physics code and Karl2D.
+	//
+	// When `flip_y` is true:
+	// - A `Rect` will have its `(x, y)` in the bottom-left corner, rather than top-left.
+	// - Textures will be drawn with their bottom-left corner as position, rather than top-left.
+	// - Blocks of text will have their origin in the bottom-left corner of the block, rather than
+	//   top-left.
+	//
+	// Caveats:
+	// - The `rect_top_*`, `rect_bottom*` and `cut_rect_*` procs still assume that (x, y) is the
+	//   top-left corner. But those procs are often use for UIs and screen-space things. An idea is
+	//   to only use `flip_y` for the world camera. Let the UI use either no camera or a non-flipped
+	//   camera.
+	flip_y: bool,
 }
 
 Window_Mode :: enum {
@@ -4346,7 +5834,20 @@ Init_Options :: struct {
 	// platforms, such as Linux+Wayland, it does not work, because Wayland always auto scales all
 	// windows.
 	disable_auto_scale_hint: bool,
+
+	// Enable depth testing. Draws are then sorted by the z value set with `set_z`: higher z ends up
+	// in front. Things drawn at the same z use the drawing order, like when depth testing is off.
+	depth_test: bool,
+
+	// The range of z values you can use with `set_z`. Leave both at zero to get the default range
+	// of -1 to 1. Set them to something like 0 and 1000 if you'd rather feed `set_z` world
+	// coordinates. Only used when `depth_test` is on.
+	depth_range_min: f32,
+	depth_range_max: f32,
 }
+
+DEPTH_RANGE_DEFAULT_MIN :: -1
+DEPTH_RANGE_DEFAULT_MAX :: 1
 
 Shader_Handle :: distinct Handle
 
@@ -4448,12 +5949,16 @@ Font_Options :: struct {
 
 	// Passed on to font atlas creation.
 	filter: Texture_Filter,
+
+	// Font formats like .ttc can contain multiple fonts. Use this parameter to pick one. For fonts
+	// that only contain a single font, leave this at zero.
+	font_index: int,
 }
 
 // Supported font types:
 // - Static: A pre-baked font where you specify a range of characters that are baked into a texture.
-// - Dynamic: A font where an atlas is continuously updated as you need need new characters. This
-//            mode current uses fontstash.
+// - Dynamic: A font that is continuously updated as you need new characters. Each font can have up
+//            to eight 1024x1024 textures (pages) filled with glyphs. Uses the `font_cache` package.
 //
 // Future types (TODO):
 // - Slug: Upload the character bezier curves to the GPU and render the text on the GPU without the
@@ -4465,19 +5970,20 @@ Font_Type :: enum {
 }
 
 Font_Data :: struct {
-	atlas: Texture,
 	options: Font_Options,
 
 	type: Font_Type,
 
 	// type == .Static
+	static_atlas: Texture,
 	static_glyphs: []Font_Baked_Glyph,
 	static_glyph_ranges: []Font_Baked_Glyph_Range,
 	static_font_size: f32,
 	static_line_spacing: f32,
 
 	// type == .Dynamic
-	dynamic_fontstash_handle: int,
+	dynamic_font: fc.Font,
+	dynamic_pages: [dynamic]Texture,
 }
 
 Handle :: hm.Handle64
@@ -4485,6 +5991,41 @@ Texture_Handle :: distinct Handle
 Render_Target_Handle :: distinct Handle
 Font :: distinct int
 DEFAULT_FONT_DATA :: #load("default_fonts/roboto.ttf")
+
+// The cursors an operating system provides out of the box. Use with `set_cursor`.
+//
+// Not every platform has every one of them. Where one is missing, the closest thing is used
+// instead:
+// - macOS has no public busy cursor, so `Wait` and `Progress` show the default arrow, and no
+//   public diagonal resize cursors, so `Resize_NESW` and `Resize_NWSE` do too.
+// - On Linux these come from the user's cursor theme. A theme missing one of them falls back to
+//   whatever the window would otherwise inherit, usually the default arrow.
+Standard_Cursor :: enum {
+	Default,
+	Text,
+	Hand,
+	Crosshair,
+	Wait,
+	Progress,
+	Resize_EW,
+	Resize_NS,
+	Resize_NESW,
+	Resize_NWSE,
+	Move,
+	Not_Allowed,
+}
+
+// A cursor made from your own image, created with `create_custom_cursor`.
+Custom_Cursor :: distinct Handle
+
+CUSTOM_CURSOR_NONE :: Custom_Cursor{}
+
+// The cursor to show: either one the OS provides or one you made. Never both, which is why this
+// is a union. The zero value is `Standard_Cursor.Default`.
+Cursor :: union #no_nil {
+	Standard_Cursor,
+	Custom_Cursor,
+}
 
 Font_Baked_Glyph_Range :: struct {
 	start_idx: int,
@@ -4511,54 +6052,34 @@ TEXTURE_NONE :: Texture_Handle {}
 RENDER_TARGET_NONE :: Render_Target_Handle {}
 
 AUDIO_MIX_SAMPLE_RATE :: 44100
-AUDIO_MIX_CHUNK_SIZE :: 1400
+AUDIO_MIX_CHUNK_SIZE :: AUDIO_BACKEND.mix_chunk_size
 
 // Single channel audio sample. Can have a value between -1 and 1. For stereo sound every other
 // sample in an array of samples will be interpreted as left and right respectively.
 Audio_Sample :: f32
 
-// Represents a sound you can play using the `play_sound` procedure. Loaded using
-// `load_sound_from_file` or `load_sound_from_bytes`. Create instances of an already loaded sound
-// using `create_sound_instance`.
+// Represents something that is currently playing in the audio mixer. Created using
+// `play_audio_clip` and `play_audio_stream`. A sound is automatically destroyed when it finishes
+// playing. It is safe to keep using the handle after that: The procedures that take a `Sound` will
+// then just do nothing.
 Sound :: distinct Handle
 
 SOUND_NONE :: Sound {}
 
-// A sound instance is what `Sound` handles are mapped to. They contain a handle to a an audio
-// buffer, and the settings for use when playing that buffer. The audio buffer may be shared between
-// multiple sound instances, which allows you to play the same sound multiple times at the same time
-// without having to clone the data.
-Sound_Object :: struct {
-	handle: Sound,
-
-	// The audio buffer may be used by multiple sound instances. This is the key idea of sound
-	// instances: That you can use `create_sound_instance` to make it possible to play a sound
-	// multiple times at the same time, without having to clone the data.
-	audio_buffer: Audio_Buffer,
-
-	// If true, then the audio buffer will be destroyed when this sound is destroyed. This is true
-	// when the sound was loaded using the `load_sound_xxx` procedures. It's false when the sound
-	// is created from `create_sound_from_audio_buffer`.
-	owns_audio_buffer: bool,
-
-	// If this sound is currently playing, then this identifies the state of the playing sound. It
-	// is PLAYING_AUDIO_BUFFER_NONE (zero) when it is not playing.
-	playing_buffer_handle: Playing_Audio_Buffer_Handle,
-
-	// This exists both here and in the `Playing_Audio_Buffer`. That way we can store settings
-	// even when the sound isn't playing. Set using `set_sound_volume/pan/pitch`.
-	playback_settings: Audio_Buffer_Playback_Settings,
-
-	// If true, then the playing sound will be set up as "looping" when `play_sound` is called. Set
-	// using `set_sound_loop`.
-	loop: bool,
-}
-
+// Plays an ogg file by decoding it a little bit at a time, instead of loading all of the audio
+// data up front like an `Audio_Clip` does. Good for music, which would otherwise use a lot of
+// memory. Start it using `play_audio_stream`.
 Audio_Stream :: distinct Handle
 
 AUDIO_STREAM_NONE :: Audio_Stream {}
 
 AUDIO_STREAM_BUFFER_SIZE :: 3 * AUDIO_MIX_SAMPLE_RATE
+
+MAX_OGG_PAGE_SIZE :: 65307
+
+AUDIO_STREAM_READ_BUF_SIZE :: 2 * MAX_OGG_PAGE_SIZE
+
+AUDIO_STREAM_READ_SIZE :: 4096
 
 Audio_Channels :: enum {
 	Mono,
@@ -4570,100 +6091,218 @@ Audio_Stream_Mode :: enum {
 	From_Bytes,
 }
 
+Audio_Stream_Seek_State :: enum {
+	None,
+	Fading_Out,
+	Ready,
+	Seeking,
+}
+
 // From stb_vorbis.odin "In my test files the maximal-size usage is ~150KB.)"
 VORBIS_STATE_SIZE :: 300 * mem.Kilobyte
+
+Audio_Stream_Cursor :: struct {
+	// Where in `Audio_Stream_Data.buffer` we have most recently written samples. Together with
+	// `Sound_Object.offset`, this forms a circular buffer. This field is the 'head' and the offset
+	// is the 'tail'.
+	buffer_write_pos: int,
+
+	// Where in the streamed source we most recently fetched samples from. For stereo, left and
+	// right count as one sample each.
+	decode_cursor: int,
+
+	// Used for discarding unwanted samples at the decode cursor. This exists because the vorbis
+	// pushdata API can't position the decoding exactly. When seeking we land the decoder at or
+	// before the wanted spot and store how many samples to skip from there.
+	//
+	// Also used for short forward seeks, which don't move the file at all and just decode past the
+	// samples in between.
+	seek_discard: int,
+}
 
 Audio_Stream_Data :: struct {
 	handle: Audio_Stream,
 	
 	vorbis: ^stbv.vorbis,
 	vorbis_buffer: stbv.vorbis_alloc,
-	playing_buffer_handle: Playing_Audio_Buffer_Handle,
+	sound: Sound,
 	buffer: Audio_Buffer,
-	
-	// Where in the audio buffer referred to by `buffer_handle` that we have most recently written
-	// samples. Together with the `offset` of the Playing_Audio_Buffer, this forms a circular
-	// buffer.
-	buffer_write_pos: int,
 
-	playback_settings: Audio_Buffer_Playback_Settings,
+	cursor: Audio_Stream_Cursor,
 
-	// Different from `loop` in `Playing_Audio_Buffer`. This says if the whole stream should loop
-	// when it reaches end-of-file. The `loop` in `Playing_Audio_Buffer` just says to loop the
+	decode_mutex: sync.Mutex,
+
+	// How many samples the whole file has, counted the same way as `decode_cursor`. Worked out
+	// when the stream is loaded. Zero if it could not be worked out.
+	total_samples: int,
+
+	// Different from `loop` in `Sound_Object`. This says if the whole stream should loop
+	// when it reaches end-of-file. The `loop` in `Sound_Object` just says to loop the
 	// buffer itself. That's something you always want for a stream: We are continously writing
 	// data from a file into a small buffer that is a few seconds long.
 	loop: bool,
+
+	seek_state: Audio_Stream_Seek_State,
+	seek_seconds: f32,
 
 	mode: Audio_Stream_Mode,
 
 	// use if mode = .From_File
 	file: ^File,
-	file_read_buf: [dynamic]u8,
+	file_read_buf: []u8,
+
+	file_read_buf_len: int,
 	file_read_buf_offset: int,
 
 	// use if mode == .From_Bytes
 	bytes: []u8,
 }
 
-// The format used to describe that data passed to `load_sound_from_bytes_raw`.
-Raw_Sound_Format :: enum {
-	Integer8,
+// The format used to describe that data passed to `load_audio_clip_from_bytes_raw`.
+Raw_Audio_Format :: enum {
+	Integer8, // unsigned, like in 8 bit WAV files. The other integer formats are signed.
 	Integer16,
+	Integer24, // three bytes per sample, little endian
 	Integer32,
-	Float,
+	Float32,
+	Float64,
 }
 
+// An Audio_Buffer is the internal type used for any kind of audio data that is loaded into memory.
+// Both Audio_Clips and Audio_Streams use this to store the samples to be played.
 Audio_Buffer :: distinct Handle
 
-AUDIO_BUFFER_NONE :: Audio_Buffer{}
+AUDIO_BUFFER_NONE :: Audio_Buffer {}
+
+// A piece of audio that has been completely loaded into memory. Play it using `play_audio_clip`.
+//
+// This is actually just an `Audio_Buffer`, but under a distinct name that is given special
+// treatment. When `play_audio_clip` runs, then a `Sound` is created. The `Sound` tracks where in
+// the `Audio_Clip` it is playing audio from. That way, many `Sound` instances can play audio from
+// the same `Audio_Clip` data.
+Audio_Clip :: distinct Audio_Buffer
+
+AUDIO_CLIP_NONE :: Audio_Clip{}
 
 Audio_Buffer_Object :: struct {
 	handle: Audio_Buffer,
 
-	// All the samples of the audio buffer. In the case of stereo, the left and right samples are
+	// The audio samples the buffer contains. In the case of stereo, the left and right samples are
 	// interleaved.
 	samples: []Audio_Sample,
 
 	// The number of samples per second. Note that the mixer uses 44100 samples per second (as
-	// defined by AUDIO_MIX_SAMPLE_RATE). When the sample rate of the buffer and the mixer do no
-	// match, then interpolation will happen during mixing.
+	// defined by AUDIO_MIX_SAMPLE_RATE). When the sample rate of the buffer and the mixer mismatch,
+	// interpolation will happen during mixing.
 	sample_rate: int,
 
 	// If this is Stereo, then the left and right samples are interleaved in `samples`.
 	channels: Audio_Channels,
 }
 
-Audio_Buffer_Playback_Settings :: struct {
+Sound_Settings :: struct {
 	volume: f32,
 	pan: f32,
 	pitch: f32,
 }
 
-DEFAULT_AUDIO_BUFFER_PLAYBACK_SETTINGS :: Audio_Buffer_Playback_Settings {
-	volume = 1,
-	pan = 0,
-	pitch = 1,
-}
+// A `Sound_Object` is what `Sound` handles map to. It represents something currently playing in
+// the mixer. It holds a `buffer` which is where the mixer reads audio samples from. How that buffer
+// gets refilled depends on the `source` field. The source can either be an Audio_Clip or an
+// Audio_Stream. For clips `buffer` is the same as the clip's buffer. For audio streams the
+// buffer is a small amount of memory that is continuously being filled with data from the audio
+// stream.
+Sound_Object :: struct {
+	handle: Sound,
+	buffer: Audio_Buffer,
+	target_settings: Sound_Settings,
+	current_settings: Sound_Settings,
 
-PLAYING_AUDIO_BUFFER_NONE :: Playing_Audio_Buffer_Handle {}
-
-Playing_Audio_Buffer_Handle :: distinct Handle
-
-Playing_Audio_Buffer :: struct {
-	handle: Playing_Audio_Buffer_Handle,
-	audio_buffer: Audio_Buffer,
-	target_settings: Audio_Buffer_Playback_Settings,
-	current_settings: Audio_Buffer_Playback_Settings,
-
-	// How many samples have played?
+	// Where in `buffer` should we play samples from next?
 	offset: int,
 
 	// Only used when playing sounds that have pitch != 1 or when the sound has a sample rate that
 	// does not match the mixer's sample rate. In those cases we may get "fractional samples"
-	// because we may be in samples that are inbetween two samples in the original sound.
+	// because we may be in samples that are in-between two samples in the original sound.
 	offset_fraction: f32,
 
+	// If source is Audio_Clip: Set this flag using `set_sound_loop`.
+	// If source is Audio_Stream: Always true (the stream has its own loop flag internally and just
+	// refills the buffer with data, which continuously plays it). `set_sound_loop` will set the
+	// loop flag inside the Audio_Stream source data.
 	loop: bool,
+
+	// Set using `set_sound_paused`. The mixer skips paused sounds.
+	paused: bool,
+
+	// If true, then this Sound will be deleted next time `update_audio` runs. We don't remove
+	// directly when mixing because we don't want to touch memory allocations there. This is because
+	// the mixing may happen on a thread. It may look like `hm.remove` is thread safe. But the
+	// handle map uses an XAR array. The XAR array may internally append to a dynamically allocated
+	// freelist, which can cause allocations to happen.
+	remove: bool,
+
+	// For seeking audio clips. The mixer does the seeking since it needs to fade out, move the
+	// playback position and then fade in again. This avoids clicks when seeking.
+	//
+	// For Audio_Stream-based sounds, the seeking state is inside Audio_Stream_Data.
+	clip_has_pending_seek: bool,
+	clip_pending_seek_seconds: f32,
+
+	// The bus this is mixed into. The zero value is the master bus.
+	bus: Audio_Bus,
+
+	// This is the Audio_Clip or Audio_Stream that was passed to either `play_audio_clip` or
+	// `play_audio_stream`, whichever was used to create this Sound.
+	source: union #no_nil {
+		Audio_Clip,
+		Audio_Stream,
+	},
+}
+
+// A bus is a group of sounds that are mixed together before they reach the master bus. You can set
+// the volume and the pan of the whole group, and you can run an effect on it. Create one using
+// `create_audio_bus` and route sounds into it using `set_sound_bus`, or the `bus` parameter of
+// `play_audio_clip` or `play_audio_stream`.
+Audio_Bus :: distinct Handle
+
+// All other buses are mixed into the master bus, as well as sounds that play directly on the master
+// bus. This is the default bus of all sounds.
+//
+// You can use this with `set_audio_bus_volume`, `set_audio_bus_pan` and `set_audio_bus_effect`.
+// That's how you set the master volume of your game.
+AUDIO_BUS_MASTER :: Audio_Bus {}
+
+// The type of procedure to pass to `set_audio_bus_effect`. For the bus where the effect is applied,
+// `samples` is the finished mix. You may modify these samples in order to create your effect.
+// `user_data` is the user data you passed to `set_audio_bus_effect`.
+Audio_Effect_Proc :: proc(samples: [][2]Audio_Sample, user_data: rawptr)
+
+Audio_Bus_Settings :: struct {
+	volume: f32,
+	pan: f32,
+}
+
+Audio_Bus_Object :: struct {
+	handle: Audio_Bus,
+
+	// Same idea as in `Sound_Object`: The current settings move towards the target
+	// settings a bit at a time, so that changing the volume of a bus doesn't click.
+	target_settings: Audio_Bus_Settings,
+	current_settings: Audio_Bus_Settings,
+
+	effect: Audio_Effect_Proc,
+	effect_user_data: rawptr,
+
+	// The sounds routed to this bus are mixed in here. The bus effect runs on this. Then this is
+	// mixed into the master bus. Unused for the master bus itself: That one is mixed straight into
+	// `mix_buffer`.
+	chunk: [AUDIO_MIX_CHUNK_SIZE][2]Audio_Sample,
+}
+
+DEFAULT_AUDIO_BUS_SETTINGS :: Audio_Bus_Settings {
+	volume = 1,
+	pan = 0,
 }
 
 // This keeps track of the internal state of the library. Usually, you do not need to poke at it.
@@ -4673,29 +6312,37 @@ State :: struct {
 	allocator: runtime.Allocator,
 	frame_arena: runtime.Arena,
 	frame_allocator: runtime.Allocator,
-	platform: Platform_Interface,
 	platform_state: rawptr,
 	render_backend: Render_Backend_Interface,
 	render_backend_state: rawptr,
 
-	fs: fs.FontContext,
-	
 	close_window_requested: bool,
 
 	// All events for this frame. Cleared when `process_events` run
 	events: [dynamic]Event,
 
+	typed_runes: [dynamic]rune,
+
 	mouse_position: Vec2,
 	mouse_delta: Vec2,
 	mouse_wheel_delta: f32,
+	mouse_wheel_delta_horizontal: f32,
 
 	key_went_down: #sparse [Keyboard_Key]bool,
 	key_went_up: #sparse [Keyboard_Key]bool,
 	key_is_held: #sparse [Keyboard_Key]bool,
+	key_repeat: #sparse [Keyboard_Key]bool,
 
 	mouse_button_went_down: #sparse [Mouse_Button]bool,
 	mouse_button_went_up: #sparse [Mouse_Button]bool,
 	mouse_button_is_held: #sparse [Mouse_Button]bool,
+
+	touches: [dynamic; MAX_TOUCHES]Touch,
+
+	// See `set_mouse_touch_emulation`.
+	mouse_touch_emulation: Mouse_Touch_Emulation,
+
+	touch_to_mouse_id: Touch_Id,
 
 	gamepad_button_went_down: [MAX_GAMEPADS]#sparse [Gamepad_Button]bool,
 	gamepad_button_went_up: [MAX_GAMEPADS]#sparse [Gamepad_Button]bool,
@@ -4704,16 +6351,44 @@ State :: struct {
 	// Also see FONT_NONE and FONT_DEFAULT
 	fonts: [dynamic]Font_Data,
 	shape_drawing_texture: Texture_Handle,
-	batch_font: Font,
-	batch_camera: Maybe(Camera),
-	batch_shader: Shader,
-	batch_scissor: Maybe(Rect),
-	batch_texture: Texture_Handle,
-	batch_render_target: Render_Target_Handle,
-	batch_blend_mode: Blend_Mode,
+	// The settings the next draw call will be recorded with. Changing one of these does not affect
+	// draw calls that are already recorded.
+	current_camera: Maybe(Camera),
+	current_shader: Shader,
+	current_scissor: Maybe(Rect),
+	current_texture: Texture_Handle,
+	current_render_target: Render_Target_Handle,
+
+	// Size of `current_render_target`, or 0 when drawing to the window. Needed to build the
+	// projection, and to measure Y up from the bottom of it, without asking the backend.
+	current_render_target_width: int,
+	current_render_target_height: int,
+	current_blend_mode: Blend_Mode,
+
+	// Recorded but not drawn yet. They all point into `vertex_buffer_cpu`.
+	batch_draw_calls: [dynamic]Draw_Call,
+
+	// The one vertices go into right now. A zeroed one means there is none.
+	current_draw_call: Draw_Call,
+
+	// Holds the constant values and textures that the draw calls point at.
+	batch_arena: runtime.Arena,
+	batch_allocator: runtime.Allocator,
+
+	// Says that the shader constants may differ from what the open draw call captured.
+	current_constants_dirty: bool,
 
 	view_matrix: Mat4,
 	proj_matrix: Mat4,
+
+	// `proj_matrix * view_matrix`. Kept around because every draw call needs it. Update it with
+	// `_update_view_projection`.
+	view_projection: Mat4,
+
+	z: f32,
+	depth_test: bool,
+	depth_range_min: f32,
+	depth_range_max: f32,
 
 	vertex_buffer_cpu: []u8,
 	vertex_buffer_cpu_used: int,
@@ -4736,26 +6411,79 @@ State :: struct {
 	audio_buffers: hm.Dynamic_Handle_Map(Audio_Buffer_Object, Audio_Buffer),
 	sounds: hm.Dynamic_Handle_Map(Sound_Object, Sound),
 
-	playing_audio_buffers: hm.Dynamic_Handle_Map(Playing_Audio_Buffer, Playing_Audio_Buffer_Handle),
-
 	audio_streams: hm.Dynamic_Handle_Map(Audio_Stream_Data, Audio_Stream),
 
-	// Mixer will never mix in more than 1.5 * AUDIO_MIX_CHUNK_SIZE. So 10 times the chunk size is
-	// ample.
-	mix_buffer: [AUDIO_MIX_CHUNK_SIZE*10][2]Audio_Sample,
+	audio_buses: hm.Dynamic_Handle_Map(Audio_Bus_Object, Audio_Bus),
 
-	// Where the mixer currently is in the mix buffer.
-	mix_buffer_offset: int,
+	// Identified by AUDIO_BUS_MASTER. Does not live in `audio_buses` because it is associated with
+	// the zero handle, which cannot be fetched from the handle map.
+	//
+	// We only use the `chunk` field of this bus when `update_audio` runs the mixer, which happens
+	// in case there is no audio thread. 
+	master_bus: Audio_Bus_Object,
+
+	audio_mutex: sync.Mutex,
+
+	audio_thread_temp_allocator_buffer: [4096]byte,
+	audio_thread_temp_allocator_arena: mem.Arena,
+	audio_thread_logger: runtime.Logger,
 }
 
 
-// Support for up to 255 mouse buttons. Cast an int to type `Mouse_Button` to use things outside the
-// options presented here.
+// Karl2D currently reports left, right, and middle mouse buttons.
+// `Max` defines the upper bound of the `Mouse_Button` enum.
 Mouse_Button :: enum {
 	Left,
 	Right,
 	Middle,
 	Max = 255,
+}
+
+// The maximum number of touches Karl2D tracks at once. Ten fingers, plus the one
+// `set_mouse_touch_emulation` makes from the mouse.
+MAX_TOUCHES :: 11
+
+// Identifies one finger for as long as it stays on the screen. Stable from the moment the touch
+// goes down until it goes up. Ids may be reused after that.
+Touch_Id :: distinct u64
+
+// Touch ID when the mouse is being used to emulate touch.
+EMULATED_TOUCH_ID :: max(Touch_Id)
+
+// When emulating mouse events using Mouse_Touch_Emulation.Touch_To_Mouse, then this signifies that
+// a touch event is not associated with the mouse.
+TOUCH_TO_MOUSE_ID_NONE :: max(Touch_Id) - 1
+
+Touch :: struct {
+	id: Touch_Id,
+
+	// Measured from the top-left corner of the window, like `get_mouse_position`.
+	position: Vec2,
+
+	// How many pixels the touch moved between the previous and the current frame.
+	delta: Vec2,
+
+	// The touch started this frame.
+	went_down: bool,
+
+	// The touch ended this frame. It stays in the list for this one frame, so you can react to it.
+	went_up: bool,
+
+	// The OS threw the touch away, for example due to palm rejection or the window losing focus.
+	// `went_up` is set as well, so code that doesn't care about the difference still works.
+	cancelled: bool,
+}
+
+Mouse_Touch_Emulation :: enum {
+	// No automatic conversion between touch and mouse events.
+	None,
+
+	// Touch events become left mouse button events. Useful for making a mouse-only game work on
+	// web. This is set by default.
+	Touch_To_Mouse,
+
+	// Mouse events become touch events. Useful for testing basic touch controls on desktop.
+	Mouse_To_Touch,
 }
 
 // Based on Raylib / GLFW
@@ -4936,8 +6664,11 @@ Event :: union {
 	Event_Close_Window_Requested,
 	Event_Key_Went_Down,
 	Event_Key_Went_Up,
+	Event_Key_Repeat,
+	Event_Typed_Rune,
 	Event_Mouse_Move,
 	Event_Mouse_Wheel,
+	Event_Mouse_Wheel_Horizontal,
 	Event_Mouse_Button_Went_Down,
 	Event_Mouse_Button_Went_Up,
 	Event_Mouse_Teleported,
@@ -4947,6 +6678,10 @@ Event :: union {
 	Event_Window_Focused,
 	Event_Window_Unfocused,
 	Event_Window_Scale_Changed,
+	Event_Touch_Went_Down,
+	Event_Touch_Moved,
+	Event_Touch_Went_Up,
+	Event_Touch_Cancelled,
 }
 
 Event_Key_Went_Down :: struct {
@@ -4955,6 +6690,18 @@ Event_Key_Went_Down :: struct {
 
 Event_Key_Went_Up :: struct {
 	key: Keyboard_Key,
+}
+
+// A key is being held down and the OS is auto-repeating it. Sent in addition to (not instead of)
+// the initial `Event_Key_Went_Down`.
+Event_Key_Repeat :: struct {
+	key: Keyboard_Key,
+}
+
+// A Unicode code point was typed, taking the current keyboard layout into account. Use this for
+// text input. See `get_typed_runes`.
+Event_Typed_Rune :: struct {
+	typed: rune,
 }
 
 Event_Mouse_Button_Went_Down :: struct {
@@ -4987,7 +6734,14 @@ Event_Mouse_Move :: struct {
 	position: Vec2,
 }
 
+// The vertical mouse wheel scrolled. `delta` is positive when scrolling up.
 Event_Mouse_Wheel :: struct {
+	delta: f32,
+}
+
+// The horizontal mouse wheel scrolled. `delta` is positive when scrolling right. A tilt wheel or a
+// two-finger sideways swipe on a trackpad drives this one.
+Event_Mouse_Wheel_Horizontal :: struct {
 	delta: f32,
 }
 
@@ -5007,18 +6761,613 @@ Event_Window_Focused :: struct {}
 
 Event_Window_Unfocused :: struct {}
 
+Event_Touch_Went_Down :: struct { id: Touch_Id, position: Vec2 }
+Event_Touch_Moved     :: struct { id: Touch_Id, position: Vec2 }
+Event_Touch_Went_Up   :: struct { id: Touch_Id, position: Vec2 }
+
+// No position: not every platform knows where a cancelled touch was. The touch keeps the last
+// position it was seen at.
+Event_Touch_Cancelled :: struct { id: Touch_Id }
+
 
 // Used by API builder. Everything after this constant will not be in karl2d.doc.odin
 API_END :: true
 
-batch_vertex :: proc(v: Vec2, uv: Vec2, color: Color) {
-	v := v
+// Returns true if `r` should be treated as a typed character for text input purposes. Filters out
+// control characters such as Backspace, Enter, Tab, Escape and Delete. Used by the platform
+// backends when producing `Event_Typed_Rune` events.
+@(private="package")
+is_typable_rune :: proc(r: rune) -> bool {
+	return r >= 32 && r != 0x7f
+}
 
-	if s.vertex_buffer_cpu_used == len(s.vertex_buffer_cpu) {
+// The number of lines `text` occupies. Used to size the text block without having to measure the
+// whole thing: only the height matters for placing the block.
+@(private="file", require_results)
+count_text_lines :: proc "contextless" (text: string) -> int {
+	lines := 1
+
+	for c in text {
+		if c == '\n' {
+			lines += 1
+		}
+	}
+
+	return lines
+}
+
+assert_initialized :: proc(loc := #caller_location) {
+	assert(s != nil, "Call k2.init before using this Karl2D procedure", loc)
+}
+
+// Finds a currently tracked touch by id. Returns nil if the touch isn't tracked, which happens for
+// example if an up/move event arrives for a touch that started before the window got focus.
+@(private="package")
+_find_touch :: proc(id: Touch_Id) -> ^Touch {
+	for &t in s.touches {
+		if t.id == id {
+			return &t
+		}
+	}
+	return nil
+}
+
+// Moves the decoder of a stream that reads from a file to `target_frame`, or to a little before
+// it. Returns the frame it landed on, or -1 if it could not get there.
+//
+// We can't ask the decoder to jump, because it only ever sees the small pieces of the file we hand
+// it. But we can seek the file ourselves and tell the decoder to resynchronize: It then looks for
+// an ogg page it trusts, and once it has decoded a frame it can say how far into the audio that
+// page was.
+//
+// So we look for the right spot in the file. We keep two known points, one before the wanted spot
+// and one after it, and narrow the gap between them. The first couple of tries assume the bytes
+// are spread evenly over the audio, which lands close on most files. A file that spends very
+// different numbers of bytes on different parts of the audio ruins that assumption, so after that
+// we cut the remaining range in half instead, which always gets there.
+//
+// Landing a little before the wanted spot is fine: `update_audio_stream` decodes the bit in
+// between and throws it away, which is quick. Landing after it is no good at all.
+_seek_file_stream :: proc(
+	sd: ^Audio_Stream_Data,
+	ab: Audio_Buffer_Object,
+	target_frame: int,
+) -> int {
+	if sd.total_samples <= 0 {
+		return -1
+	}
+
+	channels := 1
+	if ab.channels == .Stereo {
+		channels = 2
+	}
+
+	total_frames := sd.total_samples / channels
+
+	if total_frames <= 0 {
+		return -1
+	}
+
+	file_size, file_size_err := file_seek(sd.file, 0, .End)
+
+	if file_size_err != nil || file_size <= 0 {
+		return -1
+	}
+
+	// Seeks the file to `offset` and lets the decoder find a page from there. Returns the frame the
+	// decoder ends up at, or -1 if no page turned up.
+	resync_at :: proc(sd: ^Audio_Stream_Data, offset: i64) -> int {
+		// Ogg pages are usually 4 to 8 kilobytes, so reading this much normally turns up a page
+		// right away.
+		READ_SIZE :: 8192
+
+		// A page should turn up long before this many reads. This is here so that a file that is
+		// not what we think it is cannot spin forever.
+		MAX_READS :: 64
+
+		if _, seek_err := file_seek(sd.file, offset, .Start); seek_err != nil {
+			return -1
+		}
+
+		sd.file_read_buf_len = 0
+		sd.file_read_buf_offset = 0
+		stbv.flush_pushdata(sd.vorbis)
+
+		for _ in 0..<MAX_READS {
+			decoded_channels: i32
+			samples: i32
+			output: [^]^f32
+
+			bytes_used := stbv.decode_frame_pushdata(
+				sd.vorbis,
+				raw_data(sd.file_read_buf[sd.file_read_buf_offset:]),
+				i32(sd.file_read_buf_len - sd.file_read_buf_offset),
+				&decoded_channels,
+				&output,
+				&samples,
+			)
+
+			sd.file_read_buf_offset += int(bytes_used)
+
+			if samples > 0 {
+				// The decoder has found a page and decoded a frame from it, so it can now say
+				// where in the audio the next frame starts.
+				return int(stbv.get_sample_offset(sd.vorbis))
+			}
+
+			if bytes_used == 0 {
+				copy(
+					sd.file_read_buf[:],
+					sd.file_read_buf[sd.file_read_buf_offset:sd.file_read_buf_len],
+				)
+				sd.file_read_buf_len -= sd.file_read_buf_offset
+				sd.file_read_buf_offset = 0
+				space := len(sd.file_read_buf) - sd.file_read_buf_len
+
+				if space == 0 {
+					return -1
+				}
+
+				to_read := min(space, AUDIO_STREAM_READ_SIZE)
+				read, read_err := file_read(
+					sd.file,
+					sd.file_read_buf[sd.file_read_buf_len:sd.file_read_buf_len + to_read],
+				)
+
+				if read <= 0 || read_err != nil {
+					return -1
+				}
+
+				sd.file_read_buf_len += read
+			}
+		}
+
+		return -1
+	}
+
+	// Landing this far before the wanted spot is close enough to stop looking.
+	close_enough := 2 * ab.sample_rate
+
+	// Once the two known points are this close together there is nothing to gain by narrowing
+	// further: What is left decodes in well under a millisecond.
+	SMALL_RANGE :: 64 * 1024
+
+	// Cutting the range in half each time gets anywhere in a file of any size we might see well
+	// inside this many tries.
+	MAX_TRIES :: 40
+
+	// The two points we know: The audio at `lo_byte` starts at `lo_frame`, and the same for `hi`.
+	lo_byte, hi_byte := i64(0), file_size
+	lo_frame, hi_frame := 0, total_frames
+
+	// The best spot found so far, and where in the file it was.
+	best_frame := -1
+	best_byte := i64(0)
+
+	// Where in the file the decoder was left by the most recent try.
+	decoder_byte := i64(-1)
+
+	for try in 0..<MAX_TRIES {
+		if hi_byte - lo_byte <= SMALL_RANGE {
+			break
+		}
+
+		guess: i64
+
+		if try < 2 && hi_frame > lo_frame {
+			// Assume the bytes are spread evenly over the audio between the two known points.
+			aim := clamp(target_frame - close_enough/2, lo_frame, hi_frame)
+			span := f64(hi_byte - lo_byte)
+			part := f64(aim - lo_frame) / f64(hi_frame - lo_frame)
+			guess = lo_byte + i64(span * part)
+		} else {
+			guess = lo_byte + (hi_byte - lo_byte)/2
+		}
+
+		guess = clamp(guess, lo_byte, hi_byte)
+		landed := resync_at(sd, guess)
+		decoder_byte = guess
+
+		if landed < 0 {
+			// No page turned up here, so there is nothing usable this far in. Look earlier.
+			hi_byte = guess
+			continue
+		}
+
+		if landed > target_frame {
+			hi_byte = guess
+			hi_frame = landed
+			continue
+		}
+
+		lo_byte = guess
+		lo_frame = landed
+
+		if landed > best_frame {
+			best_frame = landed
+			best_byte = guess
+		}
+
+		if target_frame - landed <= close_enough {
+			break
+		}
+	}
+
+	if best_frame < 0 {
+		return -1
+	}
+
+	// The last try usually is the best spot, since that is when we stop looking. If it isn't then
+	// the decoder is somewhere else and has to be put back.
+	if decoder_byte != best_byte && best_frame != resync_at(sd, best_byte) {
+		return -1
+	}
+
+	return best_frame
+}
+
+// Works out how many audio frames an ogg file holds by looking at the last page in it.
+//
+// An ogg file is a sequence of pages. Each page starts with "OggS" and stores a granule position:
+// The number of frames that have been decoded once that page has been played. The granule position
+// of the last page is therefore the length of the whole file. We do it this way because the
+// decoder cannot tell us the length of a file we feed to it a small piece at a time.
+//
+// The file position is restored before returning. Returns 0 if no length could be found.
+_ogg_file_total_frames :: proc(f: ^File) -> int {
+	// The biggest an ogg page can be. Reading this many bytes from the end of the file means we
+	// are certain to see the start of the last page.
+	MAX_OGG_PAGE_SIZE :: 65307
+
+	// The smallest an ogg page header can be. Reading fewer bytes than this means there is no
+	// page to find.
+	MIN_OGG_PAGE_SIZE :: 27
+
+	restore_pos, restore_pos_err := file_seek(f, 0, .Current)
+
+	if restore_pos_err != nil {
+		return 0
+	}
+
+	file_size, file_size_err := file_seek(f, 0, .End)
+
+	if file_size_err != nil {
+		return 0
+	}
+
+	read_size := min(int(file_size), MAX_OGG_PAGE_SIZE)
+
+	if read_size < MIN_OGG_PAGE_SIZE {
+		file_seek(f, restore_pos, .Start)
+		return 0
+	}
+
+	if _, seek_err := file_seek(f, file_size - i64(read_size), .Start); seek_err != nil {
+		file_seek(f, restore_pos, .Start)
+		return 0
+	}
+
+	buf := make([]u8, read_size, frame_allocator)
+	filled: int
+
+	// A single read may hand back less than we asked for, so keep going until the buffer is full.
+	for filled < read_size {
+		read, read_err := file_read(f, buf[filled:])
+
+		if read <= 0 || read_err != nil {
+			break
+		}
+
+		filled += read
+	}
+
+	file_seek(f, restore_pos, .Start)
+
+	if filled < MIN_OGG_PAGE_SIZE {
+		return 0
+	}
+
+	buf = buf[:filled]
+
+	// Walk backwards until we find a page that tells us where it ends.
+	for idx := len(buf) - MIN_OGG_PAGE_SIZE; idx >= 0; idx -= 1 {
+		if string(buf[idx:idx + 4]) != "OggS" {
+			continue
+		}
+
+		granule, granule_ok := endian.get_u64(buf[idx + 6:idx + 14], .Little)
+
+		if !granule_ok {
+			continue
+		}
+
+		// All ones means that no packet finishes on this page, so it says nothing about the
+		// length. Keep looking at earlier pages.
+		if granule == max(u64) {
+			continue
+		}
+
+		return int(granule)
+	}
+
+	return 0
+}
+
+// The caller must hold sd.decode_mutex
+_seek_audio_stream :: proc(
+	sd: ^Audio_Stream_Data,
+	ab: Audio_Buffer_Object,
+	cursor: Audio_Stream_Cursor,
+	seconds: f32,
+) -> (
+	_post_seek_cursor: Audio_Stream_Cursor,
+	_ok: bool,
+) {
+	cursor := cursor
+
+	channels := 1
+	if ab.channels == .Stereo {
+		channels = 2
+	}
+
+	target_frame := int(seconds * f32(ab.sample_rate))
+
+	// Don't go past the end of the audio when we know where that is.
+	if sd.total_samples > 0 {
+		target_frame = min(target_frame, sd.total_samples / channels)
+	}
+
+	switch sd.mode {
+	case .From_Bytes:
+		if stbv.seek(sd.vorbis, u32(target_frame)) == 0 {
+			log.error("Cannot set sound position, seeking in the audio stream failed.")
+			return
+		}
+
+		cursor.decode_cursor = target_frame * channels
+		cursor.seek_discard = 0
+
+	case .From_File:
+		target := target_frame * channels
+
+		// A short step forwards is cheapest to do by decoding the samples in between and throwing
+		// them away, which is what `seek_discard` makes `update_audio_stream` do.
+		if target >= cursor.decode_cursor &&
+		   target - cursor.decode_cursor <= 2 * ab.sample_rate * channels {
+			cursor.seek_discard = target - cursor.decode_cursor
+			break
+		}
+
+		// Anything longer is done by seeking the file itself.
+		if landed := _seek_file_stream(sd, ab, target_frame); landed >= 0 {
+			cursor.decode_cursor = landed * channels
+			cursor.seek_discard = target - cursor.decode_cursor
+			break
+		}
+
+		// The file could not be searched, so go back to the start and decode from there.
+		file_seek(sd.file, 0, .Start)
+		sd.file_read_buf_len = 0
+		sd.file_read_buf_offset = 0
+		stbv.flush_pushdata(sd.vorbis)
+		cursor.decode_cursor = 0
+		cursor.seek_discard = target
+	}
+
+	return cursor, true
+}
+
+// Run by the drawing procedures before they add any vertices. Draws the batch if `vertices_needed`
+// more vertices will not fit in the vertex buffer, which leaves an empty one to put them in. Then
+// starts a new draw call if the settings changed.
+_begin_vertices :: proc(texture: Texture_Handle, vertices_needed: int) {
+	s.current_texture = texture
+
+	// Starting a draw call can pad the write position by up to one vertex, so ask for one extra.
+	bytes_needed := s.current_shader.vertex_size*(vertices_needed + 1)
+
+	if s.vertex_buffer_cpu_used + bytes_needed > len(s.vertex_buffer_cpu) {
 		draw_current_batch()
 	}
 
-	shd := s.batch_shader
+	if !_draw_call_matches_settings() {
+		_finish_draw_call()
+		_start_draw_call()
+	}
+}
+
+// Whether the open draw call already draws things the way the current settings say. A zeroed draw
+// call has no shader. It therefore never matches. That is the state right after a flush.
+_draw_call_matches_settings :: proc() -> bool {
+	dc := s.current_draw_call
+
+	// The constants are the one thing we can't compare, see `current_constants_dirty`.
+	if s.current_constants_dirty {
+		return false
+	}
+
+	if dc.shader != s.current_shader.handle ||
+	   dc.render_target != s.current_render_target ||
+	   dc.scissor != s.current_scissor ||
+	   dc.blend_mode != s.current_blend_mode {
+		return false
+	}
+
+	return _textures_match(dc.textures)
+}
+
+// Compares the textures the current settings would bind against the ones a draw call captured.
+// The shader's bindpoints are used as they are. The exception is the one Karl2D fills in with the
+// texture being drawn.
+_textures_match :: proc(recorded: []Texture_Handle) -> bool {
+	shader := s.current_shader
+
+	if len(recorded) != len(shader.texture_bindpoints) {
+		return false
+	}
+
+	def_tex_idx, has_def_tex_idx := shader.default_texture_index.?
+
+	for bindpoint, i in shader.texture_bindpoints {
+		wanted := has_def_tex_idx && i == def_tex_idx ? s.current_texture : bindpoint
+
+		if recorded[i] != wanted {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Starts the draw call that the following vertices go into. Everything it needs is captured here.
+// The drawing itself happens later, when the batch is flushed. Run `_finish_draw_call` first, or
+// the vertices of the one that is already open are lost.
+_start_draw_call :: proc() {
+	shader := s.current_shader
+
+	// Vertices for different shaders can share the buffer. Each draw call therefore starts at a
+	// multiple of its own vertex size. That lets the backends address it as a plain vertex index.
+	if remainder := s.vertex_buffer_cpu_used % shader.vertex_size; remainder != 0 {
+		s.vertex_buffer_cpu_used += shader.vertex_size - remainder
+	}
+
+	// The shader keeps one copy of its constants and bindpoints. A draw call runs long after it was
+	// recorded, so it needs the values it saw back then. A later `set_shader_constant` or write to
+	// `texture_bindpoints` must not reach back and change it. It therefore gets its own copy.
+	//
+	// Draw calls that would copy the same values share one instead. That saves the copying. It also
+	// lets the backend compare the two pointers to see there is nothing to re-upload.
+	prev := s.current_draw_call
+	same_shader := prev.shader == shader.handle
+
+	constants_data := prev.constants_data
+
+	if !same_shader || s.current_constants_dirty {
+		constants_data = slice.clone(shader.constants_data, s.batch_allocator)
+		_write_builtin_constants(shader, constants_data)
+	}
+
+	textures := prev.textures
+
+	if !same_shader || !_textures_match(prev.textures) {
+		textures = slice.clone(shader.texture_bindpoints, s.batch_allocator)
+
+		// The texture being drawn is ours rather than the shader's. It goes into the copy.
+		if def_tex_idx, has_def_tex_idx := shader.default_texture_index.?; has_def_tex_idx {
+			textures[def_tex_idx] = s.current_texture
+		}
+	}
+
+	// Scissor rectangles are screen space, which is what D3D11 and OpenGL take.
+	scissor := s.current_scissor
+
+	s.current_draw_call = {
+		vertex_offset = s.vertex_buffer_cpu_used,
+		shader = shader.handle,
+		vertex_size = shader.vertex_size,
+		constants = shader.constants,
+		constants_data = constants_data,
+		textures = textures,
+		render_target = s.current_render_target,
+		scissor = scissor,
+		blend_mode = s.current_blend_mode,
+	}
+
+	s.current_constants_dirty = false
+}
+
+// Writes the constants that Karl2D itself supplies into a draw call's copy of them. They are ours
+// rather than the shader program's, which is why they go into the copy and not into the shader.
+// The view-projection matrix is the only one right now.
+_write_builtin_constants :: proc(shader: Shader, constants_data: []u8) {
+	for mloc, builtin in shader.constant_builtin_locations {
+		constant, constant_ok := mloc.?
+
+		if !constant_ok {
+			continue
+		}
+
+		switch builtin {
+		case .View_Projection_Matrix:
+			if constant.size == size_of(Mat4) {
+				(^Mat4)(&constants_data[constant.offset])^ = s.view_projection
+			}
+		}
+	}
+}
+
+// Puts the open draw call into the list of recorded ones. Empty ones are left out, which is what a
+// run of settings changes leaves behind. What stays open is an empty draw call with the same
+// settings, so running this twice cannot record the same vertices twice.
+_finish_draw_call :: proc() {
+	dc := &s.current_draw_call
+
+	if dc.shader == SHADER_NONE {
+		return
+	}
+
+	dc.vertex_count = (s.vertex_buffer_cpu_used - dc.vertex_offset) / dc.vertex_size
+
+	if dc.vertex_count > 0 {
+		// Compared against the last draw call that made it into the list, because that is the one
+		// the backend will have set up before this one. Dropped draw calls never happened.
+		if len(s.batch_draw_calls) == 0 {
+			dc.changed = DRAW_CALL_CHANGE_ALL
+		} else {
+			dc.changed = _draw_call_changes(s.batch_draw_calls[len(s.batch_draw_calls) - 1], dc^)
+		}
+
+		append(&s.batch_draw_calls, dc^)
+	}
+
+	dc.vertex_offset = s.vertex_buffer_cpu_used
+	dc.vertex_count = 0
+}
+
+// Works out what `next` needs the backend to set up that `prev` did not. It is done here so that
+// each backend does not have to. Things that go together are also decided in one place. A new
+// render target needs a new scissor rect, for example.
+_draw_call_changes :: proc(
+	prev: Draw_Call,
+	next: Draw_Call,
+) -> (changed: bit_set[Draw_Call_Change]) {
+	if prev.shader != next.shader {
+		// A different shader has its own constant buffers and texture bindpoints. Those have to be
+		// set up again even when the values in them are the same.
+		changed += { .Shader, .Constants, .Textures }
+	}
+
+	// Draw calls that hold the same values share one copy of them. The same memory therefore means
+	// there is nothing to re-upload.
+	if raw_data(prev.constants_data) != raw_data(next.constants_data) {
+		changed += { .Constants }
+	}
+
+	if raw_data(prev.textures) != raw_data(next.textures) {
+		changed += { .Textures }
+	}
+
+	if prev.render_target != next.render_target {
+		// A draw call without a scissor rect gets one that covers the whole render target.
+		changed += { .Render_Target, .Scissor }
+	}
+
+	if prev.scissor != next.scissor {
+		changed += { .Scissor }
+	}
+
+	if prev.blend_mode != next.blend_mode {
+		changed += { .Blend_Mode }
+	}
+
+	return
+}
+
+// Callers must run `_begin_vertices` first. That leaves room in the buffer and a draw call to put
+// the vertex in.
+batch_vertex :: proc(v: Vec2, uv: Vec2, color: Color) {
+	v := v
+	shd := s.current_shader
 
 	base_offset := s.vertex_buffer_cpu_used
 	pos_offset := shd.default_input_offsets[.Position]
@@ -5029,6 +7378,10 @@ batch_vertex :: proc(v: Vec2, uv: Vec2, color: Color) {
 
 	if pos_offset != -1 {
 		(^Vec2)(&s.vertex_buffer_cpu[base_offset + pos_offset])^ = v
+
+		if s.depth_test {
+			(^f32)(&s.vertex_buffer_cpu[base_offset + pos_offset + size_of(Vec2)])^ = s.z
+		}
 	}
 
 	if uv_offset != -1 {
@@ -5054,13 +7407,67 @@ batch_vertex :: proc(v: Vec2, uv: Vec2, color: Color) {
 	s.vertex_buffer_cpu_used += shd.vertex_size
 }
 
+// Draws the batch if any recorded draw call still samples `texture`. Those draw calls have to
+// happen before the texture changes or goes away. Nothing has usually been drawn with it yet, in
+// which case there is nothing to wait for.
+_flush_if_batch_uses_texture :: proc(texture: Texture_Handle) {
+	if texture == TEXTURE_NONE {
+		return
+	}
+
+	uses_texture :: proc(dc: Draw_Call, texture: Texture_Handle) -> bool {
+		for t in dc.textures {
+			if t == texture {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if uses_texture(s.current_draw_call, texture) {
+		draw_current_batch()
+		return
+	}
+
+	for dc in s.batch_draw_calls {
+		if uses_texture(dc, texture) {
+			draw_current_batch()
+			return
+		}
+	}
+}
+
+// Run after changing `proj_matrix` or `view_matrix`. Draw calls then pick up the new combination.
+_update_view_projection :: proc() {
+	s.view_projection = s.proj_matrix * s.view_matrix
+	s.current_constants_dirty = true
+}
+
 VERTEX_BUFFER_MAX :: 1000000
+
+// How much room the batch arena starts with. A draw call needs a handful of bytes for its
+// textures. It only copies the constants when they actually changed. This therefore covers a frame
+// with thousands of draw calls in it. The arena grows if a frame needs more.
+BATCH_ARENA_BLOCK_SIZE :: 64*1024
 
 @(private="file")
 s: ^State
 
+when ODIN_OS == .Windows {
+	PLATFORM :: PLATFORM_WINDOWS
+} else when ODIN_OS == .JS {
+	PLATFORM :: PLATFORM_WEB
+} else when ODIN_OS == .Linux {
+	PLATFORM :: PLATFORM_LINUX
+} else when ODIN_OS == .Darwin {
+	PLATFORM :: PLATFORM_MAC
+} else {
+	#panic("Unsupported platform")
+}
+
 @(private="file")
-pf: Platform_Interface
+pf :: PLATFORM
 
 @(private="file")
 rb: Render_Backend_Interface
@@ -5073,7 +7480,7 @@ ab: Audio_Backend_Interface
 frame_allocator: runtime.Allocator
 
 get_shader_input_default_type :: proc(name: string, type: Shader_Input_Type) -> Shader_Default_Inputs {
-	if name == "position" && type == .Vec2 {
+	if name == "position" && (type == .Vec2 || type == .Vec3) {
 		return .Position
 	} else if name == "texcoord" && type == .Vec2 {
 		return .UV
@@ -5105,7 +7512,9 @@ get_shader_input_format :: proc(name: string, type: Shader_Input_Type) -> Pixel_
 
 	if default_type != .Unknown {
 		switch default_type {
-		case .Position: return .RG_32_Float
+		// The shaders take a vec3 position, but with depth testing off we only feed it xy and let
+		// the shader default z to 0. That keeps the 2D vertex at 20 bytes.
+		case .Position: return s.depth_test ? .RGB_32_Float : .RG_32_Float
 		case .UV: return .RG_32_Float
 		case .Color: return .RGBA_8_Norm
 		case .Unknown: unreachable()
@@ -5134,98 +7543,150 @@ frame_cstring :: proc(str: string, loc := #caller_location) -> cstring {
 
 
 @(require_results)
-matrix_ortho3d_f32 :: proc "contextless" (left, right, bottom, top, near, far: f32) -> Mat4 #no_bounds_check {
+matrix_ortho3d_f32 :: proc "contextless" (
+	left, right, bottom, top: f32,
+	z_min, z_max: f32,
+	clip_z_min, clip_z_max: f32,
+) -> Mat4 #no_bounds_check {
 	m: Mat4
+
+	// Maps the user-facing z range onto the render backend's clip space z range. GL and D3D11
+	// disagree on that range (-w..w vs 0..w), which is why this can't just be a fixed +1 like a
+	// pure 2D ortho matrix would use.
+	z_scale := (clip_z_max - clip_z_min) / (z_max - z_min)
 
 	m[0, 0] = +2 / (right - left)
 	m[1, 1] = +2 / (top - bottom)
-	m[2, 2] = +1
+	m[2, 2] = z_scale
 	m[0, 3] = -(right + left)   / (right - left)
 	m[1, 3] = -(top   + bottom) / (top - bottom)
-	m[2, 3] = 0
+	m[2, 3] = clip_z_min - z_min * z_scale
 	m[3, 3] = 1
 
 	return m
 }
 
-make_default_projection :: proc(w, h: int) -> matrix[4,4]f32 {
-	return matrix_ortho3d_f32(0, f32(w), f32(h), 0, 0.001, 2)
+make_default_projection :: proc(w, h: int, flip_y: bool) -> matrix[4,4]f32 {
+	clip_z_min, clip_z_max := rb.get_depth_clip_range()
+
+	if flip_y {
+		return matrix_ortho3d_f32(
+			0, f32(w), 0, f32(h),
+			s.depth_range_min, s.depth_range_max,
+			clip_z_min, clip_z_max,
+		)
+	}
+
+	return matrix_ortho3d_f32(
+		0, f32(w), f32(h), 0,
+		s.depth_range_min, s.depth_range_max,
+		clip_z_min, clip_z_max,
+	)
 }
 
-FONT_DEFAULT_ATLAS_SIZE :: 2048
+// Returns true if the currently used camera wants the Y axis to be flipped.
+_camera_flip_y :: proc() -> bool {
+	if cam, cam_ok := s.current_camera.?; cam_ok {
+		return cam.flip_y
+	}
 
-_update_font :: proc(fh: Font) {
-	font := &s.fonts[fh]
-	font_dirty_rect: [4]f32
+	return false
+}
 
-	tw := FONT_DEFAULT_ATLAS_SIZE
+_font_render_size :: proc(font_size: f32) -> int {
+	camera_zoom: f32 = 1
 
-	if fs.ValidateTexture(&s.fs, &font_dirty_rect) {
-		fdr := font_dirty_rect
+	if cam, cam_ok := s.current_camera.?; cam_ok && cam.zoom > 0.001 {
+		camera_zoom = cam.zoom
+	}
 
-		r := Rect {
-			fdr[0],
-			fdr[1],
-			fdr[2] - fdr[0],
-			fdr[3] - fdr[1],
+	return max(1, int(math.round(font_size * camera_zoom)))
+}
+
+_sync_font_pages :: proc(font: ^Font_Data) {
+	for page, page_idx in font.dynamic_font.pages {
+		if page_idx == len(font.dynamic_pages) {
+			append(&font.dynamic_pages, Texture {})
 		}
 
-		x := int(r.x)
-		y := int(r.y)
-		w := int(fdr[2]) - int(fdr[0])
-		h := int(fdr[3]) - int(fdr[1])
+		texture := &font.dynamic_pages[page_idx]
 
-		expanded_pixels := make([]Color, w * h, frame_allocator)
-		start := x + tw * y
+		if texture.width == page.width && texture.height == page.height {
+			continue
+		}
 
-		for i in 0..<w*h {
-			px := i%w
-			py := i/w
+		if texture.handle != TEXTURE_NONE {
+			rb.destroy_texture(texture.handle)
+		}
 
-			dst_pixel_idx := (px) + (py * w)
-			src_pixel_idx := start + (px) + (py * tw)
+		texture^ = create_texture(page.width, page.height, .RGBA_8_Norm)
 
-			src := s.fs.textureData[src_pixel_idx]
+		if texture.handle != TEXTURE_NONE {
+			set_texture_filter(texture^, font.options.filter)
+		}
+	}
+}
 
-			if font.options.premultiply_alpha {
-				a := f32(src) / 255
-				expanded_pixels[dst_pixel_idx] = {
-					u8(f32(src) * a),
-					u8(f32(src) * a),
-					u8(f32(src) * a),
-					src,
-				}
-			} else {
-				expanded_pixels[dst_pixel_idx] = {255,255,255, src}
+// For each dynamic font, this procedure updates the GPU-side atlases based on if the CPU-side
+// atlases have "dirty data". This means that there are areas on the CPU-side atlases that are not on
+// the GPU yet. This happens when `draw_text` uses previously unused glyphs.
+//
+// Dynamic fonts use the `font_cache` package. It maintains the CPU-side atlases (pages). This
+// procedure goes through the pages and checks if there are "dirty rects" set for any of them, which
+// means that that region of the GPU texture needs to be updated.
+//
+// This is run before any draw call that depends on these glyphs is submitted.
+_update_font_atlases :: proc() {
+	for &font in s.fonts {
+		if font.type != .Dynamic {
+			continue
+		}
+
+		for &page, page_idx in font.dynamic_font.pages {
+			if page.dirty_max.x <= page.dirty_min.x || page.dirty_max.y <= page.dirty_min.y {
+				continue
 			}
+
+			if page_idx >= len(font.dynamic_pages) {
+				continue
+			}
+
+			texture := font.dynamic_pages[page_idx]
+
+			if texture.handle == TEXTURE_NONE {
+				continue
+			}
+
+			x := page.dirty_min.x
+			y := page.dirty_min.y
+			w := page.dirty_max.x - x
+			h := page.dirty_max.y - y
+			pixels := make([]Color, w * h, frame_allocator)
+
+			for i in 0..<w*h {
+				px := i%w
+				py := i/w
+				alpha := page.pixels[(x + px) + (y + py) * page.width]
+
+				if font.options.premultiply_alpha {
+					pixels[i] = { alpha, alpha, alpha, alpha }
+				} else {
+					pixels[i] = { 255, 255, 255, alpha }
+				}
+			}
+
+			r := Rect {
+				f32(x),
+				f32(y),
+				f32(w),
+				f32(h),
+			}
+
+			rb.update_texture(texture.handle, slice.reinterpret([]u8, pixels), r)
+			page.dirty_min = { page.width, page.height }
+			page.dirty_max = {}
 		}
-
-		rb.update_texture(font.atlas.handle, slice.reinterpret([]u8, expanded_pixels), r)
 	}
-}
-
-// Not for direct use. Specify font to `draw_text_ex`
-_set_font :: proc(fh: Font) {
-	fh := fh
-
-	if s.batch_font == fh {
-		return
-	}
-
-	draw_current_batch()
-
-	s.batch_font = fh
-
-	if s.batch_font != FONT_NONE {
-		_update_font(s.batch_font)
-	}
-
-	if fh == 0 {
-		fh = FONT_DEFAULT
-	}
-
-	font := &s.fonts[fh]
-	fs.SetFont(&s.fs, font.dynamic_fontstash_handle)
 }
 
 _ :: jpeg
@@ -5236,19 +7697,9 @@ _ :: tga
 Color_F32 :: [4]f32
 
 f32_color_from_color :: proc(color: Color) -> Color_F32 {
-	return {
-		f32(color.r) / 255,
-		f32(color.g) / 255,
-		f32(color.b) / 255,
-		f32(color.a) / 255,
-	}
+	return (Color_F32)(color)/255
 }
 
 color_from_f32_color :: proc(color: Color_F32) -> Color {
-	return {
-		u8(color.r * 255),
-		u8(color.g * 255),
-		u8(color.b * 255),
-		u8(color.a * 255),
-	}
+	return (Color)(color*255)
 }

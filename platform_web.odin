@@ -17,12 +17,19 @@ PLATFORM_WEB :: Platform_Interface {
 	get_screen_width = web_get_screen_width,
 	get_screen_height = web_get_screen_height,
 	set_window_position = web_set_position,
+	get_window_position = web_get_position,
 	get_window_scale = web_get_window_scale,
 	set_window_mode = web_set_window_mode,
+	set_window_icon = web_set_window_icon,
+
 	set_cursor_hidden = web_set_cursor_hidden,
 	is_cursor_hidden = web_is_cursor_hidden,
-	set_cursor_locked = web_set_cursor_locked,
-	is_cursor_locked = web_is_cursor_locked,
+	set_mouse_locked = web_set_mouse_locked,
+	is_mouse_locked = web_is_mouse_locked,
+	create_custom_cursor = web_create_custom_cursor,
+	set_cursor = web_set_cursor,
+	destroy_custom_cursor = web_destroy_custom_cursor,
+
 	is_gamepad_active = web_is_gamepad_active,
 	get_gamepad_axis = web_get_gamepad_axis,
 	set_gamepad_vibration = web_set_gamepad_vibration,
@@ -33,10 +40,16 @@ PLATFORM_WEB :: Platform_Interface {
 }
 
 import "core:sys/wasm/js"
+import "core:unicode/utf8"
 import "core:math"
+import "core:encoding/base64"
 import "base:runtime"
+import hm "core:container/handle_map"
 import "log"
 import "core:fmt"
+
+// The link element in index.html that `web_set_window_icon` writes the favicon into.
+FAVICON_ELEMENT_ID :: "karl2d-favicon"
 
 web_state_size :: proc() -> int {
 	return size_of(Web_State)
@@ -55,6 +68,7 @@ web_init :: proc(
 	s.events = make([dynamic]Event, allocator)
 	s.key_from_js_event_key_code = make(map[string]Keyboard_Key, allocator)
 	s.canvas_id = "webgl-canvas"
+	hm.dynamic_init(&s.custom_cursors, allocator)
 
 	js.set_document_title(window_title)
 	s.prev_scale = f32(js.device_pixel_ratio())
@@ -71,9 +85,16 @@ web_init :: proc(
 	s.window_mode = init_options.window_mode
 
 	add_window_event_listener(.Resize, web_event_window_resize)
-	add_canvas_event_listener(.Mouse_Move, web_event_mouse_move)
-	add_canvas_event_listener(.Mouse_Down, web_event_mouse_down)
-	add_window_event_listener(.Mouse_Up, web_event_mouse_up)
+
+	// One pointer model for mouse, pen and touch. Up sits on the window because a mouse pointer
+	// gets no implicit capture: a drag that ends outside the canvas still has to release. Touch
+	// pointers do get capture, and their events bubble to the window anyway.
+	add_canvas_event_listener(.Pointer_Down, web_event_pointer_down)
+	add_canvas_event_listener(.Pointer_Move, web_event_pointer_move)
+	add_window_event_listener(.Pointer_Up, web_event_pointer_up)
+	add_canvas_event_listener(.Pointer_Cancel, web_event_pointer_cancel)
+
+	// Not a pointer event, so the wheel keeps its own listener.
 	add_canvas_event_listener(.Wheel, web_event_mouse_wheel)
 
 	add_window_event_listener(.Key_Down, web_event_key_down)
@@ -89,14 +110,37 @@ web_init :: proc(
 }
 
 web_event_key_down :: proc(e: js.Event) {
-	if e.key.repeat {
-		return
+	key := key_from_js_event(e)
+
+	if key != .None {
+		if e.key.repeat {
+			append(&s.events, Event_Key_Repeat {
+				key = key,
+			})
+		} else {
+			append(&s.events, Event_Key_Went_Down {
+				key = key,
+			})
+		}
 	}
 
-	key := key_from_js_event(e)
-	append(&s.events, Event_Key_Went_Down {
-		key = key,
-	})
+	// A typed character comes from the keydown, not from the deprecated
+	// `keypress` event. That way a page can stop the browser scrolling on
+	// space or moving the focus on tab -- which it has to do by cancelling the
+	// keydown, and cancelling a keydown also cancels the keypress that would
+	// have followed it -- without the character disappearing with it.
+	//
+	// `e.key.key` is what the key produced on the layout in use (`a`, ` `,
+	// `å`, an emoji from a picker) and a name for everything that is not a
+	// character (`Enter`, `ArrowLeft`, `F5`), which is why only a value that
+	// is exactly one rune long is taken. A key Karl2D has no `Keyboard_Key`
+	// for still types its character.
+	if !e.key.ctrl && !e.key.alt && !e.key.meta {
+		r, size := utf8.decode_rune(e.key.key)
+		if size == len(e.key.key) && is_typable_rune(r) {
+			append(&s.events, Event_Typed_Rune { typed = r })
+		}
+	}
 }
 
 web_event_key_up :: proc(e: js.Event) {
@@ -111,7 +155,7 @@ web_event_focus :: proc(e: js.Event) {
 }
 
 web_event_blur :: proc(e: js.Event) {
-	s.cursor_locked = false
+	s.mouse_locked = false
 	append(&s.events, Event_Window_Unfocused {})
 }
 
@@ -135,8 +179,62 @@ web_event_window_resize :: proc(e: js.Event) {
 	}
 }
 
-web_event_mouse_move :: proc(e: js.Event) {
-	if s.cursor_locked {
+
+web_event_mouse_wheel :: proc(e: js.Event) {
+	// Not the best way, but how would we know what the wheel deltaMode really represents? If it is
+	// in pixels, how much "scroll" does that equal to? So we keep the direction and call it one
+	// click. The browser measures down and right as positive, so the vertical axis is flipped.
+	// A swipe along one axis reports zero on the other, which is not worth an event.
+	if e.wheel.delta.y != 0 {
+		append(&s.events, Event_Mouse_Wheel {
+			delta = e.wheel.delta.y > 0 ? -1 : 1,
+		})
+	}
+
+	if e.wheel.delta.x != 0 {
+		append(&s.events, Event_Mouse_Wheel_Horizontal {
+			delta = e.wheel.delta.x > 0 ? 1 : -1,
+		})
+	}
+}
+
+// Mouse, pen and touch all arrive here. Touch becomes touch events, everything else drives the
+// mouse. The browser's own post-tap mouse events are not pointer events, so they never reach us
+// and a tap cannot arrive twice.
+web_event_pointer_down :: proc(e: js.Event) {
+	if e.mouse.pointer.pointer_type == .Touch {
+		append(&s.events, Event_Touch_Went_Down {
+			id = Touch_Id(e.mouse.pointer.pointer_id),
+			position = web_touch_position(e),
+		})
+		return
+	}
+
+	button := Mouse_Button.Left
+
+	if e.mouse.button == 2 {
+		button = .Right
+	}
+
+	if e.mouse.button == 1 {
+		button = .Middle
+	}
+
+	append(&s.events, Event_Mouse_Button_Went_Down {
+		button = button,
+	})
+}
+
+web_event_pointer_move :: proc(e: js.Event) {
+	if e.mouse.pointer.pointer_type == .Touch {
+		append(&s.events, Event_Touch_Moved {
+			id = Touch_Id(e.mouse.pointer.pointer_id),
+			position = web_touch_position(e),
+		})
+		return
+	}
+
+	if s.mouse_locked {
 		cx := f32(s.width / 2)
 		cy := f32(s.height / 2)
 		dx := f32(e.mouse.movement.x) * f32(js.device_pixel_ratio())
@@ -153,7 +251,15 @@ web_event_mouse_move :: proc(e: js.Event) {
 	}
 }
 
-web_event_mouse_down :: proc(e: js.Event) {
+web_event_pointer_up :: proc(e: js.Event) {
+	if e.mouse.pointer.pointer_type == .Touch {
+		append(&s.events, Event_Touch_Went_Up {
+			id = Touch_Id(e.mouse.pointer.pointer_id),
+			position = web_touch_position(e),
+		})
+		return
+	}
+
 	button := Mouse_Button.Left
 
 	if e.mouse.button == 2 {
@@ -161,23 +267,7 @@ web_event_mouse_down :: proc(e: js.Event) {
 	}
 
 	if e.mouse.button == 1 {
-		button = .Middle 
-	}
-
-	append(&s.events, Event_Mouse_Button_Went_Down {
-		button = button,
-	})
-}
-
-web_event_mouse_up :: proc(e: js.Event) {
-	button := Mouse_Button.Left
-
-	if e.mouse.button == 2 {
-		button = .Right
-	}
-
-	if e.mouse.button == 1 {
-		button = .Middle 
+		button = .Middle
 	}
 
 	append(&s.events, Event_Mouse_Button_Went_Up {
@@ -185,12 +275,20 @@ web_event_mouse_up :: proc(e: js.Event) {
 	})
 }
 
-web_event_mouse_wheel :: proc(e: js.Event) {
-	append(&s.events, Event_Mouse_Wheel {
-		// Not the best way, but how would we know what the wheel deltaMode really represents? If it
-		// is in pixels, how much "scroll" does that equal to?
-		delta = f32(e.wheel.delta.y > 0 ? -1 : 1),
-	})
+// Only touch is cancelled in practice. A mouse that somehow gets here has no button to release.
+web_event_pointer_cancel :: proc(e: js.Event) {
+	if e.mouse.pointer.pointer_type != .Touch {
+		return
+	}
+
+	append(&s.events, Event_Touch_Cancelled { id = Touch_Id(e.mouse.pointer.pointer_id) })
+}
+
+web_touch_position :: proc(e: js.Event) -> Vec2 {
+	return {
+		math.floor(f32(e.mouse.client.x) * f32(js.device_pixel_ratio())),
+		math.floor(f32(e.mouse.client.y) * f32(js.device_pixel_ratio())),
+	}
 }
 
 add_canvas_event_listener :: proc(evt: js.Event_Kind, callback: proc(e: js.Event)) {
@@ -231,6 +329,13 @@ web_set_screen_size_to_window_size :: proc(canvas_id: HTML_Canvas_ID) {
 }
 
 web_shutdown :: proc() {
+	for it := hm.dynamic_iterator_make(&s.custom_cursors); cd, _ in hm.dynamic_iterate(&it) {
+		delete(cd.data_uri, s.allocator)
+		delete(cd.style_value, s.allocator)
+		delete(cd.style_value_scaled, s.allocator)
+	}
+	hm.dynamic_destroy(&s.custom_cursors)
+
 	delete(s.events)
 	delete(s.key_from_js_event_key_code)
 }
@@ -336,6 +441,11 @@ web_set_position :: proc(x: int, y: int) {
 	log.warn("set_window_position not implemented on web")
 }
 
+web_get_position :: proc() -> Vec2 {
+	log.warn("get_window_position not implemented on web")
+	return {}
+}
+
 web_set_screen_size :: proc(w, h: int) {
 	scale := web_get_window_scale()
 	s.width = int(f32(w) * scale)
@@ -368,13 +478,52 @@ web_set_window_mode :: proc(new_mode: Window_Mode) {
 	}
 }
 
+// Makes a data URI out of an image, for handing it to the DOM through a string property.
+// core:image/png can only decode, not encode, so the image goes through our own `encode_png`; see
+// that proc's comment for why its uncompressed output is fine here.
+web_png_data_uri :: proc(image: Image, allocator: runtime.Allocator) -> (string, bool) {
+	png_bytes, encode_ok := encode_png(image, frame_allocator)
+
+	if !encode_ok {
+		log.error("Failed encoding image as PNG")
+		return "", false
+	}
+
+	// The base64 is copied into the data URI below, so it is not needed after that.
+	pixels_b64 := base64.encode(png_bytes, allocator = frame_allocator)
+	return fmt.aprintf("data:image/png;base64,%v", pixels_b64, allocator = allocator), true
+}
+
+// A page has no window icon, so this sets the favicon instead, as a PNG data URI. Needs the
+// `karl2d-favicon` link element that the `build_web` template puts in `index.html`.
+web_set_window_icon :: proc(image: Image, warn_if_unsupported: bool) -> bool {
+	// Every element that exists has its own id as the value of its `id` property, so a zero length
+	// means there is no such element.
+	if js.get_element_key_string_length(FAVICON_ELEMENT_ID, "id") == 0 {
+		if warn_if_unsupported {
+			log.warnf(
+				"Cannot set the window icon: index.html has no element with the id '%v'. Add " +
+				"<link id=\"%v\" rel=\"icon\" href=\"\"> to its <head>.",
+				FAVICON_ELEMENT_ID, FAVICON_ELEMENT_ID,
+			)
+		}
+
+		return false
+	}
+
+	data_uri, data_uri_ok := web_png_data_uri(image, frame_allocator)
+
+	if !data_uri_ok {
+		return false
+	}
+
+	js.set_element_key_string(FAVICON_ELEMENT_ID, "href", data_uri)
+	return true
+}
+
 web_set_cursor_hidden :: proc(hidden: bool) {
 	s.cursor_hidden = hidden
-	if hidden {
-		js.set_element_style(s.canvas_id, "cursor", "none")
-	} else {
-		js.set_element_style(s.canvas_id, "cursor", "default")
-	}
+	web_apply_cursor()
 }
 
 web_is_cursor_hidden :: proc() -> bool {
@@ -383,10 +532,10 @@ web_is_cursor_hidden :: proc() -> bool {
 
 _web_event_pointer_lock_change :: proc(e: js.Event) {
 	js.evaluate("document.getElementById('webgl-canvas')._pointerLocked = document.pointerLockElement !== null ? 1 : 0")
-	s.cursor_locked = js.get_element_key_f64("webgl-canvas", "_pointerLocked") != 0
+	s.mouse_locked = js.get_element_key_f64("webgl-canvas", "_pointerLocked") != 0
 }
 
-web_set_cursor_locked :: proc(locked: bool) {
+web_set_mouse_locked :: proc(locked: bool) {
 	if locked {
 		js.evaluate("document.getElementById('webgl-canvas').requestPointerLock()")
 		cx := f32(s.width / 2)
@@ -396,11 +545,178 @@ web_set_cursor_locked :: proc(locked: bool) {
 		js.evaluate("document.exitPointerLock()")
 	}
 
-	// s.cursor_locked set by _web_event_pointer_lock_change
+	// s.mouse_locked set by _web_event_pointer_lock_change
 }
 
-web_is_cursor_locked :: proc() -> bool {
-	return s.cursor_locked
+web_is_mouse_locked :: proc() -> bool {
+	return s.mouse_locked
+}
+
+web_create_custom_cursor :: proc(image: Image, hotspot: [2]int) -> (Custom_Cursor, bool) {
+	// There is no hardware cursor API on the web, so we hand the browser a PNG as a data URI and
+	// let CSS do the work.
+	data_uri, data_uri_ok := web_png_data_uri(image, s.allocator)
+	if !data_uri_ok {
+		return {}, false
+	}
+
+	// Browsers cap `cursor` images at 128 CSS pixels; anything bigger is either clamped or, in
+	// Firefox, ignored entirely and silently replaced with the default cursor.
+	scale := web_get_window_scale()
+	if f32(image.width)/scale > 128 || f32(image.height)/scale > 128 {
+		log.warnf(
+			"Cursor image is %vx%v physical pixels, which is %.0fx%.0f CSS pixels at the current " +
+			"%vx display scale. Browsers cap cursors at 128 CSS pixels and some ignore anything " +
+			"bigger entirely, so consider using a smaller image.",
+			image.width, image.height,
+			f32(image.width)/scale, f32(image.height)/scale,
+			scale,
+		)
+	}
+
+	cursor := Web_Cursor{hotspot = hotspot}
+	cursor.data_uri = data_uri
+	web_build_cursor_style(&cursor)
+
+	handle, add_err := hm.add(&s.custom_cursors, cursor)
+
+	if add_err != nil {
+		log.errorf("Failed to create cursor. Error: %v", add_err)
+		delete(cursor.data_uri, s.allocator)
+		delete(cursor.style_value, s.allocator)
+		delete(cursor.style_value_scaled, s.allocator)
+		return {}, false
+	}
+
+	return handle, true
+}
+
+// The `cursor` property sizes its image in CSS pixels, but the rest of Karl2D works in device
+// pixels: the canvas is `scale` times bigger than its CSS box. A cursor made from a 128x128 image
+// would therefore be drawn twice as big as a 128x128 sprite drawn by the game on a 2x display.
+//
+// `image-set` fixes that by telling the browser the image has `scale` device pixels per CSS pixel,
+// which both scales it down and keeps it crisp. The hotspot is in CSS pixels too, so it is scaled
+// to match. We keep the plain `url` value around as a fallback, see `web_set_cursor`.
+web_build_cursor_style :: proc(cursor: ^Web_Cursor) {
+	delete(cursor.style_value, s.allocator)
+	delete(cursor.style_value_scaled, s.allocator)
+
+	scale := web_get_window_scale()
+
+	cursor.style_value = fmt.aprintf(
+		"url(%v) %v %v, auto",
+		cursor.data_uri,
+		cursor.hotspot.x, cursor.hotspot.y,
+		allocator = s.allocator,
+	)
+
+	cursor.style_value_scaled = fmt.aprintf(
+		"image-set(url(%v) %vx) %.2f %.2f, auto",
+		cursor.data_uri, scale,
+		f32(cursor.hotspot.x) / scale, f32(cursor.hotspot.y) / scale,
+		allocator = s.allocator,
+	)
+
+	cursor.built_for_scale = scale
+}
+
+web_set_cursor :: proc(cursor: Cursor) {
+	// Reject a stale handle, so a programming error leaves the cursor alone.
+	if c, is_custom := cursor.(Custom_Cursor); is_custom {
+		if hm.get(&s.custom_cursors, c) == nil {
+			log.errorf("Trying to set invalid cursor %v. It may have been destroyed.", c)
+			return
+		}
+	}
+
+	s.current_cursor = cursor
+	web_apply_cursor()
+}
+
+web_standard_cursor_keyword :: proc(cursor: Standard_Cursor) -> string {
+	switch cursor {
+	case .Default:     return "default"
+	case .Text:        return "text"
+	case .Hand:        return "pointer"
+	case .Crosshair:   return "crosshair"
+	case .Wait:        return "wait"
+	case .Progress:    return "progress"
+	case .Resize_EW:   return "ew-resize"
+	case .Resize_NS:   return "ns-resize"
+	case .Resize_NESW: return "nesw-resize"
+	case .Resize_NWSE: return "nwse-resize"
+	case .Move:        return "move"
+	case .Not_Allowed: return "not-allowed"
+	}
+
+	return "default"
+}
+
+// Applies s.cursor_hidden and s.current_cursor to the canvas. The two share the same CSS `cursor`
+// property, so every entry point goes through this.
+web_apply_cursor :: proc() {
+	if s.cursor_hidden {
+		js.set_element_style(s.canvas_id, "cursor", "none")
+		s.applied_cursor = nil
+		return
+	}
+
+	switch c in s.current_cursor {
+	case Standard_Cursor:
+		// No dedup here: a keyword is tiny, unlike the data URI below.
+		js.set_element_style(s.canvas_id, "cursor", web_standard_cursor_keyword(c))
+		s.applied_cursor = nil
+
+	case Custom_Cursor:
+		cd := hm.get(&s.custom_cursors, c)
+
+		if cd == nil {
+			js.set_element_style(s.canvas_id, "cursor", web_standard_cursor_keyword(.Default))
+			s.applied_cursor = nil
+			return
+		}
+
+		scale := web_get_window_scale()
+
+		if cd.built_for_scale != scale {
+			web_build_cursor_style(cd)
+		}
+
+		// The data URI is tens of kilobytes and games tend to set the cursor every frame, so don't
+		// make the browser re-parse it when nothing has changed.
+		if s.applied_cursor == cd && s.applied_scale == scale {
+			return
+		}
+
+		// Assign the plain value first. Browsers that can't parse `image-set` ignore the second
+		// assignment and keep this one, which is the right thing to fall back to.
+		js.set_element_style(s.canvas_id, "cursor", cd.style_value)
+		js.set_element_style(s.canvas_id, "cursor", cd.style_value_scaled)
+
+		s.applied_cursor = cd
+		s.applied_scale = scale
+	}
+}
+
+web_destroy_custom_cursor :: proc(custom_cursor: Custom_Cursor) {
+	cd := hm.get(&s.custom_cursors, custom_cursor)
+
+	if cd == nil {
+		log.errorf(
+			"Trying to destroy invalid cursor %v. It may already be destroyed.",
+			custom_cursor,
+		)
+		return
+	}
+
+	delete(cd.data_uri, s.allocator)
+	delete(cd.style_value, s.allocator)
+	delete(cd.style_value_scaled, s.allocator)
+	hm.remove(&s.custom_cursors, custom_cursor)
+
+	// Falls back to the default if that was the cursor on screen.
+	web_apply_cursor()
 }
 
 web_is_gamepad_active :: proc(gamepad: int) -> bool {
@@ -465,11 +781,34 @@ Web_State :: struct {
 	height: int,
 	prev_scale: f32,
 	events: [dynamic]Event,
-	cursor_locked: bool,
+	mouse_locked: bool,
 	cursor_hidden: bool,
+
+	custom_cursors: hm.Dynamic_Handle_Map(Web_Cursor, Custom_Cursor),
+
+	// The cursor most recently passed to web_set_cursor. The zero value is Standard_Cursor.Default.
+	current_cursor: Cursor,
+
+	// What web_apply_cursor last wrote to the canvas, so it can skip redundant work. Safe to hold
+	// across frames: the handle map allocates new chunks rather than moving existing ones, and
+	// web_apply_cursor clears this whenever the cursor it points at stops resolving.
+	applied_cursor: ^Web_Cursor,
+	applied_scale: f32,
 	gamepad_state: [MAX_GAMEPADS]js.Gamepad_State,
 	window_mode: Window_Mode,
 	key_from_js_event_key_code: map[string]Keyboard_Key,
+}
+
+Web_Cursor :: struct {
+	handle: Custom_Cursor,
+	data_uri: string,
+	hotspot: [2]int,
+
+	// Both CSS values for `data_uri`, rebuilt whenever the DPI scale changes. See
+	// `web_build_cursor_style`.
+	style_value: string,
+	style_value_scaled: string,
+	built_for_scale: f32,
 }
 
 s: ^Web_State

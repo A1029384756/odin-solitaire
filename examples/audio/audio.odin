@@ -7,14 +7,37 @@ import "core:fmt"
 import "core:slice"
 
 pos: k2.Vec2
-snd: k2.Sound
-snd2: k2.Sound
-snd3: k2.Sound
-wav: k2.Audio_Buffer
-wav_1: k2.Sound
-wav_2: k2.Sound
+sine_clip_200: k2.Audio_Clip
+sine_sound: k2.Sound
+sine_clip_440: k2.Audio_Clip
+sine_clip_700: k2.Audio_Clip
+chord_clip: k2.Audio_Clip
 
 music: k2.Audio_Stream
+music_sound: k2.Sound
+
+sweep_clip: k2.Audio_Clip
+sweep_sound: k2.Sound
+
+Seek_Bar :: struct {
+	// Where the seek bar is drawn. Clicking anywhere in it jumps to that spot in the song.
+	rect: k2.Rect,
+
+	// True while the left mouse button is dragging the seek bar.
+	dragging: bool,
+
+	// How far along the seek bar the drag currently is, from 0 to 1.
+	fraction: f32,
+}
+
+music_seek_bar := Seek_Bar {
+	rect = { 20, 330, 800, 30 },
+}
+
+sweep_seek_bar := Seek_Bar {
+	rect = { 20, 460, 800, 30 },
+}
+
 snd_volume: f32
 snd_pan: f32
 snd_pitch: f32 = 1
@@ -25,14 +48,13 @@ HAS_MUSIC :: #exists(MUSIC_FILE)
 init :: proc() {
 	k2.init(1280, 720, "Karl2D Audio")
 
-	snd = make_sine_wave(200, 0.5, 44100)
+	sine_clip_200 = make_sine_wave(200, 0.5, 44100)
 	snd_volume = 1
 	snd_pitch = 1
-	snd2 = make_sine_wave(440, 1, 44100)
-	snd3 = make_sine_wave(700, 1, 22050)
-	wav = k2.load_audio_buffer_from_bytes(#load("chord.wav"))
-	wav_1 = k2.create_sound_from_audio_buffer(wav)
-	wav_2 = k2.create_sound_from_audio_buffer(wav)
+	sine_clip_440 = make_sine_wave(440, 1, 44100)
+	sine_clip_700 = make_sine_wave(700, 1, 22050)
+	chord_clip = k2.load_audio_clip_from_bytes(#load("chord.ogg"))
+	sweep_clip = make_sine_sweep(200, 800, 10, 44100)
 
 	when HAS_MUSIC {
 		when ODIN_OS == .JS {
@@ -42,17 +64,15 @@ init :: proc() {
 		} else {
 			music = k2.load_audio_stream_from_file(MUSIC_FILE)
 		}
-		k2.set_audio_stream_loop(music, true)
-		k2.play_audio_stream(music)
+		music_sound = k2.play_audio_stream(music, loop = true)
 	} else {
-		k2.set_sound_loop(snd, true)
-		k2.play_sound(snd)
+		sine_sound = k2.play_audio_clip(sine_clip_200, loop = true)
 	}
 }
 
 // Makes a sine wave of min_length rounded up to so that it ends at the end of a period. This makes
 // it possible to loop cleanly.
-make_sine_wave :: proc(freq: int, min_length: f32, sample_rate: int) -> k2.Sound {
+make_sine_wave :: proc(freq: int, min_length: f32, sample_rate: int) -> k2.Audio_Clip {
 	period_num_samples := f32(sample_rate) / f32(freq)
 	num_periods := math.ceil(f32(sample_rate) * min_length)
 	sine_data := make([]k2.Audio_Sample, int(num_periods), allocator = context.temp_allocator)
@@ -63,7 +83,82 @@ make_sine_wave :: proc(freq: int, min_length: f32, sample_rate: int) -> k2.Sound
 		samp = sf
 	}
 
-	return k2.load_sound_from_bytes_raw(slice.reinterpret([]u8, sine_data), .Float, sample_rate, .Mono)
+	return k2.load_audio_clip_from_bytes_raw(slice.reinterpret([]u8, sine_data), .Float32, sample_rate, .Mono)
+}
+
+make_sine_sweep :: proc(
+	start_freq: f32,
+	end_freq: f32,
+	length: f32,
+	sample_rate: int,
+) -> k2.Audio_Clip {
+	num_samples := int(f32(sample_rate) * length)
+	sweep_data := make([]k2.Audio_Sample, num_samples, allocator = context.temp_allocator)
+	phase: f32
+
+	for &samp, i in sweep_data {
+		freq := start_freq + (end_freq - start_freq) * f32(i) / f32(num_samples)
+		phase += (2.0*math.PI) * freq / f32(sample_rate)
+
+		if phase > 2.0*math.PI {
+			phase -= 2.0*math.PI
+		}
+
+		samp = math.sin(phase)*0.25
+	}
+
+	return k2.load_audio_clip_from_bytes_raw(
+		slice.reinterpret([]u8, sweep_data),
+		.Float32,
+		sample_rate,
+		.Mono,
+	)
+}
+
+seek_bar :: proc(bar: ^Seek_Bar, sound: k2.Sound) {
+	if k2.mouse_button_went_down(.Left) && k2.point_in_rect(k2.get_mouse_position(), bar.rect) {
+		bar.dragging = true
+	}
+
+	length := k2.get_sound_length(sound)
+
+	if bar.dragging {
+		bar.fraction = clamp((k2.get_mouse_position().x - bar.rect.x) / bar.rect.w, 0, 1)
+
+		if !k2.mouse_button_is_held(.Left) {
+			bar.dragging = false
+
+			if length > 0 {
+				k2.set_sound_time(sound, bar.fraction * length)
+			}
+		}
+	}
+
+	fraction: f32
+
+	if length > 0 {
+		fraction = clamp(k2.get_sound_time(sound)/length, 0, 1)
+	}
+
+	// While dragging, the bar follows the mouse instead of the music. The music catches up
+	// when the button is released.
+	if bar.dragging {
+		fraction = bar.fraction
+	}
+
+	k2.draw_rect(bar.rect, k2.LIGHT_GRAY)
+
+	played := bar.rect
+	played.w = bar.rect.w * fraction
+	k2.draw_rect(played, bar.dragging ? k2.LIGHT_BLUE : k2.DARK_GRAY)
+	k2.draw_rect_outline(bar.rect, 1, k2.BLACK)
+
+	k2.draw_text(
+		fmt.tprintf("%.1f / %.1f s", fraction*length, length),
+		{bar.rect.x, bar.rect.y + bar.rect.h + 8},
+		30,
+		k2.BLACK,
+	)
 }
 
 step :: proc() -> bool {
@@ -72,11 +167,11 @@ step :: proc() -> bool {
 	}
 
 	if k2.key_went_down(.Enter) {
-		k2.play_sound(snd2)
+		k2.play_audio_clip(sine_clip_440)
 	}
 
 	if k2.key_went_down(.N3) {
-		k2.play_sound(snd3)
+		k2.play_audio_clip(sine_clip_700)
 	}
 	
 	if k2.key_is_held(.Up) {
@@ -105,42 +200,57 @@ step :: proc() -> bool {
 
 
 	if k2.key_went_down(.Space) {
-		k2.set_sound_pitch(wav_1, 1)
-		k2.set_sound_pan(wav_1, 0)
-		k2.play_sound(wav_1)
+		k2.play_audio_clip(chord_clip)
 	}
 
 	if k2.key_went_down(.T)	{
-		k2.set_sound_pitch(wav_1, 2)
-		k2.set_sound_pan(wav_1, -1)
-		k2.play_sound(wav_1)
-		k2.set_sound_pitch(wav_2, 0.5)
-		k2.set_sound_pan(wav_2, 1)
-		k2.play_sound(wav_2)
+		k2.play_audio_clip(chord_clip, pitch = 2, pan = -1)
+		k2.play_audio_clip(chord_clip, pitch = 0.5, pan = 1)
 	}
 	
+	if k2.key_went_down(.L) {
+		k2.stop_sound(sweep_sound)
+		sweep_sound = k2.play_audio_clip(sweep_clip, loop = true)
+	}
+
+	if k2.key_went_down(.K) {
+		k2.set_sound_paused(sweep_sound, k2.sound_is_playing(sweep_sound))
+	}
+
 	snd_pan = clamp(snd_pan, -1, 1)
 	snd_volume = clamp(snd_volume, 0, 1)
 	snd_pitch = math.max(snd_pitch, 0.01)
 	
 	when HAS_MUSIC {
 		k2.update_audio_stream(music)
-		
+
+		// Home starts the music. End stops it, which also rewinds the stream. P pauses and
+		// resumes, keeping its place in the song.
 		if k2.key_went_down(.Home) {
-			k2.play_audio_stream(music)
+			music_sound = k2.play_audio_stream(
+				music,
+				volume = snd_volume,
+				pan = snd_pan,
+				pitch = snd_pitch,
+				loop = true,
+			)
 		}
 
 		if k2.key_went_down(.End) {
-			k2.stop_audio_stream(music)
+			k2.stop_sound(music_sound)
 		}
 
-		k2.set_audio_stream_pitch(music, snd_pitch)
-		k2.set_audio_stream_pan(music, snd_pan)
-		k2.set_audio_stream_volume(music, snd_volume)
+		if k2.key_went_down(.P) {
+			k2.set_sound_paused(music_sound, k2.sound_is_playing(music_sound))
+		}
+
+		k2.set_sound_pitch(music_sound, snd_pitch)
+		k2.set_sound_pan(music_sound, snd_pan)
+		k2.set_sound_volume(music_sound, snd_volume)
 	} else {
-		k2.set_sound_volume(snd, snd_volume)
-		k2.set_sound_pan(snd, snd_pan)
-		k2.set_sound_pitch(snd, snd_pitch)
+		k2.set_sound_volume(sine_sound, snd_volume)
+		k2.set_sound_pan(sine_sound, snd_pan)
+		k2.set_sound_pitch(sine_sound, snd_pitch)
 	}
 	
 	k2.clear(k2.WHITE)
@@ -165,6 +275,27 @@ step :: proc() -> bool {
 	)
 	k2.draw_text("Press Space to play a familiar sound.", {20, 200}, 40, k2.BLACK)
 	k2.draw_text("Press Enter to also play a 1 second 440 hz sine wave.", {20, 240}, 40, k2.BLACK)
+
+	when HAS_MUSIC {
+		k2.draw_text(
+			"Home plays the music, End stops it, P pauses. Drag the bar to seek.",
+			{20, 280},
+			40,
+			k2.BLACK,
+		)
+
+		seek_bar(&music_seek_bar, music_sound)
+	}
+
+	k2.draw_text(
+		"L plays a looping 10 second sine sweep, K pauses. Drag the bar to seek.",
+		{20, 410},
+		40,
+		k2.BLACK,
+	)
+
+	seek_bar(&sweep_seek_bar, sweep_sound)
+
 	k2.present()
 	free_all(context.temp_allocator)
 
@@ -172,12 +303,11 @@ step :: proc() -> bool {
 }
 
 shutdown :: proc() {
-	k2.destroy_sound(snd)
-	k2.destroy_sound(snd2)
-	k2.destroy_sound(snd3)
-	k2.destroy_sound(wav_1)
-	k2.destroy_sound(wav_2)
-	k2.destroy_audio_buffer(wav)
+	k2.destroy_audio_clip(sine_clip_200)
+	k2.destroy_audio_clip(sine_clip_440)
+	k2.destroy_audio_clip(sine_clip_700)
+	k2.destroy_audio_clip(chord_clip)
+	k2.destroy_audio_clip(sweep_clip)
 
 	when HAS_MUSIC {
 		k2.destroy_audio_stream(music)
